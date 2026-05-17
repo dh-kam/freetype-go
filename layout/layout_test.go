@@ -1,0 +1,126 @@
+package layout
+
+import (
+	"encoding/binary"
+	"testing"
+)
+
+func TestParseGSUB(t *testing.T) {
+	data := make([]byte, 40)
+	// Version 1.0
+	binary.BigEndian.PutUint16(data[0:2], 1)
+	binary.BigEndian.PutUint16(data[2:4], 0)
+	// Offsets
+	binary.BigEndian.PutUint16(data[4:6], 10)  // ScriptList
+	binary.BigEndian.PutUint16(data[6:8], 18)  // FeatureList
+	binary.BigEndian.PutUint16(data[8:10], 26) // LookupList
+
+	// ScriptList at 10: 1 script, tag 'dflt', offset 10 (from ScriptList start = 20)
+	binary.BigEndian.PutUint16(data[10:12], 1)
+	binary.BigEndian.PutUint32(data[12:16], 0x64666C74)
+	binary.BigEndian.PutUint16(data[16:18], 10)
+
+	// FeatureList at 18: 1 feature, tag 'test', offset 10 (from FeatureList start = 28)
+	binary.BigEndian.PutUint16(data[18:20], 1)
+	binary.BigEndian.PutUint32(data[20:24], 0x74657374)
+	binary.BigEndian.PutUint16(data[24:26], 10)
+
+	// LookupList at 26: 1 lookup, offset 4 (from LookupList start = 30)
+	binary.BigEndian.PutUint16(data[26:28], 1)
+	binary.BigEndian.PutUint16(data[28:30], 4)
+
+	// LookupTable at 30
+	binary.BigEndian.PutUint16(data[30:32], 1) // Type 1
+	binary.BigEndian.PutUint16(data[32:34], 0) // Flag
+	binary.BigEndian.PutUint16(data[34:36], 0) // SubtableCount
+
+	gsub, err := ParseGSUB(data)
+	if err != nil {
+		t.Fatalf("ParseGSUB failed: %v", err)
+	}
+
+	if gsub.VersionMajor != 1 || gsub.VersionMinor != 0 {
+		t.Errorf("expected version 1.0, got %d.%d", gsub.VersionMajor, gsub.VersionMinor)
+	}
+
+	if len(gsub.ScriptList.Scripts) != 1 {
+		t.Errorf("expected 1 script, got %d", len(gsub.ScriptList.Scripts))
+	}
+	if gsub.ScriptList.Scripts[0].Tag != 0x64666C74 {
+		t.Errorf("expected 'dflt' tag, got 0x%08X", gsub.ScriptList.Scripts[0].Tag)
+	}
+
+	if len(gsub.FeatureList.Features) != 1 {
+		t.Errorf("expected 1 feature, got %d", len(gsub.FeatureList.Features))
+	}
+	if gsub.FeatureList.Features[0].Tag != 0x74657374 {
+		t.Errorf("expected 'test' tag, got 0x%08X", gsub.FeatureList.Features[0].Tag)
+	}
+
+	if len(gsub.LookupList.Lookups) != 1 {
+		t.Errorf("expected 1 lookup, got %d", len(gsub.LookupList.Lookups))
+	}
+}
+
+func TestParseGPOS(t *testing.T) {
+	data := make([]byte, 40)
+	// Version 1.0
+	binary.BigEndian.PutUint16(data[0:2], 1)
+	binary.BigEndian.PutUint16(data[2:4], 0)
+	// Offsets
+	binary.BigEndian.PutUint16(data[4:6], 10)
+	binary.BigEndian.PutUint16(data[6:8], 18)
+	binary.BigEndian.PutUint16(data[8:10], 26)
+
+	// ScriptList at 10
+	binary.BigEndian.PutUint16(data[10:12], 1)
+	binary.BigEndian.PutUint32(data[12:16], 0x64666C74)
+	binary.BigEndian.PutUint16(data[16:18], 10)
+
+	// FeatureList at 18
+	binary.BigEndian.PutUint16(data[18:20], 1)
+	binary.BigEndian.PutUint32(data[20:24], 0x74657374)
+	binary.BigEndian.PutUint16(data[24:26], 10)
+
+	// LookupList at 26
+	binary.BigEndian.PutUint16(data[26:28], 1)
+	binary.BigEndian.PutUint16(data[28:30], 4)
+
+	// LookupTable at 30
+	binary.BigEndian.PutUint16(data[30:32], 2) // Type 2 (Pair Adjustment)
+	binary.BigEndian.PutUint16(data[32:34], 0)
+	binary.BigEndian.PutUint16(data[34:36], 0)
+
+	gpos, err := ParseGPOS(data)
+	if err != nil {
+		t.Fatalf("ParseGPOS failed: %v", err)
+	}
+
+	if gpos.VersionMajor != 1 || gpos.VersionMinor != 0 {
+		t.Errorf("expected version 1.0, got %d.%d", gpos.VersionMajor, gpos.VersionMinor)
+	}
+}
+
+func TestValueRecordSizeAndNilParse(t *testing.T) {
+	format := uint16(0x0005) // XPlacement + XAdvance
+	if got := ValueRecordSize(format); got != 4 {
+		t.Fatalf("expected ValueRecord size 4, got %d", got)
+	}
+
+	vr, size := ParseValueRecord(nil, format)
+	if size != 4 {
+		t.Fatalf("expected nil ParseValueRecord size 4, got %d", size)
+	}
+	if vr != (ValueRecord{}) {
+		t.Fatalf("expected empty ValueRecord for nil data, got %+v", vr)
+	}
+
+	data := []byte{0x00, 0x09}
+	vr, size = ParseValueRecord(data, format)
+	if size != 4 {
+		t.Fatalf("expected short ParseValueRecord size 4, got %d", size)
+	}
+	if vr.XPlacement != 9 || vr.XAdvance != 0 {
+		t.Fatalf("unexpected short ValueRecord parse: %+v", vr)
+	}
+}

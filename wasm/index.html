@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>FreeType-Go WASM Demo</title>
+    <script src="wasm_exec.js"></script>
+    <style>
+        body { font-family: sans-serif; padding: 20px; }
+        #canvas { border: 1px solid #ccc; margin-top: 10px; }
+    </style>
+</head>
+<body>
+    <h1>FreeType-Go WASM Demo</h1>
+    <input type="file" id="fontFile" accept=".ttf,.otf">
+    <input type="text" id="char" value="G" maxlength="1" style="width: 30px;">
+    <input type="number" id="size" value="128" style="width: 60px;">
+    <button id="renderBtn">Render</button>
+    <br>
+    <canvas id="canvas"></canvas>
+
+    <script>
+        const go = new Go();
+        WebAssembly.instantiateStreaming(fetch("freetype.wasm"), go.importObject).then((result) => {
+            go.run(result.instance);
+            console.log("WASM Ready");
+        });
+
+        document.getElementById('renderBtn').onclick = async () => {
+            const fileInput = document.getElementById('fontFile');
+            if (fileInput.files.length === 0) {
+                alert("Select a font file first!");
+                return;
+            }
+
+            const char = document.getElementById('char').value;
+            const size = parseInt(document.getElementById('size').value);
+            const arrayBuffer = await fileInput.files[0].arrayBuffer();
+            const fontData = new Uint8Array(arrayBuffer);
+
+            // Call the Go function exposed to JS
+            const result = renderGlyph(fontData, char.charCodeAt(0), size);
+
+            if (typeof result === 'string') {
+                alert(result);
+                return;
+            }
+
+            const canvas = document.getElementById('canvas');
+            canvas.width = result.width;
+            canvas.height = result.height;
+            const ctx = canvas.getContext('2d');
+            const imgData = ctx.createImageData(result.width, result.height);
+
+            // Convert grayscale coverage to RGBA
+            for (let i = 0; i < result.pixels.length; i++) {
+                const val = result.pixels[i];
+                imgData.data[i * 4 + 0] = 0;   // R
+                imgData.data[i * 4 + 1] = 0;   // G
+                imgData.data[i * 4 + 2] = 0;   // B
+                imgData.data[i * 4 + 3] = val; // A (coverage)
+            }
+            ctx.putImageData(imgData, 0, 0);
+        };
+    </script>
+</body>
+</html>
