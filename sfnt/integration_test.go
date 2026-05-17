@@ -2,12 +2,14 @@ package sfnt
 
 import (
 	"encoding/binary"
-	"github.com/dh-kam/freetype-go/core"
 	"testing"
+
+	"github.com/dh-kam/freetype-go/api"
+	"github.com/dh-kam/freetype-go/core"
 )
 
-func TestHintingIntegration(t *testing.T) {
-	// Create a dummy SFNT with head, maxp, loca, glyf, fpgm, prep, and cvt
+func loadHintingFixture(t *testing.T, instr []byte) api.Face {
+	t.Helper()
 	data := make([]byte, 2000)
 
 	// Offset Table
@@ -60,23 +62,6 @@ func TestHintingIntegration(t *testing.T) {
 	binary.BigEndian.PutUint16(data[glyphOffset:glyphOffset+2], 1)     // 1 contour
 	binary.BigEndian.PutUint16(data[glyphOffset+10:glyphOffset+12], 0) // endPtOfContours[0] = 0 (1 point)
 
-	// Instructions:
-	// PUSHB[1] 0 (index)
-	// PUSHW[1] 6400 (value)
-	// WCVTP (pops val 6400, then idx 0)
-	// SVTCA[x] (0x01)
-	// PUSHB[1] 0 (Point index)
-	// PUSHB[1] 0 (CVT index)
-	// MIAP[no-round] (0x3E) (pops cvtIdx 0, then pIdx 0)
-	instr := []byte{
-		0xB0, 0, // PUSHB 0 (index)
-		0xB8, 25, 0, // PUSHW 6400 (value)
-		0x44,    // WCVTP
-		0x01,    // SVTCA[x]
-		0xB0, 0, // PUSHB 0 (point index)
-		0xB0, 0, // PUSHB 0 (cvt index)
-		0x3E, // MIAP[0]
-	}
 	binary.BigEndian.PutUint16(data[glyphOffset+12:glyphOffset+14], uint16(len(instr)))
 	copy(data[glyphOffset+14:glyphOffset+14+len(instr)], instr)
 
@@ -96,6 +81,28 @@ func TestHintingIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadFace failed: %v", err)
 	}
+	return f
+}
+
+func TestHintingIntegration(t *testing.T) {
+	// Instructions:
+	// PUSHB[1] 0 (index)
+	// PUSHW[1] 6400 (value)
+	// WCVTP (pops val 6400, then idx 0)
+	// SVTCA[x] (0x01)
+	// PUSHB[1] 0 (Point index)
+	// PUSHB[1] 0 (CVT index)
+	// MIAP[no-round] (0x3E) (pops cvtIdx 0, then pIdx 0)
+	instr := []byte{
+		0xB0, 0, // PUSHB 0 (index)
+		0xB8, 25, 0, // PUSHW 6400 (value)
+		0x44,    // WCVTP
+		0x01,    // SVTCA[x]
+		0xB0, 0, // PUSHB 0 (point index)
+		0xB0, 0, // PUSHB 0 (cvt index)
+		0x3E, // MIAP[0]
+	}
+	f := loadHintingFixture(t, instr)
 
 	slot, err := f.LoadGlyph(1, 0)
 	if err != nil {
@@ -110,6 +117,38 @@ func TestHintingIntegration(t *testing.T) {
 	}
 	if points[0].Y != 20<<6 {
 		t.Errorf("expected Y=1280, got %d", points[0].Y)
+	}
+
+	slot, err = f.LoadGlyph(1, api.LoadNoHinting)
+	if err != nil {
+		t.Fatalf("LoadGlyph without hinting failed: %v", err)
+	}
+	points = slot.GetOutline().GetPoints()
+	if points[0].X != 10<<6 || points[0].Y != 20<<6 {
+		t.Errorf("expected unhinted point (640, 1280), got (%d, %d)", points[0].X, points[0].Y)
+	}
+}
+
+func TestGlyphProgramErrorKeepsUnhintedOutline(t *testing.T) {
+	instr := []byte{
+		0xB0, 0, // PUSHB 0 (index)
+		0xB8, 25, 0, // PUSHW 6400 (value)
+		0x44,    // WCVTP
+		0x01,    // SVTCA[x]
+		0xB0, 0, // PUSHB 0 (point index)
+		0xB0, 0, // PUSHB 0 (cvt index)
+		0x3E, // MIAP[0]
+		0x06, // SPVTL[0], currently unsupported and requires transaction rollback
+	}
+	f := loadHintingFixture(t, instr)
+
+	slot, err := f.LoadGlyph(1, 0)
+	if err != nil {
+		t.Fatalf("LoadGlyph failed: %v", err)
+	}
+	points := slot.GetOutline().GetPoints()
+	if points[0].X != 10<<6 || points[0].Y != 20<<6 {
+		t.Fatalf("expected failed hinting to keep unhinted point (640, 1280), got (%d, %d)", points[0].X, points[0].Y)
 	}
 }
 
@@ -199,7 +238,7 @@ func TestCFFLoading(t *testing.T) {
 	if len(points) != 1 {
 		t.Fatalf("expected 1 point, got %d", len(points))
 	}
-	if points[0].X != 10<<6 || points[0].Y != 20<<6 {
-		t.Errorf("expected (640, 1280), got (%d, %d)", points[0].X, points[0].Y)
+	if points[0].X != 15 || points[0].Y != 31 {
+		t.Errorf("expected (15, 31), got (%d, %d)", points[0].X, points[0].Y)
 	}
 }

@@ -81,3 +81,103 @@ func TestGPOS_MarkToBase(t *testing.T) {
 		t.Errorf("expected Y adjustment 130, got %d", adjustments[1].Y)
 	}
 }
+
+func TestGPOS_MarkToBaseMalformedCoverageDoesNotPanic(t *testing.T) {
+	data := make([]byte, 12)
+
+	binary.BigEndian.PutUint16(data[0:2], 1)   // format
+	binary.BigEndian.PutUint16(data[2:4], 10)  // truncated mark coverage
+	binary.BigEndian.PutUint16(data[4:6], 10)  // truncated base coverage
+	binary.BigEndian.PutUint16(data[6:8], 1)   // mark class count
+	binary.BigEndian.PutUint16(data[8:10], 0)  // mark array
+	binary.BigEndian.PutUint16(data[10:12], 0) // base array
+
+	gpos := &GPOS{Data: data}
+	lookup := &LookupTable{Type: 4, SubtableOffsets: []uint16{0}}
+	adjustments := make([]api.Vector, 2)
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("mark-to-base panicked on malformed coverage: %v", r)
+		}
+	}()
+
+	gpos.applyMarkToBasePos(lookup, []int{100, 500}, adjustments)
+	if adjustments[1] != (api.Vector{}) {
+		t.Fatalf("expected no adjustment for malformed table, got %+v", adjustments[1])
+	}
+}
+
+func TestGPOS_MarkToMark(t *testing.T) {
+	data := make([]byte, 120)
+
+	// GPOS Header
+	binary.BigEndian.PutUint16(data[0:2], 1)
+	binary.BigEndian.PutUint16(data[2:4], 0)
+	binary.BigEndian.PutUint16(data[4:6], 10)
+	binary.BigEndian.PutUint16(data[6:8], 20)
+	binary.BigEndian.PutUint16(data[8:10], 30)
+
+	// Empty ScriptList and FeatureList.
+	binary.BigEndian.PutUint16(data[10:12], 0)
+	binary.BigEndian.PutUint16(data[20:22], 0)
+
+	// LookupList at 30.
+	binary.BigEndian.PutUint16(data[30:32], 1)
+	binary.BigEndian.PutUint16(data[32:34], 4)
+
+	// LookupTable at 34.
+	binary.BigEndian.PutUint16(data[34:36], 6)
+	binary.BigEndian.PutUint16(data[36:38], 0)
+	binary.BigEndian.PutUint16(data[38:40], 1)
+	binary.BigEndian.PutUint16(data[40:42], 8)
+
+	// MarkToMarkPos format 1 at 42.
+	binary.BigEndian.PutUint16(data[42:44], 1)
+	binary.BigEndian.PutUint16(data[44:46], 12) // Mark1Coverage at 54
+	binary.BigEndian.PutUint16(data[46:48], 18) // Mark2Coverage at 60
+	binary.BigEndian.PutUint16(data[48:50], 1)
+	binary.BigEndian.PutUint16(data[50:52], 24) // Mark1Array at 66
+	binary.BigEndian.PutUint16(data[52:54], 36) // Mark2Array at 78
+
+	// Mark1Coverage at 54: glyph 501.
+	binary.BigEndian.PutUint16(data[54:56], 1)
+	binary.BigEndian.PutUint16(data[56:58], 1)
+	binary.BigEndian.PutUint16(data[58:60], 501)
+
+	// Mark2Coverage at 60: glyph 500.
+	binary.BigEndian.PutUint16(data[60:62], 1)
+	binary.BigEndian.PutUint16(data[62:64], 1)
+	binary.BigEndian.PutUint16(data[64:66], 500)
+
+	// Mark1Array at 66.
+	binary.BigEndian.PutUint16(data[66:68], 1)
+	binary.BigEndian.PutUint16(data[68:70], 0)
+	binary.BigEndian.PutUint16(data[70:72], 6)
+	binary.BigEndian.PutUint16(data[72:74], 1)
+	binary.BigEndian.PutUint16(data[74:76], 10)
+	binary.BigEndian.PutUint16(data[76:78], 20)
+
+	// Mark2Array at 78.
+	binary.BigEndian.PutUint16(data[78:80], 1)
+	binary.BigEndian.PutUint16(data[80:82], 4)
+	binary.BigEndian.PutUint16(data[82:84], 1)
+	binary.BigEndian.PutUint16(data[84:86], 100)
+	binary.BigEndian.PutUint16(data[86:88], 150)
+
+	gpos, err := ParseGPOS(data)
+	if err != nil {
+		t.Fatalf("ParseGPOS failed: %v", err)
+	}
+
+	adjustments := make([]api.Vector, 2)
+	adjustments[0] = api.Vector{X: 5, Y: 7}
+	gpos.applyLookup(gpos.LookupList.Lookups[0], []int{500, 501}, adjustments)
+
+	if adjustments[1].X != 95 {
+		t.Fatalf("expected mark-to-mark X adjustment 95, got %d", adjustments[1].X)
+	}
+	if adjustments[1].Y != 137 {
+		t.Fatalf("expected mark-to-mark Y adjustment 137, got %d", adjustments[1].Y)
+	}
+}

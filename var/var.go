@@ -4,8 +4,17 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 
 	"github.com/dh-kam/freetype-go/api"
+)
+
+const (
+	tupleSharedPointNumbers = 0x8000
+	tupleEmbeddedPeak       = 0x8000
+	tupleIntermediateRegion = 0x4000
+	tuplePrivatePoints      = 0x2000
+	tupleCountMask          = 0x0FFF
 )
 
 // Fixed is a 16.16 fixed-point number.
@@ -43,6 +52,111 @@ type InstanceRecord struct {
 	PostScriptNameID uint16 // Optional
 }
 
+// AxisValueMap maps a default normalized coordinate to a modified
+// normalized coordinate for one axis in the 'avar' table.
+type AxisValueMap struct {
+	FromCoord float32
+	ToCoord   float32
+}
+
+// AvarTable represents the 'avar' axis variation table.
+type AvarTable struct {
+	MajorVersion    uint16
+	MinorVersion    uint16
+	AxisSegmentMaps [][]AxisValueMap
+}
+
+func ParseAvar(s api.Stream) (*AvarTable, error) {
+	if s.Size() < 8 {
+		return nil, errors.New("avar table too short")
+	}
+	major, _ := readUint16(s, 0)
+	minor, _ := readUint16(s, 2)
+	if major != 1 || minor != 0 {
+		return nil, fmt.Errorf("unsupported avar version: %d.%d", major, minor)
+	}
+	axisCount, _ := readUint16(s, 6)
+	avar := &AvarTable{
+		MajorVersion:    major,
+		MinorVersion:    minor,
+		AxisSegmentMaps: make([][]AxisValueMap, axisCount),
+	}
+
+	offset := int64(8)
+	for axis := 0; axis < int(axisCount); axis++ {
+		if offset+2 > s.Size() {
+			return nil, errors.New("avar segment map truncated")
+		}
+		positionMapCount, _ := readUint16(s, offset)
+		offset += 2
+		if offset+int64(positionMapCount)*4 > s.Size() {
+			return nil, errors.New("avar axis value map truncated")
+		}
+		segmentMap := make([]AxisValueMap, positionMapCount)
+		for i := 0; i < int(positionMapCount); i++ {
+			from, _ := readInt16(s, offset)
+			to, _ := readInt16(s, offset+2)
+			segmentMap[i] = AxisValueMap{
+				FromCoord: f2Dot14ToFloat(from),
+				ToCoord:   f2Dot14ToFloat(to),
+			}
+			offset += 4
+		}
+		avar.AxisSegmentMaps[axis] = segmentMap
+	}
+	return avar, nil
+}
+
+func (t *AvarTable) MapCoordinates(coords []float32) []float32 {
+	mapped := make([]float32, len(coords))
+	for i, coord := range coords {
+		mapped[i] = t.MapCoord(i, coord)
+	}
+	return mapped
+}
+
+func (t *AvarTable) MapCoord(axisIndex int, coord float32) float32 {
+	coord = clampNormalizedCoord(coord)
+	if t == nil || axisIndex < 0 || axisIndex >= len(t.AxisSegmentMaps) {
+		return coord
+	}
+	segmentMap := t.AxisSegmentMaps[axisIndex]
+	if len(segmentMap) == 0 {
+		return coord
+	}
+
+	start := segmentMap[0]
+	if coord <= start.FromCoord {
+		if coord == start.FromCoord {
+			return clampNormalizedCoord(start.ToCoord)
+		}
+		return coord
+	}
+
+	for i := 1; i < len(segmentMap); i++ {
+		end := segmentMap[i]
+		if end.FromCoord <= start.FromCoord || end.ToCoord < start.ToCoord {
+			continue
+		}
+		if coord == end.FromCoord {
+			return clampNormalizedCoord(end.ToCoord)
+		}
+		if coord < end.FromCoord {
+			return interpolateAvarCoord(start, end, coord)
+		}
+		start = end
+	}
+	return coord
+}
+
+func interpolateAvarCoord(start, end AxisValueMap, coord float32) float32 {
+	if end.FromCoord == start.FromCoord {
+		return clampNormalizedCoord(end.ToCoord)
+	}
+	ratio := (coord - start.FromCoord) / (end.FromCoord - start.FromCoord)
+	return clampNormalizedCoord(start.ToCoord + ratio*(end.ToCoord-start.ToCoord))
+}
+
 // GvarTable represents the 'gvar' glyph variations table.
 type GvarTable struct {
 	Stream           api.Stream
@@ -57,9 +171,12 @@ type VariationEngine struct {
 	Axes         []AxisRecord
 	Coords       []float32 // Normalized coordinates [-1, 1]
 	SharedTuples [][]float32
+	Avar         *AvarTable
 	Gvar         *GvarTable
+	Cvar         *CvarTable
 	Hvar         *HVARTable
 	Vvar         *VVARTable
+	Mvar         *MVARTable
 }
 
 func NewVariationEngine(fvar *FvarTable, gvar *GvarTable, hvar *HVARTable, vvar *VVARTable) *VariationEngine {
@@ -76,17 +193,49 @@ func NewVariationEngine(fvar *FvarTable, gvar *GvarTable, hvar *HVARTable, vvar 
 	return ve
 }
 
+func (ve *VariationEngine) SetAvar(avar *AvarTable) {
+	ve.Avar = avar
+}
+
+func (ve *VariationEngine) SetCvar(cvar *CvarTable) {
+	ve.Cvar = cvar
+}
+
+func (ve *VariationEngine) SetMVAR(mvar *MVARTable) {
+	ve.Mvar = mvar
+}
+
 func (ve *VariationEngine) SetNormalizedCoordinates(coords []float32) {
-	copy(ve.Coords, coords)
+	for i := range ve.Coords {
+		ve.Coords[i] = 0
+	}
+	for i, coord := range coords {
+		if i >= len(ve.Coords) {
+			break
+		}
+		ve.Coords[i] = clampNormalizedCoord(coord)
+	}
 }
 
 func (ve *VariationEngine) SetDesignCoordinates(coords []Fixed) {
+	normalized := ve.NormalizeDesignCoordinates(coords)
+	for i := range ve.Coords {
+		ve.Coords[i] = normalized[i]
+	}
+}
+
+func (ve *VariationEngine) NormalizeDesignCoordinates(coords []Fixed) []float32 {
+	normalized := make([]float32, len(ve.Axes))
 	for i, axis := range ve.Axes {
 		if i >= len(coords) {
 			break
 		}
-		ve.Coords[i] = ve.normalize(coords[i], axis)
+		normalized[i] = clampNormalizedCoord(ve.normalize(coords[i], axis))
 	}
+	if ve.Avar != nil {
+		return ve.Avar.MapCoordinates(normalized)
+	}
+	return normalized
 }
 
 func (ve *VariationEngine) normalize(val Fixed, axis AxisRecord) float32 {
@@ -104,6 +253,16 @@ func (ve *VariationEngine) normalize(val Fixed, axis AxisRecord) float32 {
 	return 0
 }
 
+func clampNormalizedCoord(coord float32) float32 {
+	if coord < -1 {
+		return -1
+	}
+	if coord > 1 {
+		return 1
+	}
+	return coord
+}
+
 func (ve *VariationEngine) GetAdvanceDelta(glyphIndex int) int32 {
 	if ve.Hvar == nil {
 		return 0
@@ -118,22 +277,87 @@ func (ve *VariationEngine) GetLSBDelta(glyphIndex int) int32 {
 	return int32(ve.Hvar.GetLSBDelta(glyphIndex, ve.Coords))
 }
 
-func (ve *VariationEngine) ApplyVariation(glyphIndex int, outline api.Outline) error {
-	if ve.Gvar == nil {
+func (ve *VariationEngine) GetAdvanceHeightDelta(glyphIndex int) int32 {
+	if ve.Vvar == nil {
+		return 0
+	}
+	return int32(ve.Vvar.GetAdvanceHeightDelta(glyphIndex, ve.Coords))
+}
+
+func (ve *VariationEngine) GetTSBDelta(glyphIndex int) int32 {
+	if ve.Vvar == nil {
+		return 0
+	}
+	return int32(ve.Vvar.GetTSBDelta(glyphIndex, ve.Coords))
+}
+
+func (ve *VariationEngine) GetBSBDelta(glyphIndex int) int32 {
+	if ve.Vvar == nil {
+		return 0
+	}
+	return int32(ve.Vvar.GetBSBDelta(glyphIndex, ve.Coords))
+}
+
+func (ve *VariationEngine) GetVOrgDelta(glyphIndex int) int32 {
+	if ve.Vvar == nil {
+		return 0
+	}
+	return int32(ve.Vvar.GetVOrgDelta(glyphIndex, ve.Coords))
+}
+
+func (ve *VariationEngine) ApplyCVTDeltas(cvt []int32) error {
+	if ve.Cvar == nil {
 		return nil
 	}
+	return ve.Cvar.ApplyCVTDeltas(cvt, ve.Coords)
+}
+
+func (ve *VariationEngine) GetMetricDelta(valueTag uint32) int32 {
+	if ve.Mvar == nil {
+		return 0
+	}
+	return ve.Mvar.GetMetricDelta(valueTag, ve.Coords)
+}
+
+func (ve *VariationEngine) ApplyMetricDelta(valueTag uint32, value int32) int32 {
+	if ve.Mvar == nil {
+		return value
+	}
+	return ve.Mvar.ApplyMetricDelta(valueTag, value, ve.Coords)
+}
+
+func (ve *VariationEngine) ApplyVariation(glyphIndex int, outline api.Outline) error {
+	if outline == nil {
+		return nil
+	}
+	points := outline.GetPoints()
+	deltas, err := ve.GetGlyphDeltas(glyphIndex, points, outline.GetContours())
+	if err != nil {
+		return err
+	}
+	for i := range points {
+		points[i].X += deltas[i].X
+		points[i].Y += deltas[i].Y
+	}
+	return nil
+}
+
+func (ve *VariationEngine) GetGlyphDeltas(glyphIndex int, points []api.Vector, contours []int) ([]api.Vector, error) {
+	deltas := make([]api.Vector, len(points))
+	if ve.Gvar == nil {
+		return deltas, nil
+	}
 	if glyphIndex < 0 || glyphIndex >= len(ve.Gvar.GlyphDataOffsets)-1 {
-		return fmt.Errorf("glyph index %d out of range", glyphIndex)
+		return nil, fmt.Errorf("glyph index %d out of range", glyphIndex)
 	}
 
 	startOffset := ve.Gvar.GlyphDataOffsets[glyphIndex]
 	endOffset := ve.Gvar.GlyphDataOffsets[glyphIndex+1]
 	if startOffset == endOffset {
-		return nil // No variation for this glyph
+		return deltas, nil // No variation for this glyph
 	}
 
 	s := ve.Gvar.Stream
-	points := outline.GetPoints()
 	numPoints := len(points)
 
 	tupleVariationCount, _ := readUint16(s, int64(startOffset))
@@ -144,6 +368,15 @@ func (ve *VariationEngine) ApplyVariation(glyphIndex int, outline api.Outline) e
 
 	currHeaderOffset := int64(startOffset) + 4
 	currDataOffset := sharedDataOffset
+	var sharedPointIndices []int
+	if tupleVariationCount&0x8000 != 0 {
+		points, next, err := ve.unpackPointIndices(s, currDataOffset, numPoints)
+		if err != nil {
+			return nil, err
+		}
+		sharedPointIndices = points
+		currDataOffset = next
+	}
 
 	deltasX := make([]float32, numPoints)
 	deltasY := make([]float32, numPoints)
@@ -192,78 +425,46 @@ func (ve *VariationEngine) ApplyVariation(glyphIndex int, outline api.Outline) e
 			continue
 		}
 
-		// Unpack deltas
-		tupleDeltasX, tupleDeltasY, nextDataOffset, err := ve.unpackDeltas(s, currDataOffset, numPoints, tupleIndex)
+		tupleDataOffset := currDataOffset
+		tupleDeltasX, tupleDeltasY, touched, nextDataOffset, err := ve.unpackDeltas(s, tupleDataOffset, numPoints, tupleIndex, sharedPointIndices)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		currDataOffset = nextDataOffset
+		if tupleEnd := tupleDataOffset + int64(variationDataSize); tupleEnd > currDataOffset {
+			currDataOffset = tupleEnd
+		}
 
+		interpolateUntouchedDeltas(points, contours, tupleDeltasX, tupleDeltasY, touched)
 		for j := 0; j < numPoints; j++ {
 			deltasX[j] += tupleDeltasX[j] * scalar
 			deltasY[j] += tupleDeltasY[j] * scalar
 		}
 	}
 
-	// Apply deltas to outline
-	for i := range points {
-		points[i].X += int32(deltasX[i] * 64) // Convert back to 26.6
-		points[i].Y += int32(deltasY[i] * 64)
+	for i := range deltas {
+		deltas[i].X = int32(deltasX[i] * 64) // Convert back to 26.6
+		deltas[i].Y = int32(deltasY[i] * 64)
 	}
-
-	return nil
+	return deltas, nil
 }
 
 func (ve *VariationEngine) calculateScalar(peak, start, end []float32) float32 {
-	if peak == nil {
-		return 1.0
-	}
-	var scalar float32 = 1.0
-	for i := 0; i < len(ve.Coords); i++ {
-		p := peak[i]
-		curr := ve.Coords[i]
-		var s, e float32
-		if start != nil {
-			s = start[i]
-			e = end[i]
-		} else {
-			if p == 0 {
-				continue
-			} else if p > 0 {
-				s = 0
-				e = p
-			} else {
-				s = p
-				e = 0
-			}
-		}
-
-		if p == 0 || curr == p {
-			continue
-		}
-		if curr <= s || curr >= e {
-			return 0
-		}
-		if curr < p {
-			scalar *= (curr - s) / (p - s)
-		} else {
-			scalar *= (e - curr) / (e - p)
-		}
-	}
-	return scalar
+	return calculateTupleScalar(peak, start, end, ve.Coords)
 }
 
-func (ve *VariationEngine) unpackDeltas(s api.Stream, offset int64, numPoints int, tupleIndex uint16) ([]float32, []float32, int64, error) {
+func (ve *VariationEngine) unpackDeltas(s api.Stream, offset int64, numPoints int, tupleIndex uint16, sharedPointIndices []int) ([]float32, []float32, []bool, int64, error) {
 	dx := make([]float32, numPoints)
 	dy := make([]float32, numPoints)
+	touched := make([]bool, numPoints)
 
 	curr := offset
-	var pointIndices []int
+	pointIndices := sharedPointIndices
 
 	if tupleIndex&0x2000 != 0 { // PRIVATE_POINT_NUMBERS
 		count, next, err := ve.unpackPointIndices(s, curr, numPoints)
 		if err != nil {
-			return nil, nil, 0, err
+			return nil, nil, nil, 0, err
 		}
 		pointIndices = count
 		curr = next
@@ -272,14 +473,14 @@ func (ve *VariationEngine) unpackDeltas(s api.Stream, offset int64, numPoints in
 	// Unpack X deltas
 	dxValues, next, err := ve.unpackDeltaValues(s, curr, len(pointIndices), numPoints)
 	if err != nil {
-		return nil, nil, 0, err
+		return nil, nil, nil, 0, err
 	}
 	curr = next
 
 	// Unpack Y deltas
 	dyValues, next, err := ve.unpackDeltaValues(s, curr, len(pointIndices), numPoints)
 	if err != nil {
-		return nil, nil, 0, err
+		return nil, nil, nil, 0, err
 	}
 	curr = next
 
@@ -287,92 +488,114 @@ func (ve *VariationEngine) unpackDeltas(s api.Stream, offset int64, numPoints in
 		for i := 0; i < numPoints; i++ {
 			dx[i] = float32(dxValues[i])
 			dy[i] = float32(dyValues[i])
+			touched[i] = true
 		}
 	} else {
 		for i, idx := range pointIndices {
 			if idx < numPoints {
 				dx[idx] = float32(dxValues[i])
 				dy[idx] = float32(dyValues[i])
+				touched[idx] = true
 			}
 		}
 	}
 
-	return dx, dy, curr, nil
+	return dx, dy, touched, curr, nil
+}
+
+func interpolateUntouchedDeltas(points []api.Vector, contours []int, dx, dy []float32, touched []bool) {
+	if len(points) == 0 || len(contours) == 0 {
+		return
+	}
+	interpolateUntouchedDeltaAxis(points, contours, dx, touched, true)
+	interpolateUntouchedDeltaAxis(points, contours, dy, touched, false)
+}
+
+func interpolateUntouchedDeltaAxis(points []api.Vector, contours []int, deltas []float32, touched []bool, useX bool) {
+	start := 0
+	for _, end := range contours {
+		if start < 0 || start >= len(points) {
+			break
+		}
+		if end >= len(points) {
+			end = len(points) - 1
+		}
+		if end < start {
+			start = end + 1
+			continue
+		}
+
+		var refs []int
+		for i := start; i <= end; i++ {
+			if touched[i] {
+				refs = append(refs, i)
+			}
+		}
+		switch len(refs) {
+		case 0:
+		case 1:
+			refDelta := deltas[refs[0]]
+			for i := start; i <= end; i++ {
+				if !touched[i] {
+					deltas[i] = refDelta
+				}
+			}
+		default:
+			for i, ref1 := range refs {
+				ref2 := refs[(i+1)%len(refs)]
+				for p := nextContourPoint(ref1, start, end); p != ref2; p = nextContourPoint(p, start, end) {
+					if !touched[p] {
+						deltas[p] = interpolateDelta(pointCoord(points[p], useX), pointCoord(points[ref1], useX), deltas[ref1], pointCoord(points[ref2], useX), deltas[ref2])
+					}
+				}
+			}
+		}
+		start = end + 1
+	}
+}
+
+func nextContourPoint(point, start, end int) int {
+	if point >= end {
+		return start
+	}
+	return point + 1
+}
+
+func pointCoord(point api.Vector, useX bool) float32 {
+	if useX {
+		return float32(point.X)
+	}
+	return float32(point.Y)
+}
+
+func interpolateDelta(coord, coord1 float32, delta1 float32, coord2 float32, delta2 float32) float32 {
+	if coord1 == coord2 {
+		return delta1
+	}
+	if coord1 < coord2 {
+		if coord <= coord1 {
+			return delta1
+		}
+		if coord >= coord2 {
+			return delta2
+		}
+	} else {
+		if coord <= coord2 {
+			return delta2
+		}
+		if coord >= coord1 {
+			return delta1
+		}
+	}
+	return delta1 + (delta2-delta1)*(coord-coord1)/(coord2-coord1)
 }
 
 func (ve *VariationEngine) unpackPointIndices(s api.Stream, offset int64, totalPoints int) ([]int, int64, error) {
-	first, _ := readByte(s, offset)
-	offset++
-	var count int
-	if first == 0 {
-		return nil, offset, nil // All points
-	}
-	if first < 128 {
-		count = int(first)
-	} else {
-		second, _ := readByte(s, offset)
-		offset++
-		count = (int(first&0x7F) << 8) | int(second)
-	}
-
-	indices := make([]int, count)
-	var lastIndex int
-	for i := 0; i < count; {
-		control, _ := readByte(s, offset)
-		offset++
-		n := int(control&0x7F) + 1
-		if control&0x80 != 0 { // Words
-			for j := 0; j < n && i < count; j++ {
-				v, _ := readUint16(s, offset)
-				offset += 2
-				lastIndex += int(v)
-				indices[i] = lastIndex
-				i++
-			}
-		} else { // Bytes
-			for j := 0; j < n && i < count; j++ {
-				v, _ := readByte(s, offset)
-				offset++
-				lastIndex += int(v)
-				indices[i] = lastIndex
-				i++
-			}
-		}
-	}
-	return indices, offset, nil
+	return unpackVariationPointIndices(s, offset)
 }
 
 func (ve *VariationEngine) unpackDeltaValues(s api.Stream, offset int64, count int, numPoints int) ([]int16, int64, error) {
-	if count == 0 {
-		count = numPoints
-	}
-	values := make([]int16, count)
-	for i := 0; i < count; {
-		control, _ := readByte(s, offset)
-		offset++
-		n := int(control&0x3F) + 1
-		if control&0x80 != 0 { // Deltas are zero
-			for j := 0; j < n && i < count; j++ {
-				values[i] = 0
-				i++
-			}
-		} else if control&0x40 != 0 { // Words
-			for j := 0; j < n && i < count; j++ {
-				v, _ := readInt16(s, offset)
-				offset += 2
-				values[i] = v
-				i++
-			}
-		} else { // Bytes
-			for j := 0; j < n && i < count; j++ {
-				v, _ := readByte(s, offset)
-				offset++
-				values[i] = int16(int8(v))
-				i++
-			}
-		}
-	}
-	return values, offset, nil
+	return unpackVariationDeltaValues(s, offset, count, numPoints)
 }
 
 func ParseFvar(s api.Stream) (*FvarTable, error) {
@@ -453,6 +676,172 @@ func ParseGvar(s api.Stream) (*GvarTable, error) {
 		}
 	}
 	return gvar, nil
+}
+
+// CvarTable represents the 'cvar' control value variations table.
+type CvarTable struct {
+	MajorVersion     uint16
+	MinorVersion     uint16
+	AxisCount        int
+	SharedCVTIndices []int
+	Tuples           []CvarTupleVariation
+	Stream           api.Stream
+}
+
+type CvarTupleVariation struct {
+	VariationDataSize uint16
+	TupleIndex        uint16
+	PeakTuple         []float32
+	IntermediateStart []float32
+	IntermediateEnd   []float32
+	dataOffset        int64
+}
+
+func ParseCvar(s api.Stream, axisCount int) (*CvarTable, error) {
+	if axisCount < 0 {
+		return nil, errors.New("cvar axis count cannot be negative")
+	}
+	if s.Size() < 8 {
+		return nil, errors.New("cvar table too short")
+	}
+	major, _ := readUint16(s, 0)
+	minor, _ := readUint16(s, 2)
+	if major != 1 || minor != 0 {
+		return nil, fmt.Errorf("unsupported cvar version: %d.%d", major, minor)
+	}
+	tupleVariationCount, _ := readUint16(s, 4)
+	dataOffset, _ := readUint16(s, 6)
+	count := int(tupleVariationCount & tupleCountMask)
+	if int64(dataOffset) > s.Size() {
+		return nil, errors.New("cvar data offset out of range")
+	}
+
+	t := &CvarTable{
+		MajorVersion: major,
+		MinorVersion: minor,
+		AxisCount:    axisCount,
+		Tuples:       make([]CvarTupleVariation, count),
+		Stream:       s,
+	}
+
+	headerOffset := int64(8)
+	for i := 0; i < count; i++ {
+		if headerOffset+4 > s.Size() {
+			return nil, errors.New("cvar tuple variation header truncated")
+		}
+		variationDataSize, _ := readUint16(s, headerOffset)
+		tupleIndex, _ := readUint16(s, headerOffset+2)
+		headerOffset += 4
+		if tupleIndex&tupleEmbeddedPeak == 0 {
+			return nil, fmt.Errorf("cvar tuple %d missing embedded peak tuple", i)
+		}
+		peak, next, err := readF2Dot14Tuple(s, headerOffset, axisCount)
+		if err != nil {
+			return nil, err
+		}
+		headerOffset = next
+
+		var start, end []float32
+		if tupleIndex&tupleIntermediateRegion != 0 {
+			start, next, err = readF2Dot14Tuple(s, headerOffset, axisCount)
+			if err != nil {
+				return nil, err
+			}
+			headerOffset = next
+			end, next, err = readF2Dot14Tuple(s, headerOffset, axisCount)
+			if err != nil {
+				return nil, err
+			}
+			headerOffset = next
+		}
+
+		t.Tuples[i] = CvarTupleVariation{
+			VariationDataSize: variationDataSize,
+			TupleIndex:        tupleIndex,
+			PeakTuple:         peak,
+			IntermediateStart: start,
+			IntermediateEnd:   end,
+		}
+	}
+
+	currDataOffset := int64(dataOffset)
+	if tupleVariationCount&tupleSharedPointNumbers != 0 {
+		sharedIndices, next, err := unpackVariationPointIndices(s, currDataOffset)
+		if err != nil {
+			return nil, err
+		}
+		t.SharedCVTIndices = sharedIndices
+		currDataOffset = next
+	}
+	for i := range t.Tuples {
+		t.Tuples[i].dataOffset = currDataOffset
+		currDataOffset += int64(t.Tuples[i].VariationDataSize)
+		if currDataOffset > s.Size() {
+			return nil, errors.New("cvar tuple variation data truncated")
+		}
+	}
+	return t, nil
+}
+
+func (t *CvarTable) GetCVTDeltas(cvtCount int, coords []float32) ([]float32, error) {
+	if cvtCount < 0 {
+		return nil, errors.New("cvt count cannot be negative")
+	}
+	deltas := make([]float32, cvtCount)
+	if t == nil {
+		return deltas, nil
+	}
+
+	for i := range t.Tuples {
+		tuple := &t.Tuples[i]
+		scalar := calculateTupleScalar(tuple.PeakTuple, tuple.IntermediateStart, tuple.IntermediateEnd, coords)
+		if scalar == 0 {
+			continue
+		}
+
+		pointIndices := t.SharedCVTIndices
+		curr := tuple.dataOffset
+		if tuple.TupleIndex&tuplePrivatePoints != 0 {
+			privateIndices, next, err := unpackVariationPointIndices(t.Stream, curr)
+			if err != nil {
+				return nil, err
+			}
+			pointIndices = privateIndices
+			curr = next
+		}
+
+		deltaCount := len(pointIndices)
+		if pointIndices == nil {
+			deltaCount = cvtCount
+		}
+		values, _, err := unpackVariationDeltaValues(t.Stream, curr, deltaCount, cvtCount)
+		if err != nil {
+			return nil, err
+		}
+		if pointIndices == nil {
+			for i := 0; i < cvtCount; i++ {
+				deltas[i] += float32(values[i]) * scalar
+			}
+			continue
+		}
+		for i, idx := range pointIndices {
+			if idx >= 0 && idx < cvtCount {
+				deltas[idx] += float32(values[i]) * scalar
+			}
+		}
+	}
+	return deltas, nil
+}
+
+func (t *CvarTable) ApplyCVTDeltas(cvt []int32, coords []float32) error {
+	deltas, err := t.GetCVTDeltas(len(cvt), coords)
+	if err != nil {
+		return err
+	}
+	for i := range cvt {
+		cvt[i] += roundVariationDelta(deltas[i])
+	}
+	return nil
 }
 
 // Item Variation Store
@@ -656,18 +1045,24 @@ type HVARTable struct {
 }
 
 func (t *HVARTable) GetAdvanceDelta(glyphIndex int, coords []float32) float32 {
+	if t == nil || t.ItemVariationStore == nil {
+		return 0
+	}
 	outer, inner := t.getIndices(glyphIndex, t.AdvanceWidthMapping)
 	return t.ItemVariationStore.GetDelta(outer, inner, coords)
 }
 
 func (t *HVARTable) GetLSBDelta(glyphIndex int, coords []float32) float32 {
+	if t == nil || t.ItemVariationStore == nil || t.LsbMapping == nil {
+		return 0
+	}
 	outer, inner := t.getIndices(glyphIndex, t.LsbMapping)
 	return t.ItemVariationStore.GetDelta(outer, inner, coords)
 }
 
 func (t *HVARTable) getIndices(glyphIndex int, m *DeltaSetIndexMap) (int, int) {
 	var index uint32
-	if m != nil {
+	if m != nil && len(m.Indices) > 0 {
 		if glyphIndex >= len(m.Indices) {
 			index = m.Indices[len(m.Indices)-1]
 		} else {
@@ -723,6 +1118,52 @@ type VVARTable struct {
 	VOrgMapping          *DeltaSetIndexMap
 }
 
+func (t *VVARTable) GetAdvanceHeightDelta(glyphIndex int, coords []float32) float32 {
+	if t == nil || t.ItemVariationStore == nil {
+		return 0
+	}
+	outer, inner := t.getIndices(glyphIndex, t.AdvanceHeightMapping)
+	return t.ItemVariationStore.GetDelta(outer, inner, coords)
+}
+
+func (t *VVARTable) GetTSBDelta(glyphIndex int, coords []float32) float32 {
+	if t == nil || t.ItemVariationStore == nil || t.TsbMapping == nil {
+		return 0
+	}
+	outer, inner := t.getIndices(glyphIndex, t.TsbMapping)
+	return t.ItemVariationStore.GetDelta(outer, inner, coords)
+}
+
+func (t *VVARTable) GetBSBDelta(glyphIndex int, coords []float32) float32 {
+	if t == nil || t.ItemVariationStore == nil || t.BsbMapping == nil {
+		return 0
+	}
+	outer, inner := t.getIndices(glyphIndex, t.BsbMapping)
+	return t.ItemVariationStore.GetDelta(outer, inner, coords)
+}
+
+func (t *VVARTable) GetVOrgDelta(glyphIndex int, coords []float32) float32 {
+	if t == nil || t.ItemVariationStore == nil || t.VOrgMapping == nil {
+		return 0
+	}
+	outer, inner := t.getIndices(glyphIndex, t.VOrgMapping)
+	return t.ItemVariationStore.GetDelta(outer, inner, coords)
+}
+
+func (t *VVARTable) getIndices(glyphIndex int, m *DeltaSetIndexMap) (int, int) {
+	var index uint32
+	if m != nil && len(m.Indices) > 0 {
+		if glyphIndex >= len(m.Indices) {
+			index = m.Indices[len(m.Indices)-1]
+		} else {
+			index = m.Indices[glyphIndex]
+		}
+	} else {
+		index = uint32(glyphIndex)
+	}
+	return int(index >> 16), int(index & 0xFFFF)
+}
+
 func ParseVVAR(s api.Stream) (*VVARTable, error) {
 	if s.Size() < 24 {
 		return nil, errors.New("VVAR table too short")
@@ -759,7 +1200,291 @@ func ParseVVAR(s api.Stream) (*VVARTable, error) {
 	return t, nil
 }
 
+// MVAR Table
+
+type MVARValueRecord struct {
+	ValueTag           uint32
+	DeltaSetOuterIndex uint16
+	DeltaSetInnerIndex uint16
+}
+
+type MVARTable struct {
+	MajorVersion       uint16
+	MinorVersion       uint16
+	ValueRecords       []MVARValueRecord
+	ItemVariationStore *ItemVariationStore
+}
+
+func ParseMVAR(s api.Stream) (*MVARTable, error) {
+	if s.Size() < 12 {
+		return nil, errors.New("MVAR table too short")
+	}
+	major, _ := readUint16(s, 0)
+	minor, _ := readUint16(s, 2)
+	if major != 1 || minor != 0 {
+		return nil, fmt.Errorf("unsupported MVAR version: %d.%d", major, minor)
+	}
+	valueRecordSize, _ := readUint16(s, 6)
+	valueRecordCount, _ := readUint16(s, 8)
+	ivsOff, _ := readUint16(s, 10)
+	if valueRecordCount > 0 && valueRecordSize < 8 {
+		return nil, errors.New("MVAR value record size too small")
+	}
+	recordsEnd := int64(12) + int64(valueRecordCount)*int64(valueRecordSize)
+	if recordsEnd > s.Size() {
+		return nil, errors.New("MVAR value records truncated")
+	}
+
+	t := &MVARTable{
+		MajorVersion: major,
+		MinorVersion: minor,
+		ValueRecords: make([]MVARValueRecord, valueRecordCount),
+	}
+	for i := 0; i < int(valueRecordCount); i++ {
+		off := int64(12) + int64(i)*int64(valueRecordSize)
+		t.ValueRecords[i].ValueTag, _ = readUint32(s, off)
+		t.ValueRecords[i].DeltaSetOuterIndex, _ = readUint16(s, off+4)
+		t.ValueRecords[i].DeltaSetInnerIndex, _ = readUint16(s, off+6)
+	}
+	if ivsOff != 0 {
+		if int64(ivsOff) >= s.Size() {
+			return nil, errors.New("MVAR item variation store offset out of range")
+		}
+		var err error
+		t.ItemVariationStore, err = ParseItemVariationStore(s, int64(ivsOff))
+		if err != nil {
+			return nil, err
+		}
+	}
+	return t, nil
+}
+
+func (t *MVARTable) FindValueRecord(valueTag uint32) *MVARValueRecord {
+	if t == nil {
+		return nil
+	}
+	for i := range t.ValueRecords {
+		if t.ValueRecords[i].ValueTag == valueTag {
+			return &t.ValueRecords[i]
+		}
+	}
+	return nil
+}
+
+func (t *MVARTable) GetDelta(valueTag uint32, coords []float32) float32 {
+	if t == nil || t.ItemVariationStore == nil {
+		return 0
+	}
+	record := t.FindValueRecord(valueTag)
+	if record == nil {
+		return 0
+	}
+	return t.ItemVariationStore.GetDelta(int(record.DeltaSetOuterIndex), int(record.DeltaSetInnerIndex), coords)
+}
+
+func (t *MVARTable) GetMetricDelta(valueTag uint32, coords []float32) int32 {
+	return roundVariationDelta(t.GetDelta(valueTag, coords))
+}
+
+func (t *MVARTable) ApplyMetricDelta(valueTag uint32, value int32, coords []float32) int32 {
+	return value + t.GetMetricDelta(valueTag, coords)
+}
+
 // Helpers
+
+func calculateTupleScalar(peak, start, end []float32, coords []float32) float32 {
+	if peak == nil {
+		return 1.0
+	}
+	var scalar float32 = 1.0
+	for i := 0; i < len(peak); i++ {
+		if i >= len(coords) {
+			break
+		}
+		p := peak[i]
+		curr := coords[i]
+		var s, e float32
+		if start != nil {
+			if i >= len(start) || i >= len(end) {
+				break
+			}
+			s = start[i]
+			e = end[i]
+		} else if p > 0 {
+			s = 0
+			e = p
+		} else if p < 0 {
+			s = p
+			e = 0
+		} else {
+			continue
+		}
+
+		if p == 0 || curr == p {
+			continue
+		}
+		if curr <= s || curr >= e {
+			return 0
+		}
+		if curr < p {
+			scalar *= (curr - s) / (p - s)
+		} else {
+			scalar *= (e - curr) / (e - p)
+		}
+	}
+	return scalar
+}
+
+func readF2Dot14Tuple(s api.Stream, offset int64, axisCount int) ([]float32, int64, error) {
+	if axisCount < 0 {
+		return nil, 0, errors.New("axis count cannot be negative")
+	}
+	if offset+int64(axisCount)*2 > s.Size() {
+		return nil, 0, errors.New("F2DOT14 tuple truncated")
+	}
+	tuple := make([]float32, axisCount)
+	for i := 0; i < axisCount; i++ {
+		v, _ := readInt16(s, offset)
+		tuple[i] = f2Dot14ToFloat(v)
+		offset += 2
+	}
+	return tuple, offset, nil
+}
+
+func f2Dot14ToFloat(v int16) float32 {
+	return float32(v) / 16384.0
+}
+
+func unpackVariationPointIndices(s api.Stream, offset int64) ([]int, int64, error) {
+	if offset >= s.Size() {
+		return nil, offset, errors.New("point number data truncated")
+	}
+	first, err := readByte(s, offset)
+	if err != nil {
+		return nil, offset, err
+	}
+	offset++
+	var count int
+	if first == 0 {
+		return nil, offset, nil // All points or all CVTs.
+	}
+	if first < 128 {
+		count = int(first)
+	} else {
+		if offset >= s.Size() {
+			return nil, offset, errors.New("point number count truncated")
+		}
+		second, err := readByte(s, offset)
+		if err != nil {
+			return nil, offset, err
+		}
+		offset++
+		count = (int(first&0x7F) << 8) | int(second)
+	}
+
+	indices := make([]int, count)
+	var lastIndex int
+	for i := 0; i < count; {
+		if offset >= s.Size() {
+			return nil, offset, errors.New("point number run truncated")
+		}
+		control, err := readByte(s, offset)
+		if err != nil {
+			return nil, offset, err
+		}
+		offset++
+		n := int(control&0x7F) + 1
+		if control&0x80 != 0 {
+			for j := 0; j < n && i < count; j++ {
+				if offset+2 > s.Size() {
+					return nil, offset, errors.New("point number word run truncated")
+				}
+				v, _ := readUint16(s, offset)
+				offset += 2
+				lastIndex += int(v)
+				indices[i] = lastIndex
+				i++
+			}
+		} else {
+			for j := 0; j < n && i < count; j++ {
+				if offset >= s.Size() {
+					return nil, offset, errors.New("point number byte run truncated")
+				}
+				v, err := readByte(s, offset)
+				if err != nil {
+					return nil, offset, err
+				}
+				offset++
+				lastIndex += int(v)
+				indices[i] = lastIndex
+				i++
+			}
+		}
+	}
+	return indices, offset, nil
+}
+
+func unpackVariationDeltaValues(s api.Stream, offset int64, count int, numPoints int) ([]int16, int64, error) {
+	if count == 0 {
+		count = numPoints
+	}
+	if count < 0 {
+		return nil, offset, errors.New("delta count cannot be negative")
+	}
+	values := make([]int16, count)
+	for i := 0; i < count; {
+		if offset >= s.Size() {
+			return nil, offset, errors.New("delta run truncated")
+		}
+		control, err := readByte(s, offset)
+		if err != nil {
+			return nil, offset, err
+		}
+		offset++
+		n := int(control&0x3F) + 1
+		if control&0x80 != 0 {
+			for j := 0; j < n && i < count; j++ {
+				values[i] = 0
+				i++
+			}
+		} else if control&0x40 != 0 {
+			for j := 0; j < n && i < count; j++ {
+				if offset+2 > s.Size() {
+					return nil, offset, errors.New("delta word run truncated")
+				}
+				v, _ := readInt16(s, offset)
+				offset += 2
+				values[i] = v
+				i++
+			}
+		} else {
+			for j := 0; j < n && i < count; j++ {
+				if offset >= s.Size() {
+					return nil, offset, errors.New("delta byte run truncated")
+				}
+				v, err := readByte(s, offset)
+				if err != nil {
+					return nil, offset, err
+				}
+				offset++
+				values[i] = int16(int8(v))
+				i++
+			}
+		}
+	}
+	return values, offset, nil
+}
+
+func roundVariationDelta(delta float32) int32 {
+	f := float64(delta)
+	if math.IsNaN(f) || math.IsInf(f, 0) {
+		return 0
+	}
+	if delta >= 0 {
+		return int32(delta + 0.5)
+	}
+	return int32(delta - 0.5)
+}
 
 func readUint16(s api.Stream, off int64) (uint16, error) {
 	var buf [2]byte

@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"syscall/js"
 
+	"github.com/dh-kam/freetype-go/api"
 	"github.com/dh-kam/freetype-go/core"
+	"github.com/dh-kam/freetype-go/helper"
 	"github.com/dh-kam/freetype-go/raster"
 	"github.com/dh-kam/freetype-go/sfnt"
 )
@@ -33,14 +35,24 @@ func renderGlyph(this js.Value, args []js.Value) interface{} {
 
 	charCode := args[1].Int()
 	size := args[2].Int()
+	faceIndex := 0
+	if len(args) >= 4 {
+		faceIndex = args[3].Int()
+	}
 
 	// 2. Load Font
-	stream := core.NewMemoryStream(fontData)
+	var stream api.Stream = core.NewMemoryStream(fontData)
+	stream, err := helper.DecodeWOFFIfNeeded(stream)
+	if err != nil {
+		return fmt.Sprintf("Error: decode WOFF container failed: %v", err)
+	}
 	sys := core.NewSystem()
-	loader := sfnt.NewLoader(sys)
-	face, err := loader.LoadFace(stream)
+	face, err := sfnt.LoadFaceIndex(sys, stream, faceIndex)
 	if err != nil {
 		return fmt.Sprintf("Error: %v", err)
+	}
+	if err := face.SetPixelSizes(size, size); err != nil {
+		return fmt.Sprintf("Error: invalid pixel size: %v", err)
 	}
 
 	// 3. Get Glyph Index
@@ -50,16 +62,13 @@ func renderGlyph(this js.Value, args []js.Value) interface{} {
 	}
 
 	// 4. Load and Hint
-	slot, err := face.LoadGlyph(glyphIndex, 0)
+	slot, err := face.LoadGlyph(glyphIndex, api.LoadDefault)
 	if err != nil {
 		return fmt.Sprintf("Error: load glyph failed: %v", err)
 	}
 
 	outline := slot.GetOutline()
 
-	// Scaling
-	scale := int32((int64(size) << 16) / int64(face.GetUnitsPerEm()))
-	outline.Scale(scale, scale)
 	outline.Translate(0, int32(size)<<6)
 
 	// 5. Render

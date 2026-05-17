@@ -1,0 +1,9 @@
+{
+  "description": "Minimal local smoke request for the conformance JSON dump tool. Supply the font with CONFORMANCE_FONT or -font.",
+  "corpus": "ascii-smoke",
+  "ppem": "12,16,24",
+  "glyphs": [0],
+  "chars": "U+0020,U+0030,U+0041,U+0061",
+  "load_flags": "no-hinting",
+  "render_mode": "none"
+}

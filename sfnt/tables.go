@@ -264,6 +264,38 @@ type CMap interface {
 	Lookup(char rune) uint16
 }
 
+// CMapVariation represents a cmap that can resolve Unicode variation sequences.
+type CMapVariation interface {
+	LookupVariation(char rune, selector rune) (glyphID uint16, useDefault bool, ok bool)
+}
+
+// CMapTable combines a base cmap with a format 14 Unicode variation sequence map.
+type CMapTable struct {
+	Base      CMap
+	Variation *CMapFormat14
+}
+
+func (m *CMapTable) Lookup(char rune) uint16 {
+	if m == nil || m.Base == nil {
+		return 0
+	}
+	return m.Base.Lookup(char)
+}
+
+func (m *CMapTable) LookupVariation(char rune, selector rune) (uint16, bool, bool) {
+	if m == nil || m.Variation == nil {
+		return 0, false, false
+	}
+	gid, useDefault, ok := m.Variation.LookupVariation(char, selector)
+	if !ok {
+		return 0, false, false
+	}
+	if useDefault && m.Base != nil {
+		gid = m.Base.Lookup(char)
+	}
+	return gid, useDefault, true
+}
+
 type CMapFormat0 struct {
 	GlyphIdArray [256]byte
 }
@@ -271,6 +303,61 @@ type CMapFormat0 struct {
 func (m *CMapFormat0) Lookup(char rune) uint16 {
 	if char >= 0 && char < 256 {
 		return uint16(m.GlyphIdArray[char])
+	}
+	return 0
+}
+
+type CMapFormat6 struct {
+	FirstCode    uint16
+	GlyphIdArray []uint16
+}
+
+func (m *CMapFormat6) Lookup(char rune) uint16 {
+	if char < 0 {
+		return 0
+	}
+	c := uint32(char)
+	first := uint32(m.FirstCode)
+	if c < first || c-first >= uint32(len(m.GlyphIdArray)) {
+		return 0
+	}
+	return m.GlyphIdArray[int(c-first)]
+}
+
+type CMapFormat8 struct {
+	Is32   [cmapFormat8Is32Size]byte
+	Groups []CMapFormat12Group
+}
+
+func (m *CMapFormat8) Lookup(char rune) uint16 {
+	if char < 0 || uint32(char) > maxUnicodeScalar {
+		return 0
+	}
+	c := uint32(char)
+	if c <= 0xffff {
+		if cmapFormat8Is32(&m.Is32, uint16(c)) {
+			return 0
+		}
+	} else if !cmapFormat8Is32(&m.Is32, uint16(c>>16)) {
+		return 0
+	}
+
+	i, j := 0, len(m.Groups)
+	for i < j {
+		h := i + (j-i)/2
+		if m.Groups[h].EndCharCode < c {
+			i = h + 1
+		} else {
+			j = h
+		}
+	}
+
+	if i < len(m.Groups) && m.Groups[i].StartCharCode <= c {
+		gid := uint64(m.Groups[i].StartGlyphID) + uint64(c-m.Groups[i].StartCharCode)
+		if gid > uint64(maxCMapGlyphID) {
+			return 0
+		}
+		return uint16(gid)
 	}
 	return 0
 }
@@ -329,6 +416,26 @@ func (m *CMapFormat4) Lookup(char rune) uint16 {
 	return gid
 }
 
+type CMapFormat10 struct {
+	StartCharCode uint32
+	GlyphIdArray  []uint16
+}
+
+func (m *CMapFormat10) Lookup(char rune) uint16 {
+	if char < 0 {
+		return 0
+	}
+	c := uint32(char)
+	if c < m.StartCharCode {
+		return 0
+	}
+	index := c - m.StartCharCode
+	if index >= uint32(len(m.GlyphIdArray)) {
+		return 0
+	}
+	return m.GlyphIdArray[int(index)]
+}
+
 type CMapFormat12 struct {
 	Groups []CMapFormat12Group
 }
@@ -340,6 +447,9 @@ type CMapFormat12Group struct {
 }
 
 func (m *CMapFormat12) Lookup(char rune) uint16 {
+	if char < 0 {
+		return 0
+	}
 	c := uint32(char)
 	i, j := 0, len(m.Groups)
 	for i < j {
@@ -352,10 +462,143 @@ func (m *CMapFormat12) Lookup(char rune) uint16 {
 	}
 
 	if i < len(m.Groups) && m.Groups[i].StartCharCode <= c {
-		return uint16(m.Groups[i].StartGlyphID + (c - m.Groups[i].StartCharCode))
+		gid := uint64(m.Groups[i].StartGlyphID) + uint64(c-m.Groups[i].StartCharCode)
+		if gid > uint64(maxCMapGlyphID) {
+			return 0
+		}
+		return uint16(gid)
 	}
 	return 0
 }
+
+type CMapFormat13 struct {
+	Groups []CMapFormat13Group
+}
+
+type CMapFormat13Group struct {
+	StartCharCode uint32
+	EndCharCode   uint32
+	GlyphID       uint32
+}
+
+func (m *CMapFormat13) Lookup(char rune) uint16 {
+	if char < 0 {
+		return 0
+	}
+	c := uint32(char)
+	i, j := 0, len(m.Groups)
+	for i < j {
+		h := i + (j-i)/2
+		if m.Groups[h].EndCharCode < c {
+			i = h + 1
+		} else {
+			j = h
+		}
+	}
+
+	if i < len(m.Groups) && m.Groups[i].StartCharCode <= c {
+		if m.Groups[i].GlyphID > maxCMapGlyphID {
+			return 0
+		}
+		return uint16(m.Groups[i].GlyphID)
+	}
+	return 0
+}
+
+type CMapFormat14 struct {
+	VariationSelectors []CMapVariationSelectorRecord
+}
+
+type CMapVariationSelectorRecord struct {
+	VarSelector   uint32
+	DefaultUVS    []CMapDefaultUVSRange
+	NonDefaultUVS []CMapNonDefaultUVSMapping
+}
+
+type CMapDefaultUVSRange struct {
+	StartUnicodeValue uint32
+	AdditionalCount   byte
+}
+
+type CMapNonDefaultUVSMapping struct {
+	UnicodeValue uint32
+	GlyphID      uint16
+}
+
+func (m *CMapFormat14) Lookup(char rune) uint16 {
+	return 0
+}
+
+func (m *CMapFormat14) LookupVariation(char rune, selector rune) (uint16, bool, bool) {
+	if char < 0 || selector < 0 || uint32(char) > maxUnicodeScalar || uint32(selector) > maxUnicodeScalar {
+		return 0, false, false
+	}
+	c := uint32(char)
+	sel := uint32(selector)
+
+	i, j := 0, len(m.VariationSelectors)
+	for i < j {
+		h := i + (j-i)/2
+		if m.VariationSelectors[h].VarSelector < sel {
+			i = h + 1
+		} else {
+			j = h
+		}
+	}
+	if i >= len(m.VariationSelectors) || m.VariationSelectors[i].VarSelector != sel {
+		return 0, false, false
+	}
+
+	record := &m.VariationSelectors[i]
+	if gid, ok := record.lookupNonDefault(c); ok {
+		return gid, false, true
+	}
+	if record.hasDefault(c) {
+		return 0, true, true
+	}
+	return 0, false, false
+}
+
+func (r *CMapVariationSelectorRecord) hasDefault(char uint32) bool {
+	i, j := 0, len(r.DefaultUVS)
+	for i < j {
+		h := i + (j-i)/2
+		if r.DefaultUVS[h].StartUnicodeValue+uint32(r.DefaultUVS[h].AdditionalCount) < char {
+			i = h + 1
+		} else {
+			j = h
+		}
+	}
+	if i >= len(r.DefaultUVS) {
+		return false
+	}
+	uvsRange := r.DefaultUVS[i]
+	return uvsRange.StartUnicodeValue <= char &&
+		char <= uvsRange.StartUnicodeValue+uint32(uvsRange.AdditionalCount)
+}
+
+func (r *CMapVariationSelectorRecord) lookupNonDefault(char uint32) (uint16, bool) {
+	i, j := 0, len(r.NonDefaultUVS)
+	for i < j {
+		h := i + (j-i)/2
+		if r.NonDefaultUVS[h].UnicodeValue < char {
+			i = h + 1
+		} else {
+			j = h
+		}
+	}
+	if i >= len(r.NonDefaultUVS) || r.NonDefaultUVS[i].UnicodeValue != char {
+		return 0, false
+	}
+	return r.NonDefaultUVS[i].GlyphID, true
+}
+
+const (
+	maxCMapGlyphID        = uint32(0xffff)
+	maxUnicodeScalar      = uint32(0x10ffff)
+	cmapFormat8Is32Size   = 8192
+	cmapFormat8HeaderSize = 12 + cmapFormat8Is32Size + 4
+)
 
 func parseCMap(s api.Stream) (CMap, error) {
 	if s.Size() < 4 {
@@ -369,6 +612,8 @@ func parseCMap(s api.Stream) (CMap, error) {
 
 	var bestCMap CMap
 	bestScore := -1
+	var bestVariation *CMapFormat14
+	bestVariationScore := -1
 
 	for i := 0; i < int(numTables); i++ {
 		off := int64(4 + i*8)
@@ -394,17 +639,31 @@ func parseCMap(s api.Stream) (CMap, error) {
 			score = 1
 		}
 
-		if score > bestScore {
-			cmap, err := parseCMapSubtable(s, int64(offset))
-			if err == nil {
-				bestCMap = cmap
-				bestScore = score
+		cmap, err := parseCMapSubtable(s, int64(offset))
+		if err != nil {
+			continue
+		}
+		if variation, ok := cmap.(*CMapFormat14); ok {
+			if score > bestVariationScore {
+				bestVariation = variation
+				bestVariationScore = score
 			}
+			continue
+		}
+		if score > bestScore {
+			bestCMap = cmap
+			bestScore = score
 		}
 	}
 
 	if bestCMap == nil {
+		if bestVariation != nil {
+			return bestVariation, nil
+		}
 		return nil, errors.New("no supported cmap subtable found")
+	}
+	if bestVariation != nil {
+		return &CMapTable{Base: bestCMap, Variation: bestVariation}, nil
 	}
 
 	return bestCMap, nil
@@ -418,8 +677,12 @@ func parseCMapSubtable(s api.Stream, offset int64) (CMap, error) {
 
 	switch format {
 	case 0:
-		if s.Size() < offset+262 {
-			return nil, errors.New("cmap format 0 too short")
+		length, err := readUint16(s, offset+2)
+		if err != nil {
+			return nil, err
+		}
+		if err := checkCMapSubtableLength(s, offset, uint32(length), 262, "cmap format 0"); err != nil {
+			return nil, err
 		}
 		var m CMapFormat0
 		for i := 0; i < 256; i++ {
@@ -431,19 +694,60 @@ func parseCMapSubtable(s api.Stream, offset int64) (CMap, error) {
 		}
 		return &m, nil
 
+	case 6:
+		length, err := readUint16(s, offset+2)
+		if err != nil {
+			return nil, err
+		}
+		if err := checkCMapSubtableLength(s, offset, uint32(length), 10, "cmap format 6"); err != nil {
+			return nil, err
+		}
+		firstCode, err := readUint16(s, offset+6)
+		if err != nil {
+			return nil, err
+		}
+		entryCount, err := readUint16(s, offset+8)
+		if err != nil {
+			return nil, err
+		}
+		if uint32(firstCode)+uint32(entryCount) > 0x10000 {
+			return nil, errors.New("cmap format 6 code range overflows BMP")
+		}
+		if !cmapItemsFit(uint32(length), 10, 2, uint32(entryCount)) {
+			return nil, errors.New("cmap format 6 too short for glyph array")
+		}
+
+		m := &CMapFormat6{
+			FirstCode:    firstCode,
+			GlyphIdArray: make([]uint16, int(entryCount)),
+		}
+		for i := 0; i < int(entryCount); i++ {
+			m.GlyphIdArray[i], err = readUint16(s, offset+10+int64(i*2))
+			if err != nil {
+				return nil, err
+			}
+		}
+		return m, nil
+
 	case 4:
 		length, err := readUint16(s, offset+2)
 		if err != nil {
 			return nil, err
 		}
-		if s.Size() < offset+int64(length) {
-			return nil, errors.New("cmap format 4 too short")
+		if err := checkCMapSubtableLength(s, offset, uint32(length), 16, "cmap format 4"); err != nil {
+			return nil, err
 		}
 		segCountX2, err := readUint16(s, offset+6)
 		if err != nil {
 			return nil, err
 		}
+		if segCountX2 == 0 || segCountX2%2 != 0 {
+			return nil, fmt.Errorf("invalid cmap format 4 segment count: %d", segCountX2)
+		}
 		segCount := int(segCountX2 / 2)
+		if !cmapItemsFit(uint32(length), 16, 8, uint32(segCount)) {
+			return nil, errors.New("cmap format 4 too short for segment arrays")
+		}
 
 		m := &CMapFormat4{
 			segCount:      segCount,
@@ -491,40 +795,435 @@ func parseCMapSubtable(s api.Stream, offset int64) (CMap, error) {
 		}
 		return m, nil
 
+	case 8:
+		length, err := readUint32(s, offset+4)
+		if err != nil {
+			return nil, err
+		}
+		if err := checkCMapSubtableLength(s, offset, length, cmapFormat8HeaderSize, "cmap format 8"); err != nil {
+			return nil, err
+		}
+		var is32 [cmapFormat8Is32Size]byte
+		if err := readExactAt(s, is32[:], offset+12); err != nil {
+			return nil, err
+		}
+		numGroups, err := readUint32(s, offset+12+cmapFormat8Is32Size)
+		if err != nil {
+			return nil, err
+		}
+		if !cmapItemsFit(length, cmapFormat8HeaderSize, 12, numGroups) {
+			return nil, errors.New("cmap format 8 too short for groups")
+		}
+		groupCount, err := cmapCountToInt(numGroups)
+		if err != nil {
+			return nil, err
+		}
+
+		m := &CMapFormat8{
+			Is32:   is32,
+			Groups: make([]CMapFormat12Group, groupCount),
+		}
+		for i := 0; i < groupCount; i++ {
+			groupOffset := offset + cmapFormat8HeaderSize + int64(i*12)
+			m.Groups[i].StartCharCode, err = readUint32(s, groupOffset)
+			if err != nil {
+				return nil, err
+			}
+			m.Groups[i].EndCharCode, err = readUint32(s, groupOffset+4)
+			if err != nil {
+				return nil, err
+			}
+			m.Groups[i].StartGlyphID, err = readUint32(s, groupOffset+8)
+			if err != nil {
+				return nil, err
+			}
+			if m.Groups[i].StartCharCode > m.Groups[i].EndCharCode {
+				return nil, errors.New("cmap format 8 group has descending character range")
+			}
+			if i > 0 && m.Groups[i].StartCharCode <= m.Groups[i-1].EndCharCode {
+				return nil, errors.New("cmap format 8 groups overlap or are unsorted")
+			}
+			if m.Groups[i].EndCharCode > maxUnicodeScalar {
+				return nil, errors.New("cmap format 8 group exceeds Unicode range")
+			}
+			if err := validateCMapFormat8Group(&is32, m.Groups[i].StartCharCode, m.Groups[i].EndCharCode); err != nil {
+				return nil, err
+			}
+			glyphIDMax := uint64(m.Groups[i].StartGlyphID) + uint64(m.Groups[i].EndCharCode-m.Groups[i].StartCharCode)
+			if glyphIDMax > uint64(maxCMapGlyphID) {
+				return nil, errors.New("cmap format 8 glyph range exceeds uint16 glyph IDs")
+			}
+		}
+		return m, nil
+
+	case 10:
+		length, err := readUint32(s, offset+4)
+		if err != nil {
+			return nil, err
+		}
+		if err := checkCMapSubtableLength(s, offset, length, 20, "cmap format 10"); err != nil {
+			return nil, err
+		}
+		startCharCode, err := readUint32(s, offset+12)
+		if err != nil {
+			return nil, err
+		}
+		numChars, err := readUint32(s, offset+16)
+		if err != nil {
+			return nil, err
+		}
+		if numChars > 0 && startCharCode > ^uint32(0)-numChars+1 {
+			return nil, errors.New("cmap format 10 code range overflows uint32")
+		}
+		if !cmapItemsFit(length, 20, 2, numChars) {
+			return nil, errors.New("cmap format 10 too short for glyph array")
+		}
+		count, err := cmapCountToInt(numChars)
+		if err != nil {
+			return nil, err
+		}
+
+		m := &CMapFormat10{
+			StartCharCode: startCharCode,
+			GlyphIdArray:  make([]uint16, count),
+		}
+		for i := 0; i < count; i++ {
+			m.GlyphIdArray[i], err = readUint16(s, offset+20+int64(i*2))
+			if err != nil {
+				return nil, err
+			}
+		}
+		return m, nil
+
 	case 12:
 		length, err := readUint32(s, offset+4)
 		if err != nil {
 			return nil, err
 		}
-		if s.Size() < offset+int64(length) {
-			return nil, errors.New("cmap format 12 too short")
+		if err := checkCMapSubtableLength(s, offset, length, 16, "cmap format 12"); err != nil {
+			return nil, err
 		}
 		numGroups, err := readUint32(s, offset+12)
 		if err != nil {
 			return nil, err
 		}
+		if !cmapItemsFit(length, 16, 12, numGroups) {
+			return nil, errors.New("cmap format 12 too short for groups")
+		}
+		groupCount, err := cmapCountToInt(numGroups)
+		if err != nil {
+			return nil, err
+		}
 
 		m := &CMapFormat12{
-			Groups: make([]CMapFormat12Group, numGroups),
+			Groups: make([]CMapFormat12Group, groupCount),
 		}
-		for i := uint32(0); i < numGroups; i++ {
-			m.Groups[i].StartCharCode, err = readUint32(s, offset+16+int64(i*12))
+		for i := 0; i < groupCount; i++ {
+			groupOffset := offset + 16 + int64(i*12)
+			m.Groups[i].StartCharCode, err = readUint32(s, groupOffset)
 			if err != nil {
 				return nil, err
 			}
-			m.Groups[i].EndCharCode, err = readUint32(s, offset+16+int64(i*12+4))
+			m.Groups[i].EndCharCode, err = readUint32(s, groupOffset+4)
 			if err != nil {
 				return nil, err
 			}
-			m.Groups[i].StartGlyphID, err = readUint32(s, offset+16+int64(i*12+8))
+			m.Groups[i].StartGlyphID, err = readUint32(s, groupOffset+8)
 			if err != nil {
 				return nil, err
+			}
+			if m.Groups[i].StartCharCode > m.Groups[i].EndCharCode {
+				return nil, errors.New("cmap format 12 group has descending character range")
+			}
+			if i > 0 && m.Groups[i].StartCharCode <= m.Groups[i-1].EndCharCode {
+				return nil, errors.New("cmap format 12 groups overlap or are unsorted")
+			}
+			glyphIDMax := uint64(m.Groups[i].StartGlyphID) + uint64(m.Groups[i].EndCharCode-m.Groups[i].StartCharCode)
+			if glyphIDMax > uint64(maxCMapGlyphID) {
+				return nil, errors.New("cmap format 12 glyph range exceeds uint16 glyph IDs")
+			}
+		}
+		return m, nil
+
+	case 13:
+		length, err := readUint32(s, offset+4)
+		if err != nil {
+			return nil, err
+		}
+		if err := checkCMapSubtableLength(s, offset, length, 16, "cmap format 13"); err != nil {
+			return nil, err
+		}
+		numGroups, err := readUint32(s, offset+12)
+		if err != nil {
+			return nil, err
+		}
+		if !cmapItemsFit(length, 16, 12, numGroups) {
+			return nil, errors.New("cmap format 13 too short for groups")
+		}
+		groupCount, err := cmapCountToInt(numGroups)
+		if err != nil {
+			return nil, err
+		}
+
+		m := &CMapFormat13{
+			Groups: make([]CMapFormat13Group, groupCount),
+		}
+		for i := 0; i < groupCount; i++ {
+			groupOffset := offset + 16 + int64(i*12)
+			m.Groups[i].StartCharCode, err = readUint32(s, groupOffset)
+			if err != nil {
+				return nil, err
+			}
+			m.Groups[i].EndCharCode, err = readUint32(s, groupOffset+4)
+			if err != nil {
+				return nil, err
+			}
+			m.Groups[i].GlyphID, err = readUint32(s, groupOffset+8)
+			if err != nil {
+				return nil, err
+			}
+			if m.Groups[i].StartCharCode > m.Groups[i].EndCharCode {
+				return nil, errors.New("cmap format 13 group has descending character range")
+			}
+			if i > 0 && m.Groups[i].StartCharCode <= m.Groups[i-1].EndCharCode {
+				return nil, errors.New("cmap format 13 groups overlap or are unsorted")
+			}
+			if m.Groups[i].GlyphID > maxCMapGlyphID {
+				return nil, errors.New("cmap format 13 glyph ID exceeds uint16")
+			}
+		}
+		return m, nil
+
+	case 14:
+		length, err := readUint32(s, offset+2)
+		if err != nil {
+			return nil, err
+		}
+		if err := checkCMapSubtableLength(s, offset, length, 10, "cmap format 14"); err != nil {
+			return nil, err
+		}
+		numRecords, err := readUint32(s, offset+6)
+		if err != nil {
+			return nil, err
+		}
+		if !cmapItemsFit(length, 10, 11, numRecords) {
+			return nil, errors.New("cmap format 14 too short for variation selector records")
+		}
+		recordCount, err := cmapCountToInt(numRecords)
+		if err != nil {
+			return nil, err
+		}
+
+		m := &CMapFormat14{
+			VariationSelectors: make([]CMapVariationSelectorRecord, recordCount),
+		}
+		var previousSelector uint32
+		for i := 0; i < recordCount; i++ {
+			recordOffset := offset + 10 + int64(i*11)
+			selector, err := readUint24(s, recordOffset)
+			if err != nil {
+				return nil, err
+			}
+			if selector > maxUnicodeScalar {
+				return nil, errors.New("cmap format 14 variation selector exceeds Unicode range")
+			}
+			if i > 0 && selector <= previousSelector {
+				return nil, errors.New("cmap format 14 variation selectors overlap or are unsorted")
+			}
+			previousSelector = selector
+
+			defaultOffset, err := readUint32(s, recordOffset+3)
+			if err != nil {
+				return nil, err
+			}
+			nonDefaultOffset, err := readUint32(s, recordOffset+7)
+			if err != nil {
+				return nil, err
+			}
+
+			record := &m.VariationSelectors[i]
+			record.VarSelector = selector
+			if defaultOffset != 0 {
+				record.DefaultUVS, err = parseCMap14DefaultUVS(s, offset, length, defaultOffset)
+				if err != nil {
+					return nil, err
+				}
+			}
+			if nonDefaultOffset != 0 {
+				record.NonDefaultUVS, err = parseCMap14NonDefaultUVS(s, offset, length, nonDefaultOffset)
+				if err != nil {
+					return nil, err
+				}
 			}
 		}
 		return m, nil
 	}
 
 	return nil, fmt.Errorf("unsupported cmap format: %d", format)
+}
+
+func cmapFormat8Is32(is32 *[cmapFormat8Is32Size]byte, word uint16) bool {
+	return is32[int(word)/8]&byte(1<<(7-(word%8))) != 0
+}
+
+func validateCMapFormat8Group(is32 *[cmapFormat8Is32Size]byte, start uint32, end uint32) error {
+	if start <= 0xffff {
+		if end > 0xffff {
+			return errors.New("cmap format 8 group mixes 16-bit and 32-bit character codes")
+		}
+		for c := start; c <= end; c++ {
+			if cmapFormat8Is32(is32, uint16(c)) {
+				return errors.New("cmap format 8 maps 16-bit code marked as 32-bit lead")
+			}
+		}
+		return nil
+	}
+
+	startHigh := start >> 16
+	endHigh := end >> 16
+	for high := startHigh; high <= endHigh; high++ {
+		if !cmapFormat8Is32(is32, uint16(high)) {
+			return errors.New("cmap format 8 missing 32-bit lead marker")
+		}
+	}
+	return nil
+}
+
+func parseCMap14DefaultUVS(s api.Stream, cmapOffset int64, cmapLength uint32, tableOffset uint32) ([]CMapDefaultUVSRange, error) {
+	offset, available, err := checkedCMap14SubtableOffset(cmapOffset, cmapLength, tableOffset, 4, "cmap format 14 default UVS table")
+	if err != nil {
+		return nil, err
+	}
+	numRanges, err := readUint32(s, offset)
+	if err != nil {
+		return nil, err
+	}
+	if !cmapItemsFit(available, 4, 4, numRanges) {
+		return nil, errors.New("cmap format 14 default UVS table too short for ranges")
+	}
+	rangeCount, err := cmapCountToInt(numRanges)
+	if err != nil {
+		return nil, err
+	}
+
+	ranges := make([]CMapDefaultUVSRange, rangeCount)
+	var previousEnd uint32
+	for i := 0; i < rangeCount; i++ {
+		rangeOffset := offset + 4 + int64(i*4)
+		start, err := readUint24(s, rangeOffset)
+		if err != nil {
+			return nil, err
+		}
+		additionalCount, err := readByte(s, rangeOffset+3)
+		if err != nil {
+			return nil, err
+		}
+		end := start + uint32(additionalCount)
+		if start > maxUnicodeScalar || end > maxUnicodeScalar {
+			return nil, errors.New("cmap format 14 default UVS range exceeds Unicode range")
+		}
+		if i > 0 && start <= previousEnd {
+			return nil, errors.New("cmap format 14 default UVS ranges overlap or are unsorted")
+		}
+		previousEnd = end
+		ranges[i] = CMapDefaultUVSRange{
+			StartUnicodeValue: start,
+			AdditionalCount:   additionalCount,
+		}
+	}
+	return ranges, nil
+}
+
+func parseCMap14NonDefaultUVS(s api.Stream, cmapOffset int64, cmapLength uint32, tableOffset uint32) ([]CMapNonDefaultUVSMapping, error) {
+	offset, available, err := checkedCMap14SubtableOffset(cmapOffset, cmapLength, tableOffset, 4, "cmap format 14 non-default UVS table")
+	if err != nil {
+		return nil, err
+	}
+	numMappings, err := readUint32(s, offset)
+	if err != nil {
+		return nil, err
+	}
+	if !cmapItemsFit(available, 4, 5, numMappings) {
+		return nil, errors.New("cmap format 14 non-default UVS table too short for mappings")
+	}
+	mappingCount, err := cmapCountToInt(numMappings)
+	if err != nil {
+		return nil, err
+	}
+
+	mappings := make([]CMapNonDefaultUVSMapping, mappingCount)
+	var previousUnicode uint32
+	for i := 0; i < mappingCount; i++ {
+		mappingOffset := offset + 4 + int64(i*5)
+		unicodeValue, err := readUint24(s, mappingOffset)
+		if err != nil {
+			return nil, err
+		}
+		if unicodeValue > maxUnicodeScalar {
+			return nil, errors.New("cmap format 14 non-default UVS mapping exceeds Unicode range")
+		}
+		if i > 0 && unicodeValue <= previousUnicode {
+			return nil, errors.New("cmap format 14 non-default UVS mappings overlap or are unsorted")
+		}
+		previousUnicode = unicodeValue
+
+		glyphID, err := readUint16(s, mappingOffset+3)
+		if err != nil {
+			return nil, err
+		}
+		mappings[i] = CMapNonDefaultUVSMapping{
+			UnicodeValue: unicodeValue,
+			GlyphID:      glyphID,
+		}
+	}
+	return mappings, nil
+}
+
+func checkedCMap14SubtableOffset(cmapOffset int64, cmapLength uint32, tableOffset uint32, minLength uint32, name string) (int64, uint32, error) {
+	if tableOffset > cmapLength || cmapLength-tableOffset < minLength {
+		return 0, 0, fmt.Errorf("%s too short", name)
+	}
+	return cmapOffset + int64(tableOffset), cmapLength - tableOffset, nil
+}
+
+func checkCMapSubtableLength(s api.Stream, offset int64, length uint32, minLength uint32, name string) error {
+	if length < minLength {
+		return fmt.Errorf("%s too short", name)
+	}
+	end := offset + int64(length)
+	if offset < 0 || end < offset || s.Size() < end {
+		return fmt.Errorf("%s too short", name)
+	}
+	return nil
+}
+
+func checkTableRange(s api.Stream, offset int64, length int64, name string) error {
+	if offset < 0 || length < 0 || offset > s.Size() || s.Size()-offset < length {
+		return fmt.Errorf("%s too short", name)
+	}
+	return nil
+}
+
+func cmapItemsFit(length uint32, headerSize uint32, itemSize uint32, count uint32) bool {
+	if length < headerSize {
+		return false
+	}
+	return uint64(count)*uint64(itemSize) <= uint64(length-headerSize)
+}
+
+func cmapCountToInt(count uint32) (int, error) {
+	if uint64(count) > uint64(int(^uint(0)>>1)) {
+		return 0, errors.New("cmap subtable item count too large")
+	}
+	return int(count), nil
+}
+
+func readUint24(s api.Stream, off int64) (uint32, error) {
+	var buf [3]byte
+	if err := readExactAt(s, buf[:], off); err != nil {
+		return 0, err
+	}
+	return uint32(buf[0])<<16 | uint32(buf[1])<<8 | uint32(buf[2]), nil
 }
 
 func parseMaxp(s api.Stream) (MaxpTable, error) {
@@ -1082,16 +1781,79 @@ func parseVORG(s api.Stream) (VORGTable, error) {
 }
 
 type BASETable struct {
-	MajorVersion    uint16
-	MinorVersion    uint16
-	HorizAxisOffset uint16
-	VertAxisOffset  uint16
+	MajorVersion       uint16
+	MinorVersion       uint16
+	HorizAxisOffset    uint16
+	VertAxisOffset     uint16
+	ItemVarStoreOffset uint32
+	HorizAxis          *BASEAxis
+	VertAxis           *BASEAxis
+}
+
+type BASEAxis struct {
+	BaseTagListOffset    uint16
+	BaseScriptListOffset uint16
+	BaseTags             []uint32
+	BaseScriptRecords    []BASEScriptRecord
+}
+
+type BASEScriptRecord struct {
+	BaseScriptTag    uint32
+	BaseScriptOffset uint16
+	BaseScript       BASEScript
+}
+
+type BASEScript struct {
+	BaseValuesOffset    uint16
+	DefaultMinMaxOffset uint16
+	BaseLangSysCount    uint16
+	BaseLangSysRecords  []BASELangSysRecord
+	BaseValues          *BASEValues
+	DefaultMinMax       *BASEMinMax
+}
+
+type BASELangSysRecord struct {
+	BaseLangSysTag uint32
+	MinMaxOffset   uint16
+	MinMax         *BASEMinMax
+}
+
+type BASEValues struct {
+	DefaultBaselineIndex uint16
+	BaseCoordCount       uint16
+	BaseCoordOffsets     []uint16
+	BaseCoords           []*BASECoord
+}
+
+type BASECoord struct {
+	Format         uint16
+	Coordinate     int16
+	ReferenceGlyph uint16
+	BaseCoordPoint uint16
+	DeviceOffset   uint16
+}
+
+type BASEMinMax struct {
+	MinCoordOffset    uint16
+	MaxCoordOffset    uint16
+	FeatMinMaxCount   uint16
+	MinCoord          *BASECoord
+	MaxCoord          *BASECoord
+	FeatMinMaxRecords []BASEFeatMinMaxRecord
+}
+
+type BASEFeatMinMaxRecord struct {
+	FeatureTag     uint32
+	MinCoordOffset uint16
+	MaxCoordOffset uint16
+	MinCoord       *BASECoord
+	MaxCoord       *BASECoord
 }
 
 func ParseBASE(s api.Stream) (BASETable, error) {
 	var t BASETable
 	var err error
-	if s.Size() < 4 {
+	if s.Size() < 8 {
 		return t, errors.New("BASE table too short")
 	}
 	t.MajorVersion, err = readUint16(s, 0)
@@ -1102,17 +1864,325 @@ func ParseBASE(s api.Stream) (BASETable, error) {
 	if err != nil {
 		return t, err
 	}
-	if s.Size() >= 8 {
-		t.HorizAxisOffset, err = readUint16(s, 4)
+	t.HorizAxisOffset, err = readUint16(s, 4)
+	if err != nil {
+		return t, err
+	}
+	t.VertAxisOffset, err = readUint16(s, 6)
+	if err != nil {
+		return t, err
+	}
+	if t.MinorVersion >= 1 {
+		if s.Size() < 12 {
+			return t, errors.New("BASE version 1.1 table too short")
+		}
+		t.ItemVarStoreOffset, err = readUint32(s, 8)
 		if err != nil {
 			return t, err
 		}
-		t.VertAxisOffset, err = readUint16(s, 6)
+	}
+	if t.HorizAxisOffset != 0 {
+		t.HorizAxis, err = parseBASEAxis(s, int64(t.HorizAxisOffset))
+		if err != nil {
+			return t, err
+		}
+	}
+	if t.VertAxisOffset != 0 {
+		t.VertAxis, err = parseBASEAxis(s, int64(t.VertAxisOffset))
 		if err != nil {
 			return t, err
 		}
 	}
 	return t, nil
+}
+
+func parseBASEAxis(s api.Stream, offset int64) (*BASEAxis, error) {
+	if err := checkTableRange(s, offset, 4, "BASE Axis table"); err != nil {
+		return nil, err
+	}
+	axis := &BASEAxis{}
+	var err error
+	axis.BaseTagListOffset, err = readUint16(s, offset)
+	if err != nil {
+		return nil, err
+	}
+	axis.BaseScriptListOffset, err = readUint16(s, offset+2)
+	if err != nil {
+		return nil, err
+	}
+	if axis.BaseTagListOffset != 0 {
+		axis.BaseTags, err = parseBASETagList(s, offset+int64(axis.BaseTagListOffset))
+		if err != nil {
+			return nil, err
+		}
+	}
+	if axis.BaseScriptListOffset == 0 {
+		return nil, errors.New("BASE Axis missing BaseScriptList")
+	}
+	axis.BaseScriptRecords, err = parseBASEScriptList(s, offset+int64(axis.BaseScriptListOffset))
+	if err != nil {
+		return nil, err
+	}
+	return axis, nil
+}
+
+func parseBASETagList(s api.Stream, offset int64) ([]uint32, error) {
+	if err := checkTableRange(s, offset, 2, "BASE BaseTagList table"); err != nil {
+		return nil, err
+	}
+	count, err := readUint16(s, offset)
+	if err != nil {
+		return nil, err
+	}
+	if err := checkTableRange(s, offset, 2+int64(count)*4, "BASE BaseTagList table"); err != nil {
+		return nil, err
+	}
+	tags := make([]uint32, int(count))
+	for i := 0; i < int(count); i++ {
+		tags[i], err = readUint32(s, offset+2+int64(i*4))
+		if err != nil {
+			return nil, err
+		}
+	}
+	return tags, nil
+}
+
+func parseBASEScriptList(s api.Stream, offset int64) ([]BASEScriptRecord, error) {
+	if err := checkTableRange(s, offset, 2, "BASE BaseScriptList table"); err != nil {
+		return nil, err
+	}
+	count, err := readUint16(s, offset)
+	if err != nil {
+		return nil, err
+	}
+	if err := checkTableRange(s, offset, 2+int64(count)*6, "BASE BaseScriptList table"); err != nil {
+		return nil, err
+	}
+	records := make([]BASEScriptRecord, int(count))
+	for i := 0; i < int(count); i++ {
+		recordOffset := offset + 2 + int64(i*6)
+		records[i].BaseScriptTag, err = readUint32(s, recordOffset)
+		if err != nil {
+			return nil, err
+		}
+		records[i].BaseScriptOffset, err = readUint16(s, recordOffset+4)
+		if err != nil {
+			return nil, err
+		}
+		if records[i].BaseScriptOffset == 0 {
+			return nil, errors.New("BASE BaseScriptRecord has null BaseScript offset")
+		}
+		records[i].BaseScript, err = parseBASEScript(s, offset+int64(records[i].BaseScriptOffset))
+		if err != nil {
+			return nil, err
+		}
+	}
+	return records, nil
+}
+
+func parseBASEScript(s api.Stream, offset int64) (BASEScript, error) {
+	var script BASEScript
+	if err := checkTableRange(s, offset, 6, "BASE BaseScript table"); err != nil {
+		return script, err
+	}
+	var err error
+	script.BaseValuesOffset, err = readUint16(s, offset)
+	if err != nil {
+		return script, err
+	}
+	script.DefaultMinMaxOffset, err = readUint16(s, offset+2)
+	if err != nil {
+		return script, err
+	}
+	script.BaseLangSysCount, err = readUint16(s, offset+4)
+	if err != nil {
+		return script, err
+	}
+	if err := checkTableRange(s, offset, 6+int64(script.BaseLangSysCount)*6, "BASE BaseScript table"); err != nil {
+		return script, err
+	}
+	if script.BaseValuesOffset != 0 {
+		values, err := parseBASEValues(s, offset+int64(script.BaseValuesOffset))
+		if err != nil {
+			return script, err
+		}
+		script.BaseValues = values
+	}
+	if script.DefaultMinMaxOffset != 0 {
+		minMax, err := parseBASEMinMax(s, offset+int64(script.DefaultMinMaxOffset))
+		if err != nil {
+			return script, err
+		}
+		script.DefaultMinMax = minMax
+	}
+	script.BaseLangSysRecords = make([]BASELangSysRecord, int(script.BaseLangSysCount))
+	for i := 0; i < int(script.BaseLangSysCount); i++ {
+		recordOffset := offset + 6 + int64(i*6)
+		script.BaseLangSysRecords[i].BaseLangSysTag, err = readUint32(s, recordOffset)
+		if err != nil {
+			return script, err
+		}
+		script.BaseLangSysRecords[i].MinMaxOffset, err = readUint16(s, recordOffset+4)
+		if err != nil {
+			return script, err
+		}
+		if script.BaseLangSysRecords[i].MinMaxOffset == 0 {
+			return script, errors.New("BASE BaseLangSysRecord has null MinMax offset")
+		}
+		minMax, err := parseBASEMinMax(s, offset+int64(script.BaseLangSysRecords[i].MinMaxOffset))
+		if err != nil {
+			return script, err
+		}
+		script.BaseLangSysRecords[i].MinMax = minMax
+	}
+	return script, nil
+}
+
+func parseBASEValues(s api.Stream, offset int64) (*BASEValues, error) {
+	if err := checkTableRange(s, offset, 4, "BASE BaseValues table"); err != nil {
+		return nil, err
+	}
+	values := &BASEValues{}
+	var err error
+	values.DefaultBaselineIndex, err = readUint16(s, offset)
+	if err != nil {
+		return nil, err
+	}
+	values.BaseCoordCount, err = readUint16(s, offset+2)
+	if err != nil {
+		return nil, err
+	}
+	if values.BaseCoordCount > 0 && values.DefaultBaselineIndex >= values.BaseCoordCount {
+		return nil, errors.New("BASE BaseValues default baseline index out of range")
+	}
+	if err := checkTableRange(s, offset, 4+int64(values.BaseCoordCount)*2, "BASE BaseValues table"); err != nil {
+		return nil, err
+	}
+	values.BaseCoordOffsets = make([]uint16, int(values.BaseCoordCount))
+	values.BaseCoords = make([]*BASECoord, int(values.BaseCoordCount))
+	for i := 0; i < int(values.BaseCoordCount); i++ {
+		values.BaseCoordOffsets[i], err = readUint16(s, offset+4+int64(i*2))
+		if err != nil {
+			return nil, err
+		}
+		if values.BaseCoordOffsets[i] == 0 {
+			continue
+		}
+		coord, err := parseBASECoord(s, offset+int64(values.BaseCoordOffsets[i]))
+		if err != nil {
+			return nil, err
+		}
+		values.BaseCoords[i] = coord
+	}
+	return values, nil
+}
+
+func parseBASECoord(s api.Stream, offset int64) (*BASECoord, error) {
+	if err := checkTableRange(s, offset, 4, "BASE BaseCoord table"); err != nil {
+		return nil, err
+	}
+	coord := &BASECoord{}
+	var err error
+	coord.Format, err = readUint16(s, offset)
+	if err != nil {
+		return nil, err
+	}
+	coord.Coordinate, err = readInt16(s, offset+2)
+	if err != nil {
+		return nil, err
+	}
+	switch coord.Format {
+	case 1:
+		return coord, nil
+	case 2:
+		if err := checkTableRange(s, offset, 8, "BASE BaseCoord format 2 table"); err != nil {
+			return nil, err
+		}
+		coord.ReferenceGlyph, err = readUint16(s, offset+4)
+		if err != nil {
+			return nil, err
+		}
+		coord.BaseCoordPoint, err = readUint16(s, offset+6)
+		if err != nil {
+			return nil, err
+		}
+		return coord, nil
+	case 3:
+		if err := checkTableRange(s, offset, 6, "BASE BaseCoord format 3 table"); err != nil {
+			return nil, err
+		}
+		coord.DeviceOffset, err = readUint16(s, offset+4)
+		if err != nil {
+			return nil, err
+		}
+		return coord, nil
+	default:
+		return nil, fmt.Errorf("unsupported BASE BaseCoord format: %d", coord.Format)
+	}
+}
+
+func parseBASEMinMax(s api.Stream, offset int64) (*BASEMinMax, error) {
+	if err := checkTableRange(s, offset, 6, "BASE MinMax table"); err != nil {
+		return nil, err
+	}
+	minMax := &BASEMinMax{}
+	var err error
+	minMax.MinCoordOffset, err = readUint16(s, offset)
+	if err != nil {
+		return nil, err
+	}
+	minMax.MaxCoordOffset, err = readUint16(s, offset+2)
+	if err != nil {
+		return nil, err
+	}
+	minMax.FeatMinMaxCount, err = readUint16(s, offset+4)
+	if err != nil {
+		return nil, err
+	}
+	if err := checkTableRange(s, offset, 6+int64(minMax.FeatMinMaxCount)*8, "BASE MinMax table"); err != nil {
+		return nil, err
+	}
+	if minMax.MinCoordOffset != 0 {
+		minMax.MinCoord, err = parseBASECoord(s, offset+int64(minMax.MinCoordOffset))
+		if err != nil {
+			return nil, err
+		}
+	}
+	if minMax.MaxCoordOffset != 0 {
+		minMax.MaxCoord, err = parseBASECoord(s, offset+int64(minMax.MaxCoordOffset))
+		if err != nil {
+			return nil, err
+		}
+	}
+	minMax.FeatMinMaxRecords = make([]BASEFeatMinMaxRecord, int(minMax.FeatMinMaxCount))
+	for i := 0; i < int(minMax.FeatMinMaxCount); i++ {
+		recordOffset := offset + 6 + int64(i*8)
+		minMax.FeatMinMaxRecords[i].FeatureTag, err = readUint32(s, recordOffset)
+		if err != nil {
+			return nil, err
+		}
+		minMax.FeatMinMaxRecords[i].MinCoordOffset, err = readUint16(s, recordOffset+4)
+		if err != nil {
+			return nil, err
+		}
+		minMax.FeatMinMaxRecords[i].MaxCoordOffset, err = readUint16(s, recordOffset+6)
+		if err != nil {
+			return nil, err
+		}
+		if minMax.FeatMinMaxRecords[i].MinCoordOffset != 0 {
+			minMax.FeatMinMaxRecords[i].MinCoord, err = parseBASECoord(s, offset+int64(minMax.FeatMinMaxRecords[i].MinCoordOffset))
+			if err != nil {
+				return nil, err
+			}
+		}
+		if minMax.FeatMinMaxRecords[i].MaxCoordOffset != 0 {
+			minMax.FeatMinMaxRecords[i].MaxCoord, err = parseBASECoord(s, offset+int64(minMax.FeatMinMaxRecords[i].MaxCoordOffset))
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	return minMax, nil
 }
 
 type JstfTable struct {
@@ -1191,6 +2261,28 @@ type VDMXTable struct {
 	Version       uint16
 	NumRatios     uint16
 	NumVDMXGroups uint16
+	RatioRanges   []VDMXRatioRange
+	GroupOffsets  []uint16
+	Groups        []VDMXGroup
+}
+
+type VDMXRatioRange struct {
+	CharSet     byte
+	XRatio      byte
+	YStartRatio byte
+	YEndRatio   byte
+}
+
+type VDMXGroup struct {
+	StartSize byte
+	EndSize   byte
+	Records   []VDMXRecord
+}
+
+type VDMXRecord struct {
+	YPelHeight uint16
+	YMax       int16
+	YMin       int16
 }
 
 func parseVDMX(s api.Stream) (VDMXTable, error) {
@@ -1203,15 +2295,110 @@ func parseVDMX(s api.Stream) (VDMXTable, error) {
 	if err != nil {
 		return t, err
 	}
-	t.NumRatios, err = readUint16(s, 2)
+	t.NumVDMXGroups, err = readUint16(s, 2)
 	if err != nil {
 		return t, err
 	}
-	t.NumVDMXGroups, err = readUint16(s, 4)
+	t.NumRatios, err = readUint16(s, 4)
 	if err != nil {
 		return t, err
 	}
+
+	ratioCount := int(t.NumRatios)
+	ratioRangesOffset := int64(6)
+	groupOffsetsOffset := ratioRangesOffset + int64(ratioCount*4)
+	groupDataMinOffset := groupOffsetsOffset + int64(ratioCount*2)
+	if s.Size() < groupDataMinOffset {
+		return t, errors.New("VDMX table too short for ratio ranges")
+	}
+
+	t.RatioRanges = make([]VDMXRatioRange, ratioCount)
+	for i := 0; i < ratioCount; i++ {
+		rangeOffset := ratioRangesOffset + int64(i*4)
+		t.RatioRanges[i].CharSet, err = readByte(s, rangeOffset)
+		if err != nil {
+			return t, err
+		}
+		t.RatioRanges[i].XRatio, err = readByte(s, rangeOffset+1)
+		if err != nil {
+			return t, err
+		}
+		t.RatioRanges[i].YStartRatio, err = readByte(s, rangeOffset+2)
+		if err != nil {
+			return t, err
+		}
+		t.RatioRanges[i].YEndRatio, err = readByte(s, rangeOffset+3)
+		if err != nil {
+			return t, err
+		}
+	}
+
+	t.GroupOffsets = make([]uint16, ratioCount)
+	seenGroupOffsets := make(map[uint16]bool, ratioCount)
+	for i := 0; i < ratioCount; i++ {
+		groupOffset, err := readUint16(s, groupOffsetsOffset+int64(i*2))
+		if err != nil {
+			return t, err
+		}
+		t.GroupOffsets[i] = groupOffset
+		if seenGroupOffsets[groupOffset] {
+			continue
+		}
+		seenGroupOffsets[groupOffset] = true
+		if int64(groupOffset) < groupDataMinOffset {
+			return t, errors.New("VDMX group offset points into header")
+		}
+		if len(t.Groups) >= int(t.NumVDMXGroups) {
+			return t, errors.New("VDMX table has more group offsets than declared groups")
+		}
+		group, err := parseVDMXGroup(s, int64(groupOffset))
+		if err != nil {
+			return t, err
+		}
+		t.Groups = append(t.Groups, group)
+	}
+
 	return t, nil
+}
+
+func parseVDMXGroup(s api.Stream, offset int64) (VDMXGroup, error) {
+	var g VDMXGroup
+	if offset < 0 || s.Size() < offset+4 {
+		return g, errors.New("VDMX group too short")
+	}
+	numRecords, err := readUint16(s, offset)
+	if err != nil {
+		return g, err
+	}
+	g.StartSize, err = readByte(s, offset+2)
+	if err != nil {
+		return g, err
+	}
+	g.EndSize, err = readByte(s, offset+3)
+	if err != nil {
+		return g, err
+	}
+	if s.Size() < offset+4+int64(numRecords)*6 {
+		return g, errors.New("VDMX group too short for records")
+	}
+
+	g.Records = make([]VDMXRecord, int(numRecords))
+	for i := 0; i < int(numRecords); i++ {
+		recordOffset := offset + 4 + int64(i*6)
+		g.Records[i].YPelHeight, err = readUint16(s, recordOffset)
+		if err != nil {
+			return g, err
+		}
+		g.Records[i].YMax, err = readInt16(s, recordOffset+2)
+		if err != nil {
+			return g, err
+		}
+		g.Records[i].YMin, err = readInt16(s, recordOffset+4)
+		if err != nil {
+			return g, err
+		}
+	}
+	return g, nil
 }
 
 type HdmxDeviceRecord struct {

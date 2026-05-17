@@ -9,9 +9,13 @@ import (
 	"github.com/dh-kam/freetype-go/color"
 	"github.com/dh-kam/freetype-go/core"
 	"github.com/dh-kam/freetype-go/layout"
+	ftmath "github.com/dh-kam/freetype-go/math"
+	"github.com/dh-kam/freetype-go/raster"
 	"github.com/dh-kam/freetype-go/truetype"
 	"github.com/dh-kam/freetype-go/var"
 )
+
+const tagTTCF = 0x74746366
 
 // loader implements api.Driver for SFNT formats.
 type loader struct {
@@ -20,6 +24,17 @@ type loader struct {
 
 func NewLoader(sys api.FreetypeSystem) api.Driver {
 	return &loader{sys: sys}
+}
+
+// LoadFaceIndex loads a face from an SFNT stream or collection.
+// Non-collection fonts only support faceIndex 0.
+func LoadFaceIndex(sys api.FreetypeSystem, stream api.Stream, faceIndex int) (api.Face, error) {
+	return (&loader{sys: sys}).LoadFaceIndex(stream, faceIndex)
+}
+
+// NumFaces returns the number of faces in an SFNT stream or collection.
+func NumFaces(stream api.Stream) (int, error) {
+	return sfntFaceCount(stream)
 }
 
 func (f *Face) getVM() *truetype.ExecutionEnv {
@@ -53,17 +68,29 @@ func (l *loader) Handles(stream api.Stream) bool {
 		return false
 	}
 	magic := uint32(buf[0])<<24 | uint32(buf[1])<<16 | uint32(buf[2])<<8 | uint32(buf[3])
-	return magic == 0x00010000 || magic == 0x4F54544F
+	return magic == 0x00010000 || magic == 0x4F54544F || magic == tagTTCF
 }
 
 func (l *loader) LoadFace(stream api.Stream) (api.Face, error) {
+	return l.LoadFaceIndex(stream, 0)
+}
+
+func (l *loader) LoadFaceIndex(stream api.Stream, faceIndex int) (api.Face, error) {
+	directoryOffset, err := sfntDirectoryOffset(stream, faceIndex)
+	if err != nil {
+		return nil, err
+	}
+
 	f := &Face{
-		stream:    stream,
-		tables:    make(map[uint32]Table),
-		sys:       l.sys,
-		xPPEM:     24,
-		yPPEM:     24,
-		pointSize: 24,
+		stream:          stream,
+		directoryOffset: directoryOffset,
+		tables:          make(map[uint32]Table),
+		sys:             l.sys,
+		xPPEM:           24,
+		yPPEM:           24,
+		xScale:          1 << 16,
+		yScale:          1 << 16,
+		pointSize:       24,
 	}
 
 	if err := f.parseDirectory(); err != nil {
@@ -103,15 +130,13 @@ func (l *loader) LoadFace(stream api.Stream) (api.Face, error) {
 
 	f.funcs = make(map[int32][]byte)
 	f.instrs = make(map[int32][]byte)
+	f.recomputeSizeMetrics()
 
 	vm := f.getVM()
 	defer vm.Free()
 
-	if len(f.cvt) > 0 {
-		f.scaledCVT = make([]int32, len(f.cvt))
-		copy(f.scaledCVT, f.cvt)
-		vm.CVT = f.scaledCVT
-	}
+	f.scaleCVT()
+	vm.CVT = f.scaledCVT
 
 	// Run fpgm once at load time to populate functions/instructions
 	if len(f.fpgm) > 0 {
@@ -249,50 +274,128 @@ func (l *loader) LoadFace(stream api.Stream) (api.Face, error) {
 	return f, nil
 }
 
+func sfntFaceCount(stream api.Stream) (int, error) {
+	if stream.Size() < 4 {
+		return 0, errors.New("stream too short for SFNT signature")
+	}
+	magic, err := readUint32(stream, 0)
+	if err != nil {
+		return 0, err
+	}
+	if magic != tagTTCF {
+		return 1, nil
+	}
+	if stream.Size() < 16 {
+		return 0, errors.New("TTC header too short")
+	}
+	version, err := readUint32(stream, 4)
+	if err != nil {
+		return 0, err
+	}
+	if version != 0x00010000 && version != 0x00020000 {
+		return 0, fmt.Errorf("unsupported TTC version 0x%08x", version)
+	}
+	numFonts, err := readUint32(stream, 8)
+	if err != nil {
+		return 0, err
+	}
+	if numFonts == 0 {
+		return 0, errors.New("TTC collection has no fonts")
+	}
+	if uint64(numFonts) > uint64(int(^uint(0)>>1)) {
+		return 0, errors.New("TTC collection has too many fonts")
+	}
+	if uint64(12)+uint64(numFonts)*4 > uint64(stream.Size()) {
+		return 0, errors.New("TTC offset table too short")
+	}
+	return int(numFonts), nil
+}
+
+func sfntDirectoryOffset(stream api.Stream, faceIndex int) (int64, error) {
+	if faceIndex < 0 {
+		return 0, errors.New("negative face index")
+	}
+	magic, err := readUint32(stream, 0)
+	if err != nil {
+		return 0, err
+	}
+	if magic != tagTTCF {
+		if faceIndex != 0 {
+			return 0, errors.New("face index out of range")
+		}
+		return 0, nil
+	}
+
+	numFaces, err := sfntFaceCount(stream)
+	if err != nil {
+		return 0, err
+	}
+	if faceIndex >= numFaces {
+		return 0, errors.New("face index out of range")
+	}
+	faceOffset, err := readUint32(stream, 12+int64(faceIndex)*4)
+	if err != nil {
+		return 0, err
+	}
+	if uint64(faceOffset)+12 > uint64(stream.Size()) {
+		return 0, errors.New("TTC face offset out of bounds")
+	}
+	return int64(faceOffset), nil
+}
+
 // Face implements api.Face for SFNT fonts.
 type Face struct {
-	stream    api.Stream
-	tables    map[uint32]Table
-	head      HeadTable
-	maxp      MaxpTable
-	hhea      HheaTable
-	hmtx      HmtxTable
-	os2       OS2Table
-	post      PostTable
-	vhea      VheaTable
-	vmtx      VmtxTable
-	vorg      VORGTable
-	gasp      GaspTable
-	hdmx      HdmxTable
-	vdmx      VDMXTable
-	ltsh      LTSHTable
-	stat      STATTable
-	colr      *color.COLR
-	cpal      *color.CPAL
-	cmap      CMap
-	gsub      *layout.GSUB
-	gpos      *layout.GPOS
-	fpgm      []byte
-	prep      []byte
-	cvt       []int32
-	scaledCVT []int32
-	funcs     map[int32][]byte
-	instrs    map[int32][]byte
-	sys       api.FreetypeSystem
-	cff       *cff.CFF
-	glyphSlot *GlyphSlot
-	xPPEM     int
-	yPPEM     int
-	pointSize int32
-	varEngine *ftvar.VariationEngine
-	sbix      *SbixTable
-	cblc      *CBLCTable
-	cbdt      *CBDTTable
+	stream          api.Stream
+	directoryOffset int64
+	tables          map[uint32]Table
+	head            HeadTable
+	maxp            MaxpTable
+	hhea            HheaTable
+	hmtx            HmtxTable
+	os2             OS2Table
+	post            PostTable
+	vhea            VheaTable
+	vmtx            VmtxTable
+	vorg            VORGTable
+	gasp            GaspTable
+	hdmx            HdmxTable
+	vdmx            VDMXTable
+	ltsh            LTSHTable
+	stat            STATTable
+	colr            *color.COLR
+	cpal            *color.CPAL
+	cmap            CMap
+	gsub            *layout.GSUB
+	gpos            *layout.GPOS
+	fpgm            []byte
+	prep            []byte
+	cvt             []int32
+	scaledCVT       []int32
+	funcs           map[int32][]byte
+	instrs          map[int32][]byte
+	sys             api.FreetypeSystem
+	cff             *cff.CFF
+	glyphSlot       *GlyphSlot
+	xPPEM           int
+	yPPEM           int
+	xScale          int32
+	yScale          int32
+	pointSize       int32
+	varEngine       *ftvar.VariationEngine
+	sbix            *SbixTable
+	cblc            *CBLCTable
+	cbdt            *CBDTTable
+	loadedMetrics   map[int]glyphMetrics26Dot6
 }
 
 type GlyphSlot struct {
-	outline *core.Outline
-	image   *api.Image
+	outline        *core.Outline
+	bitmap         api.Bitmap
+	image          *api.Image
+	metrics        glyphMetrics26Dot6
+	hasMetrics     bool
+	slotMetrics    api.GlyphMetrics
+	hasSlotMetrics bool
 }
 
 func (gs *GlyphSlot) GetOutline() api.Outline {
@@ -309,26 +412,34 @@ func (gs *GlyphSlot) SetOutline(outline api.Outline) {
 }
 
 func (gs *GlyphSlot) GetBitmap() api.Bitmap {
-	return nil
+	return gs.bitmap
 }
 
 func (gs *GlyphSlot) GetImage() *api.Image {
 	return gs.image
 }
 
+func (gs *GlyphSlot) GetMetrics() (api.GlyphMetrics, bool) {
+	if gs == nil || !gs.hasSlotMetrics {
+		return api.GlyphMetrics{}, false
+	}
+	return gs.slotMetrics, true
+}
+
 func (f *Face) parseDirectory() error {
 	// Read offset table (12 bytes)
-	if f.stream.Size() < 12 {
+	base := f.directoryOffset
+	if base < 0 || f.stream.Size() < base+12 {
 		return errors.New("stream too short for SFNT offset table")
 	}
 
-	numTables, err := readUint16(f.stream, 4)
+	numTables, err := readUint16(f.stream, base+4)
 	if err != nil {
 		return err
 	}
 
 	// Read table directory
-	offset := int64(12)
+	offset := base + 12
 	for i := 0; i < int(numTables); i++ {
 		if f.stream.Size() < offset+16 {
 			return errors.New("stream too short for table directory")
@@ -388,6 +499,175 @@ func (f *Face) GetUnitsPerEm() uint16 {
 	return f.head.UnitsPerEm
 }
 
+func (f *Face) recomputeSizeMetrics() {
+	f.pointSize = int32(f.yPPEM)
+	f.xScale = f.computeScale(f.xPPEM)
+	f.yScale = f.computeScale(f.yPPEM)
+}
+
+func (f *Face) computeScale(ppem int) int32 {
+	unitsPerEm := f.GetUnitsPerEm()
+	if unitsPerEm == 0 || ppem <= 0 {
+		return 1 << 16
+	}
+	return ftmath.DivFix(int32(ppem), int32(unitsPerEm))
+}
+
+func (f *Face) scaleCVT() {
+	if len(f.cvt) == 0 {
+		f.scaledCVT = nil
+		return
+	}
+	f.scaledCVT = make([]int32, len(f.cvt))
+	for i, v := range f.cvt {
+		f.scaledCVT[i] = f.scaleFUnitsY(v)
+	}
+}
+
+func (f *Face) runPrep() error {
+	if len(f.prep) == 0 {
+		return nil
+	}
+	if f.funcs == nil {
+		f.funcs = make(map[int32][]byte)
+	}
+	if f.instrs == nil {
+		f.instrs = make(map[int32][]byte)
+	}
+
+	vm := f.getVM()
+	defer vm.Free()
+
+	vm.Code = f.prep
+	vm.IP = 0
+	vm.Functions = f.funcs
+	vm.Instructions = f.instrs
+	vm.CVT = f.scaledCVT
+	return vm.Run()
+}
+
+func (f *Face) scaleFUnitsX(v int32) int32 {
+	return f.scale26Dot6X(v << 6)
+}
+
+func (f *Face) scaleFUnitsY(v int32) int32 {
+	return f.scale26Dot6Y(v << 6)
+}
+
+func (f *Face) scaleFUnitsXForLoadFlags(v int32, loadFlags int) int32 {
+	if loadFlags&api.LoadNoScale != 0 {
+		return v << 6
+	}
+	return f.scaleFUnitsX(v)
+}
+
+func (f *Face) scaleFUnitsYForLoadFlags(v int32, loadFlags int) int32 {
+	if loadFlags&api.LoadNoScale != 0 {
+		return v << 6
+	}
+	return f.scaleFUnitsY(v)
+}
+
+func (f *Face) scale26Dot6X(v int32) int32 {
+	return ftmath.MulFix(v, f.xScale)
+}
+
+func (f *Face) scale26Dot6Y(v int32) int32 {
+	return ftmath.MulFix(v, f.yScale)
+}
+
+func (f *Face) scale26Dot6XForLoadFlags(v int32, loadFlags int) int32 {
+	if loadFlags&api.LoadNoScale != 0 {
+		return v
+	}
+	return f.scale26Dot6X(v)
+}
+
+func (f *Face) scale26Dot6YForLoadFlags(v int32, loadFlags int) int32 {
+	if loadFlags&api.LoadNoScale != 0 {
+		return v
+	}
+	return f.scale26Dot6Y(v)
+}
+
+func shouldHintGlyph(loadFlags int) bool {
+	return loadFlags&(api.LoadNoHinting|api.LoadNoScale) == 0
+}
+
+func (f *Face) scaleOutline(outline *core.Outline) {
+	if outline == nil {
+		return
+	}
+	for i := range outline.Points {
+		outline.Points[i].X = f.scale26Dot6X(outline.Points[i].X)
+		outline.Points[i].Y = f.scale26Dot6Y(outline.Points[i].Y)
+	}
+}
+
+func (f *Face) runGlyphProgram(outline *core.Outline, instructions []byte) error {
+	if outline == nil || len(instructions) == 0 {
+		return nil
+	}
+
+	points := make([]api.Vector, len(outline.Points))
+	copy(points, outline.Points)
+
+	cvt := make([]int32, len(f.scaledCVT))
+	copy(cvt, f.scaledCVT)
+
+	vm := f.getVM()
+	defer vm.Free()
+
+	vm.Functions = f.funcs
+	vm.Instructions = f.instrs
+	vm.CVT = cvt
+	vm.Zones[1] = truetype.Zone{
+		Points:         points,
+		OriginalPoints: make([]api.Vector, len(outline.Points)),
+		TouchedX:       make([]bool, len(outline.Points)),
+		TouchedY:       make([]bool, len(outline.Points)),
+		Contours:       outline.Contours,
+	}
+	copy(vm.Zones[1].OriginalPoints, outline.Points)
+
+	vm.Code = instructions
+	vm.IP = 0
+	vm.ZP0 = 1
+	vm.ZP1 = 1
+	vm.ZP2 = 1
+	vm.RP0 = 0
+	vm.RP1 = 0
+	vm.RP2 = 0
+
+	if err := vm.Run(); err != nil {
+		return err
+	}
+
+	copy(outline.Points, points)
+	copy(f.scaledCVT, cvt)
+	return nil
+}
+
+// SetVariationNormalizedCoordinates sets normalized variation coordinates in [-1, 1].
+func (f *Face) SetVariationNormalizedCoordinates(coords []float32) error {
+	if f.varEngine == nil {
+		return errors.New("font has no variation axes")
+	}
+	f.varEngine.SetNormalizedCoordinates(coords)
+	f.loadedMetrics = nil
+	return nil
+}
+
+// SetVariationDesignCoordinates sets design-space variation coordinates.
+func (f *Face) SetVariationDesignCoordinates(coords []ftvar.Fixed) error {
+	if f.varEngine == nil {
+		return errors.New("font has no variation axes")
+	}
+	f.varEngine.SetDesignCoordinates(coords)
+	f.loadedMetrics = nil
+	return nil
+}
+
 func (f *Face) SetPixelSizes(width, height int) error {
 	if width < 0 || height < 0 {
 		return errors.New("pixel size must be non-negative")
@@ -401,10 +681,18 @@ func (f *Face) SetPixelSizes(width, height int) error {
 	if width <= 0 || height <= 0 {
 		return errors.New("pixel size must be positive")
 	}
+	if width > 1<<25 || height > 1<<25 {
+		return errors.New("pixel size too large")
+	}
 
 	f.xPPEM = width
 	f.yPPEM = height
-	f.pointSize = int32(height)
+	f.recomputeSizeMetrics()
+	f.loadedMetrics = nil
+	f.scaleCVT()
+	if err := f.runPrep(); err != nil {
+		return fmt.Errorf("failed to run prep program: %w", err)
+	}
 	return nil
 }
 
@@ -418,6 +706,23 @@ func (f *Face) GetGlyphIndex(char rune) (int, error) {
 func (f *Face) GetGlyphMetrics(glyphIndex int) (advance int32, lsb int32, err error) {
 	if glyphIndex < 0 || glyphIndex >= f.GetNumGlyphs() {
 		return 0, 0, fmt.Errorf("glyph index %d out of range", glyphIndex)
+	}
+	if metrics, ok := f.loadedMetrics[glyphIndex]; ok {
+		return metrics.advance, metrics.lsb, nil
+	}
+	advance, lsb, err = f.getGlyphMetricsFUnits(glyphIndex)
+	if err != nil {
+		return 0, 0, err
+	}
+	return f.scaleFUnitsX(advance), f.scaleFUnitsX(lsb), nil
+}
+
+func (f *Face) getGlyphMetricsFUnits(glyphIndex int) (advance int32, lsb int32, err error) {
+	if glyphIndex < 0 || glyphIndex >= f.GetNumGlyphs() {
+		return 0, 0, fmt.Errorf("glyph index %d out of range", glyphIndex)
+	}
+	if metricsGlyphIndex, ok := f.compositeMetricsGlyphIndex(glyphIndex, make(map[int]bool)); ok {
+		glyphIndex = metricsGlyphIndex
 	}
 
 	numHMetrics := int(f.hhea.NumberOfHMetrics)
@@ -452,6 +757,128 @@ func (f *Face) GetGlyphMetrics(glyphIndex int) (advance int32, lsb int32, err er
 	return advance, lsb, nil
 }
 
+func (f *Face) compositeMetricsGlyphIndex(glyphIndex int, active map[int]bool) (int, bool) {
+	if glyphIndex < 0 || glyphIndex >= f.GetNumGlyphs() {
+		return 0, false
+	}
+	if active[glyphIndex] {
+		return 0, false
+	}
+	active[glyphIndex] = true
+	defer delete(active, glyphIndex)
+
+	glyphStream, err := f.glyphDataStream(glyphIndex)
+	if err != nil || glyphStream == nil || glyphStream.Size() < glyphHeaderSize {
+		return 0, false
+	}
+	numberOfContours, err := readInt16(glyphStream, 0)
+	if err != nil || numberOfContours >= 0 {
+		return 0, false
+	}
+
+	currOffset := int64(10)
+	selectedGlyph := -1
+	for {
+		flags, err := readUint16(glyphStream, currOffset)
+		if err != nil {
+			return 0, false
+		}
+		currOffset += 2
+
+		subGlyphIndex, err := readUint16(glyphStream, currOffset)
+		if err != nil {
+			return 0, false
+		}
+		currOffset += 2
+
+		if flags&ARG_1_AND_2_ARE_WORDS != 0 {
+			currOffset += 4
+		} else {
+			currOffset += 2
+		}
+
+		switch {
+		case flags&WE_HAVE_A_SCALE != 0:
+			currOffset += 2
+		case flags&WE_HAVE_AN_X_AND_Y_SCALE != 0:
+			currOffset += 4
+		case flags&WE_HAVE_A_TWO_BY_TWO != 0:
+			currOffset += 8
+		}
+
+		if flags&USE_MY_METRICS != 0 {
+			selectedGlyph = int(subGlyphIndex)
+		}
+		if flags&MORE_COMPONENTS == 0 {
+			break
+		}
+	}
+
+	if selectedGlyph < 0 || selectedGlyph >= f.GetNumGlyphs() {
+		return 0, false
+	}
+	if nestedGlyph, ok := f.compositeMetricsGlyphIndex(selectedGlyph, active); ok {
+		return nestedGlyph, true
+	}
+	return selectedGlyph, true
+}
+
+func (f *Face) glyphDataStream(glyphIndex int) (api.Stream, error) {
+	if glyphIndex < 0 || glyphIndex >= f.GetNumGlyphs() {
+		return nil, fmt.Errorf("glyph index %d out of range", glyphIndex)
+	}
+	locaStream, err := f.GetTable("loca")
+	if err != nil {
+		return nil, err
+	}
+
+	var offset, length uint32
+	if f.head.IndexToLocFormat == 0 {
+		o1, err := readUint16(locaStream, int64(glyphIndex*2))
+		if err != nil {
+			return nil, err
+		}
+		o2, err := readUint16(locaStream, int64((glyphIndex+1)*2))
+		if err != nil {
+			return nil, err
+		}
+		if o2 < o1 {
+			return nil, fmt.Errorf("loca offsets are not monotonic for glyph %d", glyphIndex)
+		}
+		offset = uint32(o1) * 2
+		length = uint32(o2)*2 - offset
+	} else if f.head.IndexToLocFormat == 1 {
+		o1, err := readUint32(locaStream, int64(glyphIndex*4))
+		if err != nil {
+			return nil, err
+		}
+		o2, err := readUint32(locaStream, int64((glyphIndex+1)*4))
+		if err != nil {
+			return nil, err
+		}
+		if o2 < o1 {
+			return nil, fmt.Errorf("loca offsets are not monotonic for glyph %d", glyphIndex)
+		}
+		offset = o1
+		length = o2 - offset
+	} else {
+		return nil, fmt.Errorf("unsupported indexToLocFormat %d", f.head.IndexToLocFormat)
+	}
+
+	glyfStream, err := f.GetTable("glyf")
+	if err != nil {
+		return nil, err
+	}
+	if int64(offset) > glyfStream.Size() || int64(length) > glyfStream.Size()-int64(offset) {
+		return nil, fmt.Errorf("glyph %d range [%d,%d) exceeds glyf table length %d", glyphIndex, offset, offset+length, glyfStream.Size())
+	}
+	return &tableStream{
+		base:   glyfStream,
+		offset: int64(offset),
+		length: int64(length),
+	}, nil
+}
+
 func (f *Face) Shape(text string) ([]int, []api.Vector) {
 	glyphs := make([]int, 0, len(text))
 	for _, r := range text {
@@ -473,8 +900,8 @@ func (f *Face) Shape(text string) ([]int, []api.Vector) {
 	if f.gpos != nil {
 		adjustments := f.gpos.Position(glyphs)
 		for i := range positions {
-			positions[i].X += adjustments[i].X
-			positions[i].Y += adjustments[i].Y
+			positions[i].X += f.scaleFUnitsX(adjustments[i].X)
+			positions[i].Y += f.scaleFUnitsY(adjustments[i].Y)
 		}
 	}
 
@@ -494,24 +921,59 @@ const (
 	OVERLAP_COMPOUND         = 0x0400
 )
 
+const (
+	glyphHeaderSize             int64 = 10
+	maxCompositeGlyphDepth            = 64
+	maxCompositeGlyphComponents       = 1024
+)
+
+type glyphLoadContext struct {
+	active         map[int]bool
+	depth          int
+	componentCount int
+}
+
+type glyphBBox struct {
+	xMin int32
+	yMin int32
+	xMax int32
+	yMax int32
+}
+
+type glyphMetrics26Dot6 struct {
+	advance int32
+	lsb     int32
+}
+
+type glyphLoadResult struct {
+	outline          *core.Outline
+	realPointCount   int
+	metricPointStart int
+	metricPointEnd   int
+	metrics          glyphMetrics26Dot6
+	hasMetrics       bool
+}
+
 func (f *Face) LoadGlyph(glyphIndex int, loadFlags int) (api.GlyphSlot, error) {
 	var imagePayload []byte
 
-	if f.sbix != nil {
-		payload, err := f.sbix.GetImage(glyphIndex, 0xFFFF) // Request max size
-		if err == nil && payload != nil {
-			imagePayload = payload
+	if loadFlags&(api.LoadNoBitmap|api.LoadNoScale) == 0 {
+		if f.sbix != nil {
+			payload, err := f.sbix.GetImage(glyphIndex, 0xFFFF) // Request max size
+			if err == nil && payload != nil {
+				imagePayload = payload
+			}
 		}
-	}
-	if imagePayload == nil && f.cblc != nil && f.cbdt != nil {
-		payload, err := GetCBLCImage(*f.cblc, *f.cbdt, glyphIndex)
-		if err == nil && payload != nil {
-			imagePayload = payload
+		if imagePayload == nil && f.cblc != nil && f.cbdt != nil {
+			payload, err := GetCBLCImage(*f.cblc, *f.cbdt, glyphIndex)
+			if err == nil && payload != nil {
+				imagePayload = payload
+			}
 		}
 	}
 
 	var decodedImage *api.Image
-	if imagePayload != nil {
+	if imagePayload != nil && f.sys != nil {
 		decoder := f.sys.GetImageDecoder()
 		if decoder != nil {
 			img, err := decoder.Decode(imagePayload)
@@ -531,11 +993,19 @@ func (f *Face) LoadGlyph(glyphIndex int, loadFlags int) (api.GlyphSlot, error) {
 			}
 			return nil, err
 		}
-		slot := &GlyphSlot{outline: outline, image: decodedImage}
+		if loadFlags&api.LoadNoScale == 0 {
+			f.scaleOutline(outline)
+		}
+		bitmap, err := f.renderGlyphBitmap(outline, loadFlags)
+		if err != nil {
+			return nil, err
+		}
+		slotMetrics, hasSlotMetrics := glyphSlotMetricsFromOutline(outline, realPointCount(outline), glyphMetrics26Dot6{}, false)
+		slot := &GlyphSlot{outline: outline, bitmap: bitmap, image: decodedImage, slotMetrics: slotMetrics, hasSlotMetrics: hasSlotMetrics}
 		f.glyphSlot = slot
 		return slot, nil
 	}
-	outline, err := f.loadGlyphInternal(glyphIndex)
+	result, err := f.loadGlyphInternal(glyphIndex, loadFlags)
 	if err != nil {
 		if decodedImage != nil {
 			slot := &GlyphSlot{image: decodedImage}
@@ -544,15 +1014,199 @@ func (f *Face) LoadGlyph(glyphIndex int, loadFlags int) (api.GlyphSlot, error) {
 		}
 		return nil, err
 	}
-	slot := &GlyphSlot{outline: outline, image: decodedImage}
+	if !result.hasMetrics {
+		if metrics, ok := f.glyphMetricsForLoadFlags(glyphIndex, loadFlags); ok {
+			result.metrics = metrics
+			result.hasMetrics = true
+		}
+	}
+	slotMetrics, hasSlotMetrics := glyphSlotMetricsFromOutline(result.outline, result.realPointCount, result.metrics, result.hasMetrics)
+	outline := stripGlyphPhantoms(result.outline, result.realPointCount)
+	bitmap, err := f.renderGlyphBitmap(outline, loadFlags)
+	if err != nil {
+		return nil, err
+	}
+	slot := &GlyphSlot{
+		outline:        outline,
+		bitmap:         bitmap,
+		image:          decodedImage,
+		metrics:        result.metrics,
+		hasMetrics:     result.hasMetrics,
+		slotMetrics:    slotMetrics,
+		hasSlotMetrics: hasSlotMetrics,
+	}
+	if result.hasMetrics && loadFlags&api.LoadNoScale == 0 {
+		f.rememberLoadedMetrics(glyphIndex, result.metrics)
+	}
 	f.glyphSlot = slot
 	return slot, nil
 }
 
-func (f *Face) loadGlyphInternal(glyphIndex int) (*core.Outline, error) {
+func (f *Face) glyphMetricsForLoadFlags(glyphIndex int, loadFlags int) (glyphMetrics26Dot6, bool) {
+	advance, lsb, err := f.getGlyphMetricsFUnits(glyphIndex)
+	if err != nil {
+		return glyphMetrics26Dot6{}, false
+	}
+	if loadFlags&api.LoadNoScale != 0 {
+		return glyphMetrics26Dot6{advance: advance << 6, lsb: lsb << 6}, true
+	}
+	return glyphMetrics26Dot6{advance: f.scaleFUnitsX(advance), lsb: f.scaleFUnitsX(lsb)}, true
+}
+
+func (f *Face) renderGlyphBitmap(outline *core.Outline, loadFlags int) (api.Bitmap, error) {
+	if loadFlags&api.LoadRender == 0 {
+		return nil, nil
+	}
+
+	mode := bitmapPixelModeForLoadFlags(loadFlags)
+	renderOutline, width, rows := renderOutlineForBitmap(outline)
+	bitmap := core.NewBitmap(width, rows)
+	bitmap.SetPixelMode(mode)
+	if renderOutline == nil || width == 0 || rows == 0 {
+		return bitmap, nil
+	}
+
+	var rast api.Rasterizer
+	if f.sys != nil {
+		rast = f.sys.Rasterizer()
+	}
+	if rast == nil {
+		rast = raster.NewSmoothRasterizer()
+	}
+	if err := rast.Render(renderOutline, bitmap); err != nil {
+		return nil, err
+	}
+	return bitmap, nil
+}
+
+func bitmapPixelModeForLoadFlags(loadFlags int) uint8 {
+	if loadFlags&api.LoadMonochrome != 0 || loadFlags&api.LoadTargetMask == api.LoadTargetMono {
+		return api.MODE_MONO
+	}
+	return api.MODE_GRAY
+}
+
+func renderOutlineForBitmap(outline *core.Outline) (*core.Outline, int, int) {
+	minX, minY, maxX, maxY, ok := outlineBounds(outline, realPointCount(outline))
+	if !ok {
+		return nil, 0, 0
+	}
+	minPX := floor26Dot6(minX)
+	minPY := floor26Dot6(minY)
+	maxPX := ceil26Dot6(maxX)
+	maxPY := ceil26Dot6(maxY)
+	width := int(maxPX - minPX)
+	rows := int(maxPY - minPY)
+	if width < 0 {
+		width = 0
+	}
+	if rows < 0 {
+		rows = 0
+	}
+
+	renderOutline := &core.Outline{
+		Points:   make([]api.Vector, len(outline.Points)),
+		Tags:     append([]byte{}, outline.Tags...),
+		Contours: append([]int{}, outline.Contours...),
+	}
+	maxY26Dot6 := maxPY << 6
+	minX26Dot6 := minPX << 6
+	for i, p := range outline.Points {
+		renderOutline.Points[i] = api.Vector{
+			X: p.X - minX26Dot6,
+			Y: maxY26Dot6 - p.Y,
+		}
+	}
+	return renderOutline, width, rows
+}
+
+func glyphSlotMetricsFromOutline(outline *core.Outline, realPoints int, metrics glyphMetrics26Dot6, hasMetrics bool) (api.GlyphMetrics, bool) {
+	if outline == nil {
+		return api.GlyphMetrics{}, false
+	}
+
+	minX, minY, maxX, maxY, hasBounds := outlineBounds(outline, realPoints)
+	slotMetrics := api.GlyphMetrics{}
+	if hasBounds {
+		slotMetrics.Width = maxX - minX
+		slotMetrics.Height = maxY - minY
+		slotMetrics.HoriBearingX = minX
+		slotMetrics.HoriBearingY = maxY
+	}
+	if hasMetrics {
+		slotMetrics.HoriBearingX = metrics.lsb
+		slotMetrics.HoriAdvance = metrics.advance
+	}
+	if phantoms, ok := copyGlyphPhantoms(outline, realPoints); ok {
+		slotMetrics.VertBearingX = minX - phantoms[2].X
+		slotMetrics.VertBearingY = maxY - phantoms[2].Y
+		slotMetrics.VertAdvance = phantoms[2].Y - phantoms[3].Y
+	}
+	return slotMetrics, true
+}
+
+func outlineBounds(outline *core.Outline, realPoints int) (minX, minY, maxX, maxY int32, ok bool) {
+	realPoints = clampRealPointCount(realPoints, outline)
+	if realPoints == 0 {
+		return 0, 0, 0, 0, false
+	}
+	minX = outline.Points[0].X
+	minY = outline.Points[0].Y
+	maxX = minX
+	maxY = minY
+	for i := 1; i < realPoints; i++ {
+		p := outline.Points[i]
+		if p.X < minX {
+			minX = p.X
+		}
+		if p.Y < minY {
+			minY = p.Y
+		}
+		if p.X > maxX {
+			maxX = p.X
+		}
+		if p.Y > maxY {
+			maxY = p.Y
+		}
+	}
+	return minX, minY, maxX, maxY, true
+}
+
+func floor26Dot6(v int32) int32 {
+	if v >= 0 {
+		return v >> 6
+	}
+	return -int32((int64(-v) + 63) >> 6)
+}
+
+func ceil26Dot6(v int32) int32 {
+	return -floor26Dot6(-v)
+}
+
+func (f *Face) loadGlyphInternal(glyphIndex int, loadFlags int) (*glyphLoadResult, error) {
+	return f.loadGlyphInternalWithContext(glyphIndex, loadFlags, &glyphLoadContext{
+		active: make(map[int]bool),
+	})
+}
+
+func (f *Face) loadGlyphInternalWithContext(glyphIndex int, loadFlags int, ctx *glyphLoadContext) (*glyphLoadResult, error) {
 	if glyphIndex < 0 || glyphIndex >= f.GetNumGlyphs() {
 		return nil, fmt.Errorf("glyph index %d out of range", glyphIndex)
 	}
+	if ctx == nil {
+		ctx = &glyphLoadContext{active: make(map[int]bool)}
+	}
+	if ctx.active == nil {
+		ctx.active = make(map[int]bool)
+	}
+	if ctx.depth > maxCompositeGlyphDepth {
+		return nil, fmt.Errorf("composite glyph depth exceeded at glyph %d", glyphIndex)
+	}
+	if ctx.active[glyphIndex] {
+		return nil, fmt.Errorf("composite glyph cycle references glyph %d", glyphIndex)
+	}
+	ctx.active[glyphIndex] = true
+	defer delete(ctx.active, glyphIndex)
 
 	locaStream, err := f.GetTable("loca")
 	if err != nil {
@@ -570,9 +1224,12 @@ func (f *Face) loadGlyphInternal(glyphIndex int) (*core.Outline, error) {
 		if err != nil {
 			return nil, err
 		}
+		if o2 < o1 {
+			return nil, fmt.Errorf("loca offsets are not monotonic for glyph %d", glyphIndex)
+		}
 		offset = uint32(o1) * 2
 		length = uint32(o2)*2 - offset
-	} else {
+	} else if f.head.IndexToLocFormat == 1 {
 		// Long format (uint32)
 		o1, err := readUint32(locaStream, int64(glyphIndex*4))
 		if err != nil {
@@ -582,41 +1239,103 @@ func (f *Face) loadGlyphInternal(glyphIndex int) (*core.Outline, error) {
 		if err != nil {
 			return nil, err
 		}
+		if o2 < o1 {
+			return nil, fmt.Errorf("loca offsets are not monotonic for glyph %d", glyphIndex)
+		}
 		offset = o1
 		length = o2 - offset
-	}
-
-	if length == 0 {
-		// Empty glyph
-		return &core.Outline{}, nil
+	} else {
+		return nil, fmt.Errorf("unsupported indexToLocFormat %d", f.head.IndexToLocFormat)
 	}
 
 	glyfStream, err := f.GetTable("glyf")
 	if err != nil {
 		return nil, err
 	}
+	if int64(offset) > glyfStream.Size() || int64(length) > glyfStream.Size()-int64(offset) {
+		return nil, fmt.Errorf("glyph %d range [%d,%d) exceeds glyf table length %d", glyphIndex, offset, offset+length, glyfStream.Size())
+	}
 
-	return f.parseGlyph(glyfStream, int64(offset), int64(length), glyphIndex)
+	if length == 0 {
+		// Empty glyph
+		return &glyphLoadResult{outline: &core.Outline{}}, nil
+	}
+
+	return f.parseGlyph(glyfStream, int64(offset), int64(length), glyphIndex, loadFlags, ctx)
 }
 
-func (f *Face) parseGlyph(s api.Stream, offset int64, length int64, glyphIndex int) (*core.Outline, error) {
-	numberOfContours, err := readInt16(s, offset)
+func (f *Face) parseGlyph(s api.Stream, offset int64, length int64, glyphIndex int, loadFlags int, ctx *glyphLoadContext) (*glyphLoadResult, error) {
+	if offset < 0 || length < 0 || offset > s.Size() || length > s.Size()-offset {
+		return nil, fmt.Errorf("glyph %d range [%d,%d) exceeds stream length %d", glyphIndex, offset, offset+length, s.Size())
+	}
+	if length < glyphHeaderSize {
+		return nil, fmt.Errorf("glyph %d is too short: %d bytes", glyphIndex, length)
+	}
+
+	glyphStream := &tableStream{
+		base:   s,
+		offset: offset,
+		length: length,
+	}
+
+	numberOfContours, err := readInt16(glyphStream, 0)
+	if err != nil {
+		return nil, err
+	}
+	bbox, err := readGlyphBBox(glyphStream, 0)
 	if err != nil {
 		return nil, err
 	}
 
 	if numberOfContours >= 0 {
-		return f.parseSimpleGlyph(s, offset, numberOfContours, glyphIndex)
+		return f.parseSimpleGlyph(glyphStream, 0, numberOfContours, glyphIndex, loadFlags, bbox)
 	} else {
-		return f.parseCompositeGlyph(s, offset, glyphIndex)
+		return f.parseCompositeGlyph(glyphStream, 0, glyphIndex, loadFlags, ctx, bbox)
 	}
 }
 
-func (f *Face) getPhantomPoints(glyphIndex int) []api.Vector {
-	advance, _, _ := f.GetGlyphMetrics(glyphIndex)
+func readGlyphBBox(s api.Stream, offset int64) (glyphBBox, error) {
+	xMin, err := readInt16(s, offset+2)
+	if err != nil {
+		return glyphBBox{}, err
+	}
+	yMin, err := readInt16(s, offset+4)
+	if err != nil {
+		return glyphBBox{}, err
+	}
+	xMax, err := readInt16(s, offset+6)
+	if err != nil {
+		return glyphBBox{}, err
+	}
+	yMax, err := readInt16(s, offset+8)
+	if err != nil {
+		return glyphBBox{}, err
+	}
+	return glyphBBox{xMin: int32(xMin), yMin: int32(yMin), xMax: int32(xMax), yMax: int32(yMax)}, nil
+}
+
+func (f *Face) getPhantomPoints(glyphIndex int, bbox glyphBBox, loadFlags int) []api.Vector {
+	points := f.getPhantomPointsFUnits(glyphIndex, bbox)
+	if loadFlags&api.LoadNoScale != 0 {
+		return points
+	}
+	for i := range points {
+		points[i].X = f.scale26Dot6X(points[i].X)
+		points[i].Y = f.scale26Dot6Y(points[i].Y)
+	}
+	return points
+}
+
+func (f *Face) getPhantomPointsFUnits(glyphIndex int, bbox glyphBBox) []api.Vector {
+	advance, lsb, err := f.getGlyphMetricsFUnits(glyphIndex)
+	if err != nil {
+		advance = 0
+		lsb = bbox.xMin
+	}
+	leftOrigin := bbox.xMin - lsb
 
 	advanceHeight := int32(f.GetUnitsPerEm())
-	var topOrigin int32 = 0
+	topOrigin := bbox.yMax
 
 	if f.vhea.NumOfLongVerMetrics > 0 {
 		numVMetrics := int(f.vhea.NumOfLongVerMetrics)
@@ -631,20 +1350,38 @@ func (f *Face) getPhantomPoints(glyphIndex int) []api.Vector {
 				tsb = f.vmtx.TopSideBearings[tsbIndex]
 			}
 		}
-		topOrigin = int32(tsb)
+		topOrigin = bbox.yMax + int32(tsb)
+	}
+	if f.varEngine != nil {
+		advanceHeight += f.varEngine.GetAdvanceHeightDelta(glyphIndex)
+		topOrigin += f.varEngine.GetTSBDelta(glyphIndex)
 	}
 
 	return []api.Vector{
-		{X: 0, Y: 0},
-		{X: advance << 6, Y: 0},
+		{X: leftOrigin << 6, Y: 0},
+		{X: (leftOrigin + advance) << 6, Y: 0},
 		{X: 0, Y: topOrigin << 6},
-		{X: 0, Y: advanceHeight << 6},
+		{X: 0, Y: (topOrigin - advanceHeight) << 6},
 	}
 }
 
-func (f *Face) parseSimpleGlyph(s api.Stream, offset int64, numberOfContours int16, glyphIndex int) (*core.Outline, error) {
+func (f *Face) applyGlyphVariation(glyphIndex int, outline *core.Outline) error {
+	if f.varEngine == nil || outline == nil {
+		return nil
+	}
+	return f.varEngine.ApplyVariation(glyphIndex, outline)
+}
+
+func (f *Face) glyphVariationDeltas(glyphIndex int, points []api.Vector, contours []int) ([]api.Vector, error) {
+	if f.varEngine == nil {
+		return make([]api.Vector, len(points)), nil
+	}
+	return f.varEngine.GetGlyphDeltas(glyphIndex, points, contours)
+}
+
+func (f *Face) parseSimpleGlyph(s api.Stream, offset int64, numberOfContours int16, glyphIndex int, loadFlags int, bbox glyphBBox) (*glyphLoadResult, error) {
 	if numberOfContours <= 0 {
-		return &core.Outline{}, nil
+		return &glyphLoadResult{outline: &core.Outline{}}, nil
 	}
 	headerSize := int64(10) // numberOfContours + 4 * int16 bounding box
 
@@ -660,7 +1397,7 @@ func (f *Face) parseSimpleGlyph(s api.Stream, offset int64, numberOfContours int
 	lastPointIndex := int(endPtsOfContours[numberOfContours-1])
 	numPoints := lastPointIndex + 1
 
-	instructionLengthOffset := offset + headerSize + int64(numberOfContours*2)
+	instructionLengthOffset := offset + headerSize + int64(numberOfContours)*2
 	instructionLength, err := readUint16(s, instructionLengthOffset)
 	if err != nil {
 		return nil, err
@@ -777,51 +1514,61 @@ func (f *Face) parseSimpleGlyph(s api.Stream, offset int64, numberOfContours int
 	}
 
 	// Append phantom points
-	phantomPoints := f.getPhantomPoints(glyphIndex)
+	phantomPoints := f.getPhantomPointsFUnits(glyphIndex, bbox)
 	outline.Points = append(outline.Points, phantomPoints...)
 	outline.Tags = append(outline.Tags, 0, 0, 0, 0)
 
-	if len(instructions) > 0 {
-		vm := f.getVM()
-		defer vm.Free()
-
-		vm.Functions = f.funcs
-		vm.Instructions = f.instrs
-		vm.CVT = f.scaledCVT
-
-		// Prepare VM Zone 1 with glyph points (including phantom points)
-		vm.Zones[1] = truetype.Zone{
-			Points:         outline.Points,
-			OriginalPoints: make([]api.Vector, len(outline.Points)),
-			TouchedX:       make([]bool, len(outline.Points)),
-			TouchedY:       make([]bool, len(outline.Points)),
-			Contours:       outline.Contours,
-		}
-		copy(vm.Zones[1].OriginalPoints, outline.Points)
-
-		// Set default VM state for glyph execution
-		vm.Code = instructions
-		vm.IP = 0
-		vm.ZP0 = 1
-		vm.ZP1 = 1
-		vm.ZP2 = 1
-		vm.RP0 = 0
-		vm.RP1 = 0
-		vm.RP2 = 0
-
-		_ = vm.Run()
+	if err := f.applyGlyphVariation(glyphIndex, outline); err != nil {
+		return nil, err
+	}
+	if loadFlags&api.LoadNoScale == 0 {
+		f.scaleOutline(outline)
 	}
 
-	return outline, nil
+	if len(instructions) > 0 && shouldHintGlyph(loadFlags) {
+		_ = f.runGlyphProgram(outline, instructions)
+	}
+
+	result := &glyphLoadResult{
+		outline:          outline,
+		realPointCount:   numPoints,
+		metricPointStart: 0,
+		metricPointEnd:   numPoints,
+	}
+	updateGlyphMetricsFromPhantoms(result)
+	return result, nil
 }
 
-func (f *Face) parseCompositeGlyph(s api.Stream, offset int64, glyphIndex int) (*core.Outline, error) {
+func (f *Face) parseCompositeGlyph(s api.Stream, offset int64, glyphIndex int, loadFlags int, ctx *glyphLoadContext, bbox glyphBBox) (*glyphLoadResult, error) {
 	currOffset := offset + 10 // skip header (numberOfContours + bounding box)
+
+	if ctx == nil {
+		ctx = &glyphLoadContext{active: make(map[int]bool)}
+	}
+
+	componentTotal, err := countCompositeGlyphComponents(s, currOffset)
+	if err != nil {
+		return nil, err
+	}
+	variationPoints := make([]api.Vector, componentTotal+4)
+	componentDeltas, err := f.glyphVariationDeltas(glyphIndex, variationPoints, nil)
+	if err != nil {
+		return nil, err
+	}
 
 	var finalOutline *core.Outline
 	var instructions []byte
+	var metricPhantoms []api.Vector
+	metricPointStart := -1
+	metricPointEnd := -1
+	componentIndex := 0
 
 	for {
+		ctx.componentCount++
+		if ctx.componentCount > maxCompositeGlyphComponents {
+			return nil, fmt.Errorf("composite glyph component limit exceeded at glyph %d", glyphIndex)
+		}
+
 		flags, err := readUint16(s, currOffset)
 		if err != nil {
 			return nil, err
@@ -922,16 +1669,22 @@ func (f *Face) parseCompositeGlyph(s api.Stream, offset int64, glyphIndex int) (
 			yy = int32(yscale)
 		}
 
-		subOutline, err := f.loadGlyphInternal(int(subGlyphIndex))
+		ctx.depth++
+		subResult, err := f.loadGlyphInternalWithContext(int(subGlyphIndex), loadFlags, ctx)
+		ctx.depth--
 		if err != nil {
 			return nil, err
+		}
+		subOutline := subResult.outline
+		if subOutline == nil {
+			subOutline = &core.Outline{}
 		}
 
 		// Apply transform and initial translation
 		var dx, dy int32
 		if flags&ARGS_ARE_XY_VALUES != 0 {
-			dx = arg1 << 6
-			dy = arg2 << 6
+			dx = f.scaleFUnitsXForLoadFlags(arg1, loadFlags)
+			dy = f.scaleFUnitsYForLoadFlags(arg2, loadFlags)
 		}
 
 		for i := range subOutline.Points {
@@ -939,8 +1692,8 @@ func (f *Face) parseCompositeGlyph(s api.Stream, offset int64, glyphIndex int) (
 			y := subOutline.Points[i].Y
 
 			// (x * xx + y * xy) >> 14
-			nx := (x*xx + y*xy) >> 14
-			ny := (x*yx + y*yy) >> 14
+			nx := int32((int64(x)*int64(xx) + int64(y)*int64(xy)) >> 14)
+			ny := int32((int64(x)*int64(yx) + int64(y)*int64(yy)) >> 14)
 
 			subOutline.Points[i].X = nx + dx
 			subOutline.Points[i].Y = ny + dy
@@ -958,14 +1711,30 @@ func (f *Face) parseCompositeGlyph(s api.Stream, offset int64, glyphIndex int) (
 				}
 			}
 		}
+		if componentIndex < len(componentDeltas) {
+			delta := componentDeltas[componentIndex]
+			vdx := f.scale26Dot6XForLoadFlags(delta.X, loadFlags)
+			vdy := f.scale26Dot6YForLoadFlags(delta.Y, loadFlags)
+			for i := range subOutline.Points {
+				subOutline.Points[i].X += vdx
+				subOutline.Points[i].Y += vdy
+			}
+		}
+
+		mergePointStart := 0
+		if finalOutline != nil {
+			mergePointStart = len(finalOutline.Points)
+		}
+		if flags&USE_MY_METRICS != 0 && subResult.hasMetrics {
+			if phantoms, ok := copyGlyphPhantoms(subOutline, subResult.realPointCount); ok {
+				metricPhantoms = phantoms
+				metricPointStart = mergePointStart + subResult.metricPointStart
+				metricPointEnd = mergePointStart + subResult.metricPointEnd
+			}
+		}
 
 		// Strip phantom points from subOutline before merging
-		realSubPoints := len(subOutline.Points)
-		if len(subOutline.Contours) > 0 {
-			realSubPoints = subOutline.Contours[len(subOutline.Contours)-1] + 1
-		} else {
-			realSubPoints = 0
-		}
+		realSubPoints := clampRealPointCount(subResult.realPointCount, subOutline)
 		subOutline.Points = subOutline.Points[:realSubPoints]
 		subOutline.Tags = subOutline.Tags[:realSubPoints]
 
@@ -995,6 +1764,7 @@ func (f *Face) parseCompositeGlyph(s api.Stream, offset int64, glyphIndex int) (
 			}
 			break
 		}
+		componentIndex++
 	}
 
 	if finalOutline == nil {
@@ -1002,42 +1772,157 @@ func (f *Face) parseCompositeGlyph(s api.Stream, offset int64, glyphIndex int) (
 	}
 
 	// Append phantom points for the composite glyph
-	phantomPoints := f.getPhantomPoints(glyphIndex)
+	finalRealPointCount := realPointCount(finalOutline)
+	phantomPoints := metricPhantoms
+	if len(phantomPoints) != 4 {
+		phantomPoints = f.getPhantomPoints(glyphIndex, bbox, loadFlags)
+		metricPointStart = 0
+		metricPointEnd = finalRealPointCount
+	}
+	if len(componentDeltas) >= componentTotal+4 {
+		for i := 0; i < 4; i++ {
+			delta := componentDeltas[componentTotal+i]
+			phantomPoints[i].X += f.scale26Dot6XForLoadFlags(delta.X, loadFlags)
+			phantomPoints[i].Y += f.scale26Dot6YForLoadFlags(delta.Y, loadFlags)
+		}
+	}
 	finalOutline.Points = append(finalOutline.Points, phantomPoints...)
 	finalOutline.Tags = append(finalOutline.Tags, 0, 0, 0, 0)
 
-	if len(instructions) > 0 {
-		vm := f.getVM()
-		defer vm.Free()
-
-		vm.Functions = f.funcs
-		vm.Instructions = f.instrs
-		vm.CVT = f.scaledCVT
-
-		// Prepare VM Zone 1 with glyph points
-		vm.Zones[1] = truetype.Zone{
-			Points:         finalOutline.Points,
-			OriginalPoints: make([]api.Vector, len(finalOutline.Points)),
-			TouchedX:       make([]bool, len(finalOutline.Points)),
-			TouchedY:       make([]bool, len(finalOutline.Points)),
-			Contours:       finalOutline.Contours,
-		}
-		copy(vm.Zones[1].OriginalPoints, finalOutline.Points)
-
-		// Set default VM state for glyph execution
-		vm.Code = instructions
-		vm.IP = 0
-		vm.ZP0 = 1
-		vm.ZP1 = 1
-		vm.ZP2 = 1
-		vm.RP0 = 0
-		vm.RP1 = 0
-		vm.RP2 = 0
-
-		_ = vm.Run()
+	if len(instructions) > 0 && shouldHintGlyph(loadFlags) {
+		_ = f.runGlyphProgram(finalOutline, instructions)
 	}
 
-	return finalOutline, nil
+	result := &glyphLoadResult{
+		outline:          finalOutline,
+		realPointCount:   finalRealPointCount,
+		metricPointStart: metricPointStart,
+		metricPointEnd:   metricPointEnd,
+	}
+	updateGlyphMetricsFromPhantoms(result)
+	return result, nil
+}
+
+func countCompositeGlyphComponents(s api.Stream, offset int64) (int, error) {
+	count := 0
+	currOffset := offset
+	for {
+		flags, err := readUint16(s, currOffset)
+		if err != nil {
+			return 0, err
+		}
+		currOffset += 2
+		if _, err := readUint16(s, currOffset); err != nil {
+			return 0, err
+		}
+		currOffset += 2
+
+		if flags&ARG_1_AND_2_ARE_WORDS != 0 {
+			currOffset += 4
+		} else {
+			currOffset += 2
+		}
+
+		switch {
+		case flags&WE_HAVE_A_SCALE != 0:
+			currOffset += 2
+		case flags&WE_HAVE_AN_X_AND_Y_SCALE != 0:
+			currOffset += 4
+		case flags&WE_HAVE_A_TWO_BY_TWO != 0:
+			currOffset += 8
+		}
+
+		count++
+		if flags&MORE_COMPONENTS == 0 {
+			return count, nil
+		}
+	}
+}
+
+func (f *Face) rememberLoadedMetrics(glyphIndex int, metrics glyphMetrics26Dot6) {
+	if f.loadedMetrics == nil {
+		f.loadedMetrics = make(map[int]glyphMetrics26Dot6)
+	}
+	f.loadedMetrics[glyphIndex] = metrics
+}
+
+func stripGlyphPhantoms(outline *core.Outline, realPointCount int) *core.Outline {
+	if outline == nil {
+		return nil
+	}
+	realPointCount = clampRealPointCount(realPointCount, outline)
+	outline.Points = outline.Points[:realPointCount]
+	outline.Tags = outline.Tags[:realPointCount]
+	return outline
+}
+
+func realPointCount(outline *core.Outline) int {
+	if outline == nil || len(outline.Contours) == 0 {
+		return 0
+	}
+	n := outline.Contours[len(outline.Contours)-1] + 1
+	return clampRealPointCount(n, outline)
+}
+
+func clampRealPointCount(n int, outline *core.Outline) int {
+	if outline == nil || n < 0 {
+		return 0
+	}
+	if n > len(outline.Points) {
+		return len(outline.Points)
+	}
+	if n > len(outline.Tags) {
+		return len(outline.Tags)
+	}
+	return n
+}
+
+func copyGlyphPhantoms(outline *core.Outline, realPointCount int) ([]api.Vector, bool) {
+	if outline == nil {
+		return nil, false
+	}
+	realPointCount = clampRealPointCount(realPointCount, outline)
+	if len(outline.Points)-realPointCount < 4 {
+		return nil, false
+	}
+	phantoms := make([]api.Vector, 4)
+	copy(phantoms, outline.Points[realPointCount:realPointCount+4])
+	return phantoms, true
+}
+
+func updateGlyphMetricsFromPhantoms(result *glyphLoadResult) {
+	if result == nil || result.outline == nil {
+		return
+	}
+	phantoms, ok := copyGlyphPhantoms(result.outline, result.realPointCount)
+	if !ok {
+		return
+	}
+	minX, ok := outlineMinXRange(result.outline, result.metricPointStart, result.metricPointEnd)
+	if !ok {
+		return
+	}
+	result.metrics = glyphMetrics26Dot6{
+		advance: phantoms[1].X - phantoms[0].X,
+		lsb:     minX - phantoms[0].X,
+	}
+	result.hasMetrics = true
+}
+
+func outlineMinXRange(outline *core.Outline, start, end int) (int32, bool) {
+	if outline == nil || start < 0 || end <= start || start >= len(outline.Points) {
+		return 0, false
+	}
+	if end > len(outline.Points) {
+		end = len(outline.Points)
+	}
+	minX := outline.Points[start].X
+	for i := start + 1; i < end; i++ {
+		if outline.Points[i].X < minX {
+			minX = outline.Points[i].X
+		}
+	}
+	return minX, true
 }
 
 func (f *Face) GetGlyphSlot() api.GlyphSlot {
@@ -1053,3 +1938,4 @@ func (f *Face) GetColorLayers(glyphIndex int) ([]color.Layer, error) {
 
 var _ api.Driver = (*loader)(nil)
 var _ api.Face = (*Face)(nil)
+var _ api.GlyphSlotMetricsProvider = (*GlyphSlot)(nil)

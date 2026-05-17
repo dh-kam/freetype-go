@@ -7,6 +7,8 @@
 ### 1. 폰트 포맷 (Font Formats)
 - **TrueType (.ttf)**: SFNT 디렉터리 파싱, 주요 테이블 파싱, 글리프 로딩, cmap/hmtx 처리, TrueType 명령어 실행 구조가 포함되어 있습니다.
 - **OpenType/CFF (.otf)**: CFF 파싱 및 CharString 관련 지원이 있습니다. 지원 범위는 계속 변할 수 있습니다.
+- **TrueType/OpenType 컬렉션(.ttc/.otc)**: SFNT 로더가 기본적으로 첫 face를 열거나 `sfnt.LoadFaceIndex`로 지정한 face를 열 수 있습니다.
+- **WOFF/WOFF2 컨테이너**: WOFF 및 WOFF2 스트림을 SFNT 또는 TTC로 디코딩할 수 있으며, WOFF2는 변환된 `glyf`/`loca`, `hmtx`, collection directory 재구성을 포함합니다.
 - **비트맵 폰트**: BDF, PCF, FNT 및 일부 내장 비트맵 테이블을 다룹니다.
 - **컬러 폰트**: 일부 `COLR`/`CPAL` 및 `sbix` 데이터 처리를 위한 파서와 헬퍼가 있습니다.
 

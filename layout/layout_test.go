@@ -124,3 +124,82 @@ func TestValueRecordSizeAndNilParse(t *testing.T) {
 		t.Fatalf("unexpected short ValueRecord parse: %+v", vr)
 	}
 }
+
+func TestLayoutParsersRejectTruncatedCountRecords(t *testing.T) {
+	tests := map[string]func() error{
+		"script list": func() error {
+			_, err := ParseScriptList([]byte{
+				0x00, 0x01,
+				0x64, 0x66,
+			}, 0)
+			return err
+		},
+		"feature list": func() error {
+			_, err := ParseFeatureList([]byte{
+				0x00, 0x01,
+				0x74, 0x65, 0x73,
+			}, 0)
+			return err
+		},
+		"lookup list": func() error {
+			_, err := ParseLookupList([]byte{0x00, 0x02, 0x00, 0x04}, 0)
+			return err
+		},
+		"lookup table": func() error {
+			_, err := ParseLookupTable([]byte{
+				0x00, 0x01,
+				0x00, 0x00,
+				0x00, 0x01,
+			}, 0)
+			return err
+		},
+		"coverage format 1": func() error {
+			_, err := ParseCoverage([]byte{
+				0x00, 0x01,
+				0x00, 0x02,
+				0x00, 0x05,
+			}, 0)
+			return err
+		},
+		"coverage format 2": func() error {
+			_, err := ParseCoverage([]byte{
+				0x00, 0x02,
+				0x00, 0x01,
+				0x00, 0x01,
+				0x00, 0x02,
+			}, 0)
+			return err
+		},
+		"class definition format 1": func() error {
+			_, err := ParseClassDef([]byte{
+				0x00, 0x01,
+				0x00, 0x14,
+				0x00, 0x02,
+				0x00, 0x01,
+			}, 0)
+			return err
+		},
+		"class definition format 2": func() error {
+			_, err := ParseClassDef([]byte{
+				0x00, 0x02,
+				0x00, 0x01,
+				0x00, 0x14,
+				0x00, 0x15,
+			}, 0)
+			return err
+		},
+	}
+
+	for name, fn := range tests {
+		t.Run(name, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("parser panicked: %v", r)
+				}
+			}()
+			if err := fn(); err == nil {
+				t.Fatalf("expected malformed table error")
+			}
+		})
+	}
+}

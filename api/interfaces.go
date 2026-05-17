@@ -10,8 +10,92 @@ type Face interface {
 	GetGlyphSlot() GlyphSlot
 	GetUnitsPerEm() uint16
 	GetGlyphIndex(char rune) (int, error)
+	// GetGlyphMetrics returns horizontal metrics in 26.6 pixel units.
 	GetGlyphMetrics(glyphIndex int) (advance int32, lsb int32, err error)
 	Shape(text string) ([]int, []Vector)
+}
+
+// LoadFlag values are passed to Face.LoadGlyph. The first two values are the
+// historical Go API flags; later values model FreeType load concepts for API
+// and conformance plumbing even when a driver only implements a subset.
+type LoadFlag = int
+
+const (
+	LoadDefault   = 0
+	LoadNoHinting = 1 << 0
+
+	LoadNoScale                  = 1 << 1
+	LoadRender                   = 1 << 2
+	LoadNoBitmap                 = 1 << 3
+	LoadVerticalLayout           = 1 << 4
+	LoadForceAutohint            = 1 << 5
+	LoadCropBitmap               = 1 << 6
+	LoadPedantic                 = 1 << 7
+	LoadIgnoreGlobalAdvanceWidth = 1 << 8
+	LoadNoRecurse                = 1 << 9
+	LoadIgnoreTransform          = 1 << 10
+	LoadMonochrome               = 1 << 11
+	LoadLinearDesign             = 1 << 12
+	LoadNoAutohint               = 1 << 13
+	LoadColor                    = 1 << 14
+	LoadComputeMetrics           = 1 << 15
+	LoadBitmapMetricsOnly        = 1 << 20
+	LoadNoSVG                    = 1 << 24
+
+	LoadTargetNormal = 0
+	LoadTargetLight  = 1 << 16
+	LoadTargetMono   = 2 << 16
+	LoadTargetLCD    = 3 << 16
+	LoadTargetLCDV   = 4 << 16
+	LoadTargetMask   = 15 << 16
+)
+
+// RenderMode mirrors FreeType's glyph render modes. RenderModeNone is a Go
+// sentinel used by conformance tooling when only glyph loading is requested.
+type RenderMode int
+
+const (
+	RenderModeNone RenderMode = -1
+)
+
+const (
+	RenderModeNormal RenderMode = iota
+	RenderModeLight
+	RenderModeMono
+	RenderModeLCD
+	RenderModeLCDV
+)
+
+// GlyphMetrics mirrors the FreeType FT_Glyph_Metrics fields in 26.6 pixel
+// units after glyph load and hinting.
+type GlyphMetrics struct {
+	Width        int32
+	Height       int32
+	HoriBearingX int32
+	HoriBearingY int32
+	HoriAdvance  int32
+	VertBearingX int32
+	VertBearingY int32
+	VertAdvance  int32
+}
+
+// GlyphSlotMetricsProvider is optional. Implementations can expose loaded slot
+// metrics without changing the stable GlyphSlot interface.
+type GlyphSlotMetricsProvider interface {
+	GetMetrics() (GlyphMetrics, bool)
+}
+
+// GetGlyphSlotMetrics returns loaded glyph metrics when a slot implementation
+// exposes them through GlyphSlotMetricsProvider.
+func GetGlyphSlotMetrics(slot GlyphSlot) (GlyphMetrics, bool) {
+	if slot == nil {
+		return GlyphMetrics{}, false
+	}
+	provider, ok := slot.(GlyphSlotMetricsProvider)
+	if !ok {
+		return GlyphMetrics{}, false
+	}
+	return provider.GetMetrics()
 }
 
 // GlyphSlot holds the currently loaded glyph.

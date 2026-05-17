@@ -56,11 +56,7 @@ func (g *GSUB) Substitute(glyphs []int) []int {
 	}
 	// If we have features, apply them. Otherwise apply all lookups for simple cases.
 	if g.FeatureList != nil && len(g.FeatureList.Features) > 0 {
-		indices := make([]int, len(g.FeatureList.Features))
-		for i := range indices {
-			indices[i] = i
-		}
-		return g.SubstituteFeatures(glyphs, indices)
+		return g.SubstituteFeatures(glyphs, defaultFeatureIndices(g.ScriptList, g.FeatureList, g.Data))
 	}
 
 	out := glyphs
@@ -98,6 +94,9 @@ func (g *GSUB) SubstituteFeatures(glyphs []int, featureIndices []int) []int {
 }
 
 func (g *GSUB) applyLookup(lookup *LookupTable, glyphs []int) []int {
+	if lookup == nil {
+		return glyphs
+	}
 	switch lookup.Type {
 	case 1: // Single Substitution
 		return g.applySingleSubst(lookup, glyphs)
@@ -105,135 +104,231 @@ func (g *GSUB) applyLookup(lookup *LookupTable, glyphs []int) []int {
 		return g.applyLigatureSubst(lookup, glyphs)
 	case 6: // Chaining Contextual Substitution
 		return g.applyChainingContextSubst(lookup, glyphs)
+	case 7: // Extension Substitution
+		return g.applyExtensionSubst(lookup, glyphs)
 	default:
 		return glyphs
 	}
 }
 
+type chainSubstRecord struct {
+	index       uint16
+	lookupIndex uint16
+}
+
+type chainingContextFormat3 struct {
+	backtrackCoverages []CoverageTable
+	inputCoverages     []CoverageTable
+	lookaheadCoverages []CoverageTable
+	substRecords       []chainSubstRecord
+}
+
 func (g *GSUB) applyChainingContextSubst(lookup *LookupTable, glyphs []int) []int {
-	for _, off := range lookup.SubtableOffsets {
-		d := g.Data[off:]
-		format := binary.BigEndian.Uint16(d[0:2])
-		if format != 3 {
-			continue // Only support format 3 for now
-		}
-
-		backtrackCount := binary.BigEndian.Uint16(d[2:4])
-		curr := 4
-		backtrackCoverages := make([]CoverageTable, backtrackCount)
-		for i := 0; i < int(backtrackCount); i++ {
-			cOff := binary.BigEndian.Uint16(d[curr : curr+2])
-			backtrackCoverages[i], _ = ParseCoverage(g.Data, off+cOff)
-			curr += 2
-		}
-
-		inputCount := binary.BigEndian.Uint16(d[curr : curr+2])
-		curr += 2
-		inputCoverages := make([]CoverageTable, inputCount)
-		for i := 0; i < int(inputCount); i++ {
-			cOff := binary.BigEndian.Uint16(d[curr : curr+2])
-			inputCoverages[i], _ = ParseCoverage(g.Data, off+cOff)
-			curr += 2
-		}
-
-		lookaheadCount := binary.BigEndian.Uint16(d[curr : curr+2])
-		curr += 2
-		lookaheadCoverages := make([]CoverageTable, lookaheadCount)
-		for i := 0; i < int(lookaheadCount); i++ {
-			cOff := binary.BigEndian.Uint16(d[curr : curr+2])
-			lookaheadCoverages[i], _ = ParseCoverage(g.Data, off+cOff)
-			curr += 2
-		}
-
-		substCount := binary.BigEndian.Uint16(d[curr : curr+2])
-		curr += 2
-		type substRecord struct {
-			index       uint16
-			lookupIndex uint16
-		}
-		substRecords := make([]substRecord, substCount)
-		for i := 0; i < int(substCount); i++ {
-			substRecords[i].index = binary.BigEndian.Uint16(d[curr : curr+2])
-			substRecords[i].lookupIndex = binary.BigEndian.Uint16(d[curr+2 : curr+4])
-			curr += 4
-		}
-
-		// Apply to glyphs
-		newGlyphs := make([]int, len(glyphs))
-		copy(newGlyphs, glyphs)
-
-		for i := 0; i < len(newGlyphs); {
-			if i < int(backtrackCount) || i+int(inputCount)+int(lookaheadCount) > len(newGlyphs) {
-				i++
-				continue
-			}
-
-			// Check input
-			match := true
-			for j := 0; j < int(inputCount); j++ {
-				if inputCoverages[j].GetIndex(newGlyphs[i+j]) < 0 {
-					match = false
-					break
-				}
-			}
-			if !match {
-				i++
-				continue
-			}
-
-			// Check backtrack
-			for j := 0; j < int(backtrackCount); j++ {
-				if backtrackCoverages[j].GetIndex(newGlyphs[i-1-j]) < 0 {
-					match = false
-					break
-				}
-			}
-			if !match {
-				i++
-				continue
-			}
-
-			// Check lookahead
-			for j := 0; j < int(lookaheadCount); j++ {
-				if lookaheadCoverages[j].GetIndex(newGlyphs[i+int(inputCount)+j]) < 0 {
-					match = false
-					break
-				}
-			}
-			if !match {
-				i++
-				continue
-			}
-
-			// Match found, apply substitutions
-			// Important: Substitutions are applied to the input sequence.
-			// They are lookups from the GSUB LookupList.
-			tempGlyphs := newGlyphs[i : i+int(inputCount)]
-			for _, rec := range substRecords {
-				if int(rec.lookupIndex) < len(g.LookupList.Lookups) {
-					targetLookup := g.LookupList.Lookups[rec.lookupIndex]
-					// This is slightly tricky because applying a lookup might change the number of glyphs.
-					// For simple contextual substitution, it usually replaces one glyph.
-					// Here we apply it to the specific index within the matched input sequence.
-					if int(rec.index) < len(tempGlyphs) {
-						// Apply lookup to a single glyph at rec.index
-						sub := g.applyLookup(targetLookup, tempGlyphs[rec.index:rec.index+1])
-						// Replace in tempGlyphs. If sub has different length, this gets complicated.
-						// Usually it's 1-to-1 or ligature.
-						if len(sub) == 1 {
-							tempGlyphs[rec.index] = sub[0]
-						} else {
-							// For now, handle 1-to-1.
-						}
-					}
-				}
-			}
-			copy(newGlyphs[i:], tempGlyphs)
-			i += int(inputCount)
-		}
-		glyphs = newGlyphs
+	if g.LookupList == nil {
+		return glyphs
 	}
-	return glyphs
+
+	out := make([]int, len(glyphs))
+	copy(out, glyphs)
+
+	for _, off := range lookup.SubtableOffsets {
+		subtable, ok := g.parseChainingContextFormat3(off)
+		if !ok {
+			continue
+		}
+
+		for i := 0; i < len(out); {
+			if !subtable.matches(out, i) {
+				i++
+				continue
+			}
+
+			inputEnd := i + len(subtable.inputCoverages)
+			lengthChanged := false
+
+			for _, rec := range subtable.substRecords {
+				if lengthChanged {
+					break
+				}
+				if int(rec.lookupIndex) >= len(g.LookupList.Lookups) {
+					continue
+				}
+				sequenceIndex := int(rec.index)
+				if sequenceIndex < 0 || sequenceIndex >= len(subtable.inputCoverages) {
+					continue
+				}
+				targetIndex := i + sequenceIndex
+				beforeLen := len(out)
+				next, changed := g.applyContextLookupAt(g.LookupList.Lookups[rec.lookupIndex], out, targetIndex, inputEnd)
+				if !changed {
+					continue
+				}
+				out = next
+				delta := len(out) - beforeLen
+				inputEnd += delta
+				lengthChanged = delta != 0
+			}
+
+			if inputEnd <= i {
+				i++
+			} else {
+				i = inputEnd
+			}
+		}
+	}
+	return out
+}
+
+func (g *GSUB) parseChainingContextFormat3(off uint16) (*chainingContextFormat3, bool) {
+	if !hasTableBytes(g.Data, off, 4) {
+		return nil, false
+	}
+	d := g.Data[off:]
+	format := binary.BigEndian.Uint16(d[0:2])
+	if format != 3 {
+		return nil, false
+	}
+
+	curr := 2
+	readCoverages := func() ([]CoverageTable, bool) {
+		if !hasBytesAt(g.Data, int(off)+curr, 2) {
+			return nil, false
+		}
+		count := binary.BigEndian.Uint16(g.Data[int(off)+curr : int(off)+curr+2])
+		curr += 2
+		if !hasBytesAt(g.Data, int(off)+curr, int(count)*2) {
+			return nil, false
+		}
+
+		coverages := make([]CoverageTable, int(count))
+		for i := 0; i < int(count); i++ {
+			coverageRel := binary.BigEndian.Uint16(g.Data[int(off)+curr : int(off)+curr+2])
+			curr += 2
+			coverageOffset, ok := resolveTableOffset(off, coverageRel)
+			if !ok {
+				return nil, false
+			}
+			coverage, err := ParseCoverage(g.Data, uint16(coverageOffset))
+			if err != nil {
+				return nil, false
+			}
+			coverages[i] = coverage
+		}
+		return coverages, true
+	}
+
+	backtrackCoverages, ok := readCoverages()
+	if !ok {
+		return nil, false
+	}
+	inputCoverages, ok := readCoverages()
+	if !ok || len(inputCoverages) == 0 {
+		return nil, false
+	}
+	lookaheadCoverages, ok := readCoverages()
+	if !ok {
+		return nil, false
+	}
+
+	if !hasBytesAt(g.Data, int(off)+curr, 2) {
+		return nil, false
+	}
+	substCount := binary.BigEndian.Uint16(g.Data[int(off)+curr : int(off)+curr+2])
+	curr += 2
+	if !hasBytesAt(g.Data, int(off)+curr, int(substCount)*4) {
+		return nil, false
+	}
+
+	substRecords := make([]chainSubstRecord, int(substCount))
+	for i := 0; i < int(substCount); i++ {
+		recordOffset := int(off) + curr + i*4
+		substRecords[i] = chainSubstRecord{
+			index:       binary.BigEndian.Uint16(g.Data[recordOffset : recordOffset+2]),
+			lookupIndex: binary.BigEndian.Uint16(g.Data[recordOffset+2 : recordOffset+4]),
+		}
+	}
+
+	return &chainingContextFormat3{
+		backtrackCoverages: backtrackCoverages,
+		inputCoverages:     inputCoverages,
+		lookaheadCoverages: lookaheadCoverages,
+		substRecords:       substRecords,
+	}, true
+}
+
+func (c *chainingContextFormat3) matches(glyphs []int, index int) bool {
+	if index < len(c.backtrackCoverages) || index+len(c.inputCoverages)+len(c.lookaheadCoverages) > len(glyphs) {
+		return false
+	}
+	for i, coverage := range c.inputCoverages {
+		if coverage.GetIndex(glyphs[index+i]) < 0 {
+			return false
+		}
+	}
+	for i, coverage := range c.backtrackCoverages {
+		if coverage.GetIndex(glyphs[index-1-i]) < 0 {
+			return false
+		}
+	}
+	lookaheadStart := index + len(c.inputCoverages)
+	for i, coverage := range c.lookaheadCoverages {
+		if coverage.GetIndex(glyphs[lookaheadStart+i]) < 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func (g *GSUB) applyContextLookupAt(lookup *LookupTable, glyphs []int, index int, limit int) ([]int, bool) {
+	if lookup == nil || index < 0 || index >= len(glyphs) {
+		return glyphs, false
+	}
+	if limit > len(glyphs) {
+		limit = len(glyphs)
+	}
+	if limit <= index {
+		return glyphs, false
+	}
+
+	switch lookup.Type {
+	case 1:
+		substituted := g.applySingleSubst(lookup, []int{glyphs[index]})
+		if len(substituted) != 1 || substituted[0] == glyphs[index] {
+			return glyphs, false
+		}
+		glyphs[index] = substituted[0]
+		return glyphs, true
+	case 4:
+		replacement, consumed, ok := g.firstLigatureSubstitution(lookup, glyphs[index:limit])
+		if !ok {
+			return glyphs, false
+		}
+		next := make([]int, 0, len(glyphs)-consumed+len(replacement))
+		next = append(next, glyphs[:index]...)
+		next = append(next, replacement...)
+		next = append(next, glyphs[index+consumed:]...)
+		return next, true
+	case 7:
+		out := glyphs
+		changed := false
+		for _, off := range lookup.SubtableOffsets {
+			extensionLookup, ok := parseExtensionLookup(g.Data, off, lookup.Flag, 7)
+			if !ok {
+				continue
+			}
+			beforeLen := len(out)
+			next, didChange := g.applyContextLookupAt(extensionLookup, out, index, limit)
+			if !didChange {
+				continue
+			}
+			out = next
+			limit += len(out) - beforeLen
+			changed = true
+		}
+		return out, changed
+	default:
+		return glyphs, false
+	}
 }
 
 func (g *GSUB) applySingleSubst(lookup *LookupTable, glyphs []int) []int {
@@ -241,10 +336,17 @@ func (g *GSUB) applySingleSubst(lookup *LookupTable, glyphs []int) []int {
 	copy(newGlyphs, glyphs)
 
 	for _, off := range lookup.SubtableOffsets {
+		if !hasTableBytes(g.Data, off, 6) {
+			continue
+		}
 		d := g.Data[off:]
 		format := binary.BigEndian.Uint16(d[0:2])
 		coverageOff := binary.BigEndian.Uint16(d[2:4])
-		coverage, err := ParseCoverage(g.Data, off+coverageOff)
+		coverageOffset, ok := resolveTableOffset(off, coverageOff)
+		if !ok {
+			continue
+		}
+		coverage, err := ParseCoverage(g.Data, uint16(coverageOffset))
 		if err != nil {
 			continue
 		}
@@ -258,8 +360,14 @@ func (g *GSUB) applySingleSubst(lookup *LookupTable, glyphs []int) []int {
 				}
 			}
 		} else if format == 2 {
+			if !hasTableBytes(g.Data, off, 6) {
+				continue
+			}
 			count := binary.BigEndian.Uint16(d[4:6])
-			substitutes := make([]uint16, count)
+			if !hasTableBytes(g.Data, off, 6+int(count)*2) {
+				continue
+			}
+			substitutes := make([]uint16, int(count))
 			for i := 0; i < int(count); i++ {
 				substitutes[i] = binary.BigEndian.Uint16(d[6+i*2 : 8+i*2])
 			}
@@ -279,62 +387,103 @@ func (g *GSUB) applyLigatureSubst(lookup *LookupTable, glyphs []int) []int {
 		return glyphs
 	}
 
+	newGlyphs := make([]int, 0, len(glyphs))
+	for i := 0; i < len(glyphs); {
+		replacement, consumed, ok := g.firstLigatureSubstitution(lookup, glyphs[i:])
+		if ok {
+			newGlyphs = append(newGlyphs, replacement...)
+			i += consumed
+			continue
+		}
+		newGlyphs = append(newGlyphs, glyphs[i])
+		i++
+	}
+	return newGlyphs
+}
+
+func (g *GSUB) firstLigatureSubstitution(lookup *LookupTable, glyphs []int) ([]int, int, bool) {
+	if lookup == nil || len(glyphs) == 0 {
+		return nil, 0, false
+	}
 	for _, off := range lookup.SubtableOffsets {
+		if !hasTableBytes(g.Data, off, 6) {
+			continue
+		}
 		d := g.Data[off:]
+		format := binary.BigEndian.Uint16(d[0:2])
+		if format != 1 {
+			continue
+		}
 		coverageOff := binary.BigEndian.Uint16(d[2:4])
-		coverage, err := ParseCoverage(g.Data, off+coverageOff)
+		coverageOffset, ok := resolveTableOffset(off, coverageOff)
+		if !ok {
+			continue
+		}
+		coverage, err := ParseCoverage(g.Data, uint16(coverageOffset))
 		if err != nil {
 			continue
 		}
 
 		ligSetCount := binary.BigEndian.Uint16(d[4:6])
-		ligSetOffsets := make([]uint16, ligSetCount)
-		for i := 0; i < int(ligSetCount); i++ {
-			ligSetOffsets[i] = binary.BigEndian.Uint16(d[6+i*2 : 8+i*2])
+		if !hasTableBytes(g.Data, off, 6+int(ligSetCount)*2) {
+			continue
+		}
+		covIdx := coverage.GetIndex(glyphs[0])
+		if covIdx < 0 || covIdx >= int(ligSetCount) {
+			continue
 		}
 
-		newGlyphs := make([]int, 0, len(glyphs))
-		for i := 0; i < len(glyphs); {
-			gid := glyphs[i]
-			covIdx := coverage.GetIndex(gid)
-			if covIdx >= 0 && covIdx < int(ligSetCount) {
-				// Found a start of a potential ligature
-				ligSetOff := off + ligSetOffsets[covIdx]
-				lsd := g.Data[ligSetOff:]
-				ligCount := binary.BigEndian.Uint16(lsd[0:2])
-				matched := false
-				for j := 0; j < int(ligCount); j++ {
-					ligOff := ligSetOff + binary.BigEndian.Uint16(lsd[2+j*2:4+j*2])
-					ld := g.Data[ligOff:]
-					ligGlyph := binary.BigEndian.Uint16(ld[0:2])
-					compCount := binary.BigEndian.Uint16(ld[2:4])
+		ligSetRel := binary.BigEndian.Uint16(d[6+covIdx*2 : 8+covIdx*2])
+		ligSetOffset, ok := resolveTableOffset(off, ligSetRel)
+		if !ok || !hasBytesAt(g.Data, ligSetOffset, 2) {
+			continue
+		}
+		ligSetData := g.Data[ligSetOffset:]
+		ligCount := binary.BigEndian.Uint16(ligSetData[0:2])
+		if !hasBytesAt(g.Data, ligSetOffset, 2+int(ligCount)*2) {
+			continue
+		}
 
-					if i+int(compCount) <= len(glyphs) {
-						matchComp := true
-						for k := 1; k < int(compCount); k++ {
-							if glyphs[i+k] != int(binary.BigEndian.Uint16(ld[4+(k-1)*2:6+(k-1)*2])) {
-								matchComp = false
-								break
-							}
-						}
-						if matchComp {
-							newGlyphs = append(newGlyphs, int(ligGlyph))
-							i += int(compCount)
-							matched = true
-							break
-						}
-					}
+		for i := 0; i < int(ligCount); i++ {
+			ligRel := binary.BigEndian.Uint16(ligSetData[2+i*2 : 4+i*2])
+			ligOffset := ligSetOffset + int(ligRel)
+			if !hasBytesAt(g.Data, ligOffset, 4) {
+				continue
+			}
+			ligData := g.Data[ligOffset:]
+			ligGlyph := binary.BigEndian.Uint16(ligData[0:2])
+			compCount := binary.BigEndian.Uint16(ligData[2:4])
+			if compCount == 0 || int(compCount) > len(glyphs) {
+				continue
+			}
+			if !hasBytesAt(g.Data, ligOffset, 4+(int(compCount)-1)*2) {
+				continue
+			}
+
+			match := true
+			for j := 1; j < int(compCount); j++ {
+				componentGlyph := binary.BigEndian.Uint16(ligData[4+(j-1)*2 : 6+(j-1)*2])
+				if glyphs[j] != int(componentGlyph) {
+					match = false
+					break
 				}
-				if !matched {
-					newGlyphs = append(newGlyphs, gid)
-					i++
-				}
-			} else {
-				newGlyphs = append(newGlyphs, gid)
-				i++
+			}
+			if match {
+				return []int{int(ligGlyph)}, int(compCount), true
 			}
 		}
-		glyphs = newGlyphs
 	}
-	return glyphs
+	return nil, 0, false
+}
+
+func (g *GSUB) applyExtensionSubst(lookup *LookupTable, glyphs []int) []int {
+	out := glyphs
+	for _, off := range lookup.SubtableOffsets {
+		extensionLookup, ok := parseExtensionLookup(g.Data, off, lookup.Flag, 7)
+		if !ok {
+			continue
+		}
+		out = g.applyLookup(extensionLookup, out)
+	}
+	return out
 }

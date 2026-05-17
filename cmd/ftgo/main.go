@@ -9,14 +9,16 @@ import (
 
 	"github.com/dh-kam/freetype-go/api"
 	"github.com/dh-kam/freetype-go/core"
+	"github.com/dh-kam/freetype-go/helper"
 	"github.com/dh-kam/freetype-go/raster"
 	"github.com/dh-kam/freetype-go/sfnt"
 )
 
 func main() {
-	fontPath := flag.String("font", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "Path to TTF/OTF font file")
+	fontPath := flag.String("font", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "Path to TTF/OTF/TTC/WOFF/WOFF2 font file")
 	charToRender := flag.String("char", "G", "Character to render")
 	size := flag.Int("size", 24, "Font size in pixels")
+	faceIndex := flag.Int("face-index", 0, "Face index for TTC/OTC collections")
 	flag.Parse()
 
 	if len(*charToRender) == 0 {
@@ -31,10 +33,17 @@ func main() {
 	}
 	defer f.Close()
 
-	stream, _ := core.NewFileStream(f)
+	fileStream, err := core.NewFileStream(f)
+	if err != nil {
+		log.Fatalf("Failed to create font stream: %v", err)
+	}
+	var stream api.Stream = fileStream
+	stream, err = helper.DecodeWOFFIfNeeded(stream)
+	if err != nil {
+		log.Fatalf("Failed to decode WOFF container: %v", err)
+	}
 	sys := core.NewSystem()
-	loader := sfnt.NewLoader(sys)
-	face, err := loader.LoadFace(stream)
+	face, err := sfnt.LoadFaceIndex(sys, stream, *faceIndex)
 	if err != nil {
 		log.Fatalf("Failed to load face: %v", err)
 	}
@@ -49,7 +58,7 @@ func main() {
 	}
 
 	fmt.Printf("Loading glyph index: %d\n", glyphIndex)
-	slot, err := face.LoadGlyph(glyphIndex, 0)
+	slot, err := face.LoadGlyph(glyphIndex, api.LoadDefault)
 	if err != nil {
 		log.Fatalf("Failed to load glyph: %v", err)
 	}
@@ -63,14 +72,6 @@ func main() {
 	if outline == nil {
 		log.Fatal("Outline is empty")
 	}
-
-	// Basic scaling
-	unitsPerEm := int64(face.GetUnitsPerEm())
-	if unitsPerEm == 0 {
-		unitsPerEm = 2048 // Fallback
-	}
-	scale := int32((int64(*size) << 16) / unitsPerEm)
-	outline.Scale(scale, scale)
 
 	// Calculate bounding box after scaling
 	minX, minY, maxX, maxY := getBBox(outline)

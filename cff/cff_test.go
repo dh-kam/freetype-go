@@ -2,10 +2,67 @@ package cff
 
 import (
 	"bytes"
+	"math"
 	"testing"
 
 	"github.com/dh-kam/freetype-go/core"
 )
+
+func csNumber(v int) byte {
+	if v < -107 || v > 107 {
+		panic("test charstring number out of single-byte range")
+	}
+	return byte(v + 139)
+}
+
+func testIndex(objects ...[]byte) *Index {
+	offsets := make([]uint32, len(objects)+1)
+	offsets[0] = 1
+	data := make([]byte, 0)
+	next := uint32(1)
+	for i, obj := range objects {
+		data = append(data, obj...)
+		next += uint32(len(obj))
+		offsets[i+1] = next
+	}
+	return &Index{
+		Count:   uint16(len(objects)),
+		OffSize: 1,
+		Offsets: offsets,
+		Data:    data,
+	}
+}
+
+func assertPoint(t *testing.T, outline *core.Outline, idx int, x, y int32) {
+	t.Helper()
+	if idx >= len(outline.Points) {
+		t.Fatalf("point %d missing; outline has %d points", idx, len(outline.Points))
+	}
+	if outline.Points[idx].X != x*64 || outline.Points[idx].Y != y*64 {
+		t.Fatalf("point %d: expected (%d, %d), got (%d, %d)", idx, x*64, y*64, outline.Points[idx].X, outline.Points[idx].Y)
+	}
+}
+
+func interpretStack(t *testing.T, data []byte) *charStringContext {
+	t.Helper()
+	ctx := &charStringContext{outline: &core.Outline{}}
+	if err := ctx.interpret(data); err != nil {
+		t.Fatalf("interpret failed: %v", err)
+	}
+	return ctx
+}
+
+func assertStack(t *testing.T, got, want []float64) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("stack length: got %d (%v), want %d (%v)", len(got), got, len(want), want)
+	}
+	for i := range want {
+		if math.Abs(got[i]-want[i]) > 1e-9 {
+			t.Fatalf("stack[%d]: got %v, want %v; full stack %v", i, got[i], want[i], got)
+		}
+	}
+}
 
 func TestParseIndex(t *testing.T) {
 	// Case 1: OffSize 1
@@ -244,6 +301,249 @@ func TestDecodeCharString(t *testing.T) {
 	}
 }
 
+func TestDecodeCharStringLineAndCurveOperators(t *testing.T) {
+	n := csNumber
+	data := []byte{
+		n(0), n(0), 21, // rmoveto
+		n(10), n(20), n(30), 6, // hlineto
+		n(5), n(7), 7, // vlineto
+		n(10), n(0), n(10), n(10), n(0), n(10), 8, // rrcurveto
+		n(10), n(20), n(30), n(40), 31, // hvcurveto
+		n(10), n(20), n(30), n(40), 30, // vhcurveto
+		14,
+	}
+
+	outline, err := DecodeCharString(data, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("DecodeCharString failed: %v", err)
+	}
+	if len(outline.Points) != 36 {
+		t.Fatalf("expected 36 points, got %d", len(outline.Points))
+	}
+	assertPoint(t, outline, 0, 0, 0)
+	assertPoint(t, outline, 3, 40, 20)
+	assertPoint(t, outline, 5, 47, 25)
+	assertPoint(t, outline, 15, 67, 45)
+	assertPoint(t, outline, 25, 97, 115)
+	assertPoint(t, outline, 35, 157, 155)
+}
+
+func TestDecodeCharStringFlexOperators(t *testing.T) {
+	n := csNumber
+	data := []byte{
+		n(0), n(0), 21, // rmoveto
+		n(10), n(20), n(5), n(30), n(40), n(50), n(60), 12, 34, // hflex
+		n(10), n(2), n(20), n(3), n(30), n(4), n(40), n(5), n(50), n(6), n(7), 12, 37, // flex1
+		14,
+	}
+
+	outline, err := DecodeCharString(data, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("DecodeCharString failed: %v", err)
+	}
+	if len(outline.Points) != 41 {
+		t.Fatalf("expected 41 points, got %d", len(outline.Points))
+	}
+	assertPoint(t, outline, 20, 210, 0)
+	assertPoint(t, outline, 40, 367, 0)
+}
+
+func TestDecodeCharStringSubrBias(t *testing.T) {
+	n := csNumber
+	localSubrs := testIndex([]byte{n(10), n(0), 5, 11})
+	globalSubrs := testIndex([]byte{n(0), n(20), 5, 11})
+	data := []byte{
+		n(0), n(0), 21,
+		n(-107), 10, // local subr index 0 with bias 107
+		n(-107), 29, // global subr index 0 with bias 107
+		14,
+	}
+
+	outline, err := DecodeCharString(data, globalSubrs, localSubrs, nil)
+	if err != nil {
+		t.Fatalf("DecodeCharString failed: %v", err)
+	}
+	if len(outline.Points) != 3 {
+		t.Fatalf("expected 3 points, got %d", len(outline.Points))
+	}
+	assertPoint(t, outline, 2, 10, 20)
+}
+
+func TestCharStringWidthHintsAndMasks(t *testing.T) {
+	n := csNumber
+	data := []byte{
+		n(55), n(0), n(10), 1, // width + hstem
+		19, 0xff, // hintmask with one byte that must be skipped
+		n(0), n(0), 21,
+		14,
+	}
+	ctx := &charStringContext{outline: &core.Outline{}}
+
+	if err := ctx.interpret(data); err != nil {
+		t.Fatalf("interpret failed: %v", err)
+	}
+	if !ctx.widthParsed {
+		t.Fatalf("expected width to be parsed")
+	}
+	if ctx.hintCount != 1 {
+		t.Fatalf("expected one stem hint, got %d", ctx.hintCount)
+	}
+	if len(ctx.stack) != 0 {
+		t.Fatalf("expected empty stack, got %v", ctx.stack)
+	}
+	assertPoint(t, ctx.outline, 0, 0, 0)
+}
+
+func TestCharStringArithmeticAndLogicalOperators(t *testing.T) {
+	n := csNumber
+	data := []byte{
+		n(10), n(5), 12, 10, // add
+		n(20), n(3), 12, 11, // sub
+		n(4), n(6), 12, 24, // mul
+		n(22), n(7), 12, 12, // div
+		n(-9), 12, 9, // abs
+		n(9), 12, 14, // neg
+		n(9), 12, 26, // sqrt
+		n(1), n(0), 12, 3, // and
+		n(1), n(0), 12, 4, // or
+		n(0), 12, 5, // not
+		n(5), n(5), 12, 15, // eq
+	}
+
+	ctx := interpretStack(t, data)
+	assertStack(t, ctx.stack, []float64{
+		15,
+		17,
+		24,
+		float64(22) / 7,
+		9,
+		-9,
+		3,
+		0,
+		1,
+		1,
+		1,
+	})
+}
+
+func TestCharStringStackOperators(t *testing.T) {
+	n := csNumber
+	tests := []struct {
+		name string
+		data []byte
+		want []float64
+	}{
+		{name: "drop", data: []byte{n(1), n(2), 12, 18}, want: []float64{1}},
+		{name: "dup", data: []byte{n(7), 12, 27}, want: []float64{7, 7}},
+		{name: "exch", data: []byte{n(1), n(2), 12, 28}, want: []float64{2, 1}},
+		{name: "index", data: []byte{n(10), n(20), n(30), n(1), 12, 29}, want: []float64{10, 20, 30, 20}},
+		{name: "index clamps negative", data: []byte{n(10), n(20), n(-1), 12, 29}, want: []float64{10, 20, 20}},
+		{name: "index clamps high", data: []byte{n(10), n(20), n(9), 12, 29}, want: []float64{10, 20, 10}},
+		{name: "roll positive", data: []byte{n(1), n(2), n(3), n(4), n(4), n(1), 12, 30}, want: []float64{4, 1, 2, 3}},
+		{name: "roll negative", data: []byte{n(1), n(2), n(3), n(4), n(4), n(-1), 12, 30}, want: []float64{2, 3, 4, 1}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := interpretStack(t, tt.data)
+			assertStack(t, ctx.stack, tt.want)
+		})
+	}
+}
+
+func TestCharStringStorageIfelseRandomAndVsindex(t *testing.T) {
+	n := csNumber
+
+	t.Run("put get", func(t *testing.T) {
+		ctx := interpretStack(t, []byte{n(42), n(3), 12, 20, n(3), 12, 21})
+		assertStack(t, ctx.stack, []float64{42})
+	})
+
+	t.Run("ifelse true", func(t *testing.T) {
+		ctx := interpretStack(t, []byte{n(10), n(20), n(3), n(4), 12, 22})
+		assertStack(t, ctx.stack, []float64{10})
+	})
+
+	t.Run("ifelse false", func(t *testing.T) {
+		ctx := interpretStack(t, []byte{n(10), n(20), n(4), n(3), 12, 22})
+		assertStack(t, ctx.stack, []float64{20})
+	})
+
+	t.Run("random", func(t *testing.T) {
+		ctx := interpretStack(t, []byte{12, 23, 12, 23})
+		if len(ctx.stack) != 2 {
+			t.Fatalf("expected two random values, got %v", ctx.stack)
+		}
+		for _, v := range ctx.stack {
+			if v <= 0 || v > 1 {
+				t.Fatalf("random value out of range: %v", ctx.stack)
+			}
+		}
+		if ctx.stack[0] == ctx.stack[1] {
+			t.Fatalf("expected deterministic sequence to advance, got %v", ctx.stack)
+		}
+	})
+
+	t.Run("vsindex and blend", func(t *testing.T) {
+		ctx := &charStringContext{outline: &core.Outline{}, blendVector: []float64{0.5}}
+		data := []byte{
+			n(2), 15, // vsindex
+			n(10), n(20), n(4), n(-2), n(2), 16, // blend
+		}
+		if err := ctx.interpret(data); err != nil {
+			t.Fatalf("interpret failed: %v", err)
+		}
+		if ctx.vsIndex != 2 {
+			t.Fatalf("vsIndex = %d, want 2", ctx.vsIndex)
+		}
+		assertStack(t, ctx.stack, []float64{12, 19})
+	})
+}
+
+func TestLoadGlyphOutlineDirectFixture(t *testing.T) {
+	n := csNumber
+	face := &CFF{
+		CharStringsIndex: *testIndex([]byte{
+			n(10), n(20), 21,
+			n(5), n(0), 5,
+			14,
+		}),
+	}
+
+	outline, err := face.LoadGlyphOutline(0)
+	if err != nil {
+		t.Fatalf("LoadGlyphOutline failed: %v", err)
+	}
+	if len(outline.Points) != 2 {
+		t.Fatalf("expected two points, got %d", len(outline.Points))
+	}
+	assertPoint(t, outline, 0, 10, 20)
+	assertPoint(t, outline, 1, 15, 20)
+
+	if _, err := face.LoadGlyphOutline(1); err == nil {
+		t.Fatalf("LoadGlyphOutline succeeded for out-of-range glyph")
+	}
+}
+
+func TestCalculateBias(t *testing.T) {
+	tests := []struct {
+		count int
+		want  int
+	}{
+		{0, 107},
+		{1239, 107},
+		{1240, 1131},
+		{33899, 1131},
+		{33900, 32768},
+	}
+
+	for _, tt := range tests {
+		if got := calculateBias(tt.count); got != tt.want {
+			t.Fatalf("calculateBias(%d) = %d, want %d", tt.count, got, tt.want)
+		}
+	}
+}
+
 func TestDecodeCharStringRejectsTruncatedNumbers(t *testing.T) {
 	tests := []struct {
 		name string
@@ -254,6 +554,7 @@ func TestDecodeCharStringRejectsTruncatedNumbers(t *testing.T) {
 		{name: "negative short number", data: []byte{251}},
 		{name: "fixed number", data: []byte{255, 0, 1, 2}},
 		{name: "escape operator", data: []byte{12}},
+		{name: "hintmask", data: []byte{139, 139, 1, 19}},
 	}
 
 	for _, tt := range tests {
@@ -274,9 +575,21 @@ func TestDecodeCharStringRejectsOperandUnderflow(t *testing.T) {
 		{name: "lineto odd operands", data: []byte{139, 5}},
 		{name: "hlineto missing operands", data: []byte{6}},
 		{name: "rrcurveto short operands", data: []byte{139, 139, 139, 139, 139, 8}},
+		{name: "hvcurveto short operands", data: []byte{139, 139, 139, 31}},
+		{name: "flex short operands", data: []byte{139, 139, 12, 35}},
 		{name: "callsubr missing operand", data: []byte{10}},
 		{name: "callgsubr missing operand", data: []byte{29}},
 		{name: "blend missing count", data: []byte{16}},
+		{name: "vsindex missing operand", data: []byte{15}},
+		{name: "add missing operand", data: []byte{139, 12, 10}},
+		{name: "drop missing operand", data: []byte{12, 18}},
+		{name: "dup missing operand", data: []byte{12, 27}},
+		{name: "exch missing operand", data: []byte{139, 12, 28}},
+		{name: "index missing operand", data: []byte{139, 12, 29}},
+		{name: "roll missing operand", data: []byte{139, 12, 30}},
+		{name: "put missing operand", data: []byte{139, 12, 20}},
+		{name: "get missing operand", data: []byte{12, 21}},
+		{name: "ifelse missing operand", data: []byte{139, 139, 139, 12, 22}},
 	}
 
 	for _, tt := range tests {

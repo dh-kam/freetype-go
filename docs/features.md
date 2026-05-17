@@ -10,6 +10,11 @@ statement of full FreeType compatibility or stable API coverage.
   loading, cmap/hmtx support, and TrueType instruction machinery.
 - **OpenType/CFF (.otf)**: CFF parsing and charstring-related support are
   present. Coverage should be treated as evolving.
+- **TrueType/OpenType collections (.ttc/.otc)**: The SFNT loader can open the
+  first face by default or a requested face via `sfnt.LoadFaceIndex`.
+- **WOFF/WOFF2 containers**: WOFF streams and WOFF2 streams can be decoded to
+  SFNT or TTC; WOFF2 includes transformed `glyf`/`loca`, `hmtx`, and collection
+  directory reconstruction.
 - **Bitmap Fonts**: BDF, PCF, FNT, and selected embedded bitmap table support.
 - **Color Fonts**: Parsers/helpers for selected `COLR`/`CPAL` and `sbix`
   data exist.

@@ -1,10 +1,14 @@
 package sfnt
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"io"
 	"testing"
+
+	"github.com/dh-kam/freetype-go/api"
+	"github.com/dh-kam/freetype-go/core"
 )
 
 func TestLoadFace(t *testing.T) {
@@ -52,6 +56,156 @@ func TestLoadFace(t *testing.T) {
 	}
 }
 
+func TestLoadFaceTTCFirstFace(t *testing.T) {
+	data := testTTCData([]ttcFaceSpec{
+		{offset: 32, headOffset: 300, maxpOffset: 354, numGlyphs: 7, indexToLocFormat: 1},
+	})
+
+	stream := &mockStream{data: data}
+	loader := NewLoader(&mockSystem{})
+	if !loader.Handles(stream) {
+		t.Fatal("loader should handle TTC streams")
+	}
+
+	f, err := loader.LoadFace(stream)
+	if err != nil {
+		t.Fatalf("LoadFace failed: %v", err)
+	}
+	if f.GetNumGlyphs() != 7 {
+		t.Fatalf("numGlyphs = %d, want 7", f.GetNumGlyphs())
+	}
+	sfntFace := f.(*Face)
+	if sfntFace.directoryOffset != 32 {
+		t.Fatalf("directoryOffset = %d, want %d", sfntFace.directoryOffset, 32)
+	}
+	if sfntFace.head.IndexToLocFormat != 1 {
+		t.Fatalf("indexToLocFormat = %d, want 1", sfntFace.head.IndexToLocFormat)
+	}
+}
+
+func TestLoadFaceTTCFaceIndex(t *testing.T) {
+	data := testTTCData([]ttcFaceSpec{
+		{offset: 32, headOffset: 300, maxpOffset: 354, numGlyphs: 7, indexToLocFormat: 0},
+		{offset: 128, headOffset: 420, maxpOffset: 474, numGlyphs: 13, indexToLocFormat: 1},
+	})
+	stream := &mockStream{data: data}
+
+	numFaces, err := NumFaces(stream)
+	if err != nil {
+		t.Fatalf("NumFaces failed: %v", err)
+	}
+	if numFaces != 2 {
+		t.Fatalf("NumFaces = %d, want 2", numFaces)
+	}
+
+	first, err := LoadFaceIndex(&mockSystem{}, stream, 0)
+	if err != nil {
+		t.Fatalf("LoadFaceIndex(0) failed: %v", err)
+	}
+	if first.GetNumGlyphs() != 7 {
+		t.Fatalf("first face numGlyphs = %d, want 7", first.GetNumGlyphs())
+	}
+
+	second, err := LoadFaceIndex(&mockSystem{}, stream, 1)
+	if err != nil {
+		t.Fatalf("LoadFaceIndex(1) failed: %v", err)
+	}
+	if second.GetNumGlyphs() != 13 {
+		t.Fatalf("second face numGlyphs = %d, want 13", second.GetNumGlyphs())
+	}
+	sfntFace := second.(*Face)
+	if sfntFace.directoryOffset != 128 {
+		t.Fatalf("second face directoryOffset = %d, want 128", sfntFace.directoryOffset)
+	}
+	if sfntFace.head.IndexToLocFormat != 1 {
+		t.Fatalf("second face indexToLocFormat = %d, want 1", sfntFace.head.IndexToLocFormat)
+	}
+}
+
+func TestLoadFaceIndexRejectsOutOfRange(t *testing.T) {
+	data := testTTCData([]ttcFaceSpec{
+		{offset: 32, headOffset: 300, maxpOffset: 354, numGlyphs: 7},
+	})
+	_, err := LoadFaceIndex(&mockSystem{}, &mockStream{data: data}, 1)
+	if err == nil {
+		t.Fatal("expected out-of-range face index to fail")
+	}
+
+	data = make([]byte, 200)
+	binary.BigEndian.PutUint32(data[0:4], 0x00010000)
+	_, err = LoadFaceIndex(&mockSystem{}, &mockStream{data: data}, 1)
+	if err == nil {
+		t.Fatal("expected non-collection face index to fail")
+	}
+}
+
+func TestNumFacesNonCollection(t *testing.T) {
+	data := make([]byte, 16)
+	binary.BigEndian.PutUint32(data[0:4], 0x00010000)
+	numFaces, err := NumFaces(&mockStream{data: data})
+	if err != nil {
+		t.Fatalf("NumFaces failed: %v", err)
+	}
+	if numFaces != 1 {
+		t.Fatalf("NumFaces = %d, want 1", numFaces)
+	}
+}
+
+type ttcFaceSpec struct {
+	offset           uint32
+	headOffset       uint32
+	maxpOffset       uint32
+	numGlyphs        uint16
+	indexToLocFormat uint16
+}
+
+func testTTCData(faces []ttcFaceSpec) []byte {
+	size := 16
+	for _, face := range faces {
+		for _, end := range []uint32{face.offset + 44, face.headOffset + 54, face.maxpOffset + 6} {
+			if int(end) > size {
+				size = int(end)
+			}
+		}
+	}
+	data := make([]byte, size)
+	copy(data[0:4], "ttcf")
+	binary.BigEndian.PutUint32(data[4:8], 0x00010000)
+	binary.BigEndian.PutUint32(data[8:12], uint32(len(faces)))
+	for i, face := range faces {
+		binary.BigEndian.PutUint32(data[12+i*4:16+i*4], face.offset)
+	}
+	for _, face := range faces {
+		base := int(face.offset)
+		binary.BigEndian.PutUint32(data[base:base+4], 0x00010000)
+		binary.BigEndian.PutUint16(data[base+4:base+6], 2)
+
+		copy(data[base+12:base+16], "head")
+		binary.BigEndian.PutUint32(data[base+20:base+24], face.headOffset)
+		binary.BigEndian.PutUint32(data[base+24:base+28], 54)
+
+		copy(data[base+28:base+32], "maxp")
+		binary.BigEndian.PutUint32(data[base+36:base+40], face.maxpOffset)
+		binary.BigEndian.PutUint32(data[base+40:base+44], 6)
+
+		binary.BigEndian.PutUint16(data[face.headOffset+50:face.headOffset+52], face.indexToLocFormat)
+		binary.BigEndian.PutUint16(data[face.maxpOffset+4:face.maxpOffset+6], face.numGlyphs)
+	}
+	return data
+}
+
+func TestLoadFaceTTCRejectsEmptyCollection(t *testing.T) {
+	data := make([]byte, 16)
+	copy(data[0:4], "ttcf")
+	binary.BigEndian.PutUint32(data[4:8], 0x00010000)
+
+	loader := NewLoader(&mockSystem{})
+	_, err := loader.LoadFace(&mockStream{data: data})
+	if err == nil {
+		t.Fatal("expected empty TTC collection to fail")
+	}
+}
+
 func TestReadUint16RejectsShortRead(t *testing.T) {
 	_, err := readUint16(&mockStream{data: []byte{0x12}}, 0)
 	if !errors.Is(err, io.ErrUnexpectedEOF) {
@@ -81,6 +235,77 @@ func TestSetPixelSizes(t *testing.T) {
 	}
 }
 
+func TestSetPixelSizesScalesCVTAndRunsPrep(t *testing.T) {
+	f := &Face{
+		head:   HeadTable{UnitsPerEm: 1000},
+		maxp:   MaxpTable{MaxStackElements: 8, MaxStorage: 1},
+		cvt:    []int32{100, 200},
+		prep:   []byte{0xB0, 1, 0xB0, 77, 0x44}, // PUSHB 1; PUSHB 77; WCVTP
+		funcs:  make(map[int32][]byte),
+		instrs: make(map[int32][]byte),
+	}
+
+	if err := f.SetPixelSizes(20, 20); err != nil {
+		t.Fatalf("SetPixelSizes failed: %v", err)
+	}
+	if got, want := f.scaledCVT[0], int32(128); got != want {
+		t.Fatalf("scaled CVT[0]: got %d, want %d", got, want)
+	}
+	if got, want := f.scaledCVT[1], int32(77); got != want {
+		t.Fatalf("prep-adjusted CVT[1]: got %d, want %d", got, want)
+	}
+
+	f.scaledCVT[1] = 999
+	if err := f.SetPixelSizes(10, 10); err != nil {
+		t.Fatalf("SetPixelSizes failed: %v", err)
+	}
+	if got, want := f.scaledCVT[0], int32(64); got != want {
+		t.Fatalf("rescaled CVT[0]: got %d, want %d", got, want)
+	}
+	if got, want := f.scaledCVT[1], int32(77); got != want {
+		t.Fatalf("prep did not rerun for CVT[1]: got %d, want %d", got, want)
+	}
+}
+
+func TestSizeScalesMetricsAndOutline(t *testing.T) {
+	f := &Face{
+		head: HeadTable{UnitsPerEm: 1000},
+		maxp: MaxpTable{NumGlyphs: 1},
+		hhea: HheaTable{NumberOfHMetrics: 1},
+		hmtx: HmtxTable{
+			HMetrics: []HMetric{{AdvanceWidth: 1000, LeftSideBearing: 100}},
+		},
+	}
+	if err := f.SetPixelSizes(20, 10); err != nil {
+		t.Fatalf("SetPixelSizes failed: %v", err)
+	}
+
+	advance, lsb, err := f.GetGlyphMetrics(0)
+	if err != nil {
+		t.Fatalf("GetGlyphMetrics failed: %v", err)
+	}
+	if advance != 20<<6 || lsb != 2<<6 {
+		t.Fatalf("metrics got advance=%d lsb=%d, want %d %d", advance, lsb, 20<<6, 2<<6)
+	}
+
+	outline := &core.Outline{
+		Points: []api.Vector{
+			{X: 1000 << 6, Y: 500 << 6},
+			{X: 100 << 6, Y: 100 << 6},
+		},
+		Tags:     []byte{1, 1},
+		Contours: []int{1},
+	}
+	f.scaleOutline(outline)
+
+	if got, want := outline.Points[0], (api.Vector{X: 20 << 6, Y: 5 << 6}); got != want {
+		t.Fatalf("point 0: got %+v, want %+v", got, want)
+	}
+	if got, want := outline.Points[1], (api.Vector{X: 2 << 6, Y: 1 << 6}); got != want {
+		t.Fatalf("point 1: got %+v, want %+v", got, want)
+	}
+}
+
 func TestGetGlyphMetricsRejectsMissingOrShortHmtx(t *testing.T) {
 	f := &Face{
 		maxp: MaxpTable{NumGlyphs: 2},
@@ -95,6 +320,901 @@ func TestGetGlyphMetricsRejectsMissingOrShortHmtx(t *testing.T) {
 	}
 	if _, _, err := f.GetGlyphMetrics(1); err == nil {
 		t.Fatal("expected short hmtx to fail")
+	}
+}
+
+func loadGlyphBoundsTestFace(t *testing.T, indexToLocFormat int16, offsets []uint32, glyf []byte) *Face {
+	t.Helper()
+	if len(offsets) < 2 {
+		t.Fatal("glyph bounds fixture requires at least two loca offsets")
+	}
+
+	align4 := func(v uint32) uint32 {
+		return (v + 3) &^ 3
+	}
+
+	numGlyphs := len(offsets) - 1
+	var locaLen uint32
+	if indexToLocFormat == 0 {
+		locaLen = uint32(len(offsets) * 2)
+	} else {
+		locaLen = uint32(len(offsets) * 4)
+	}
+
+	glyfOffset := uint32(128)
+	headOffset := align4(glyfOffset + uint32(len(glyf)))
+	maxpOffset := align4(headOffset + 54)
+	locaOffset := align4(maxpOffset + 32)
+	data := make([]byte, locaOffset+locaLen)
+
+	binary.BigEndian.PutUint32(data[0:4], 0x00010000)
+	binary.BigEndian.PutUint16(data[4:6], 4)
+
+	writeTable := func(index int, tag string, offset, length uint32) {
+		entry := 12 + index*16
+		copy(data[entry:entry+4], tag)
+		binary.BigEndian.PutUint32(data[entry+8:entry+12], offset)
+		binary.BigEndian.PutUint32(data[entry+12:entry+16], length)
+	}
+	writeTable(0, "glyf", glyfOffset, uint32(len(glyf)))
+	writeTable(1, "head", headOffset, 54)
+	writeTable(2, "loca", locaOffset, locaLen)
+	writeTable(3, "maxp", maxpOffset, 32)
+
+	copy(data[glyfOffset:glyfOffset+uint32(len(glyf))], glyf)
+
+	head := int(headOffset)
+	binary.BigEndian.PutUint16(data[head+18:head+20], 1000)
+	binary.BigEndian.PutUint16(data[head+50:head+52], uint16(indexToLocFormat))
+
+	maxp := int(maxpOffset)
+	binary.BigEndian.PutUint32(data[maxp:maxp+4], 0x00010000)
+	binary.BigEndian.PutUint16(data[maxp+4:maxp+6], uint16(numGlyphs))
+
+	loca := int(locaOffset)
+	for i, offset := range offsets {
+		if indexToLocFormat == 0 {
+			if offset%2 != 0 {
+				t.Fatalf("short loca offset %d is not even", offset)
+			}
+			binary.BigEndian.PutUint16(data[loca+i*2:loca+i*2+2], uint16(offset/2))
+		} else {
+			binary.BigEndian.PutUint32(data[loca+i*4:loca+i*4+4], offset)
+		}
+	}
+
+	f, err := NewLoader(&mockSystem{}).LoadFace(&mockStream{data: data})
+	if err != nil {
+		t.Fatalf("LoadFace failed: %v", err)
+	}
+	return f.(*Face)
+}
+
+func compositeGlyphData(subGlyph uint16) []byte {
+	data := make([]byte, 16)
+	binary.BigEndian.PutUint16(data[0:2], 0xffff)
+	binary.BigEndian.PutUint16(data[10:12], ARGS_ARE_XY_VALUES)
+	binary.BigEndian.PutUint16(data[12:14], subGlyph)
+	return data
+}
+
+func compositeGlyphWithComponents(subGlyph uint16, count int) []byte {
+	data := make([]byte, 10+count*6)
+	binary.BigEndian.PutUint16(data[0:2], 0xffff)
+	offset := 10
+	for i := 0; i < count; i++ {
+		flags := uint16(ARGS_ARE_XY_VALUES)
+		if i < count-1 {
+			flags |= MORE_COMPONENTS
+		}
+		binary.BigEndian.PutUint16(data[offset:offset+2], flags)
+		binary.BigEndian.PutUint16(data[offset+2:offset+4], subGlyph)
+		offset += 6
+	}
+	return data
+}
+
+func onePointGlyphData() []byte {
+	data := make([]byte, 15)
+	binary.BigEndian.PutUint16(data[0:2], 1)
+	binary.BigEndian.PutUint16(data[10:12], 0)
+	binary.BigEndian.PutUint16(data[12:14], 0)
+	data[14] = 0x01 | 0x10 | 0x20
+	return data
+}
+
+type metricsGlyph struct {
+	advance uint16
+	lsb     int16
+}
+
+func loadGlyphMetricsTestFace(t *testing.T, offsets []uint32, glyf []byte, metrics []metricsGlyph) *Face {
+	t.Helper()
+	if len(offsets) < 2 {
+		t.Fatal("glyph metrics fixture requires at least two loca offsets")
+	}
+	numGlyphs := len(offsets) - 1
+	if len(metrics) != numGlyphs {
+		t.Fatalf("metrics count = %d, want %d", len(metrics), numGlyphs)
+	}
+
+	align4 := func(v uint32) uint32 {
+		return (v + 3) &^ 3
+	}
+
+	const numTables = 6
+	glyfOffset := uint32(160)
+	headOffset := align4(glyfOffset + uint32(len(glyf)))
+	hheaOffset := align4(headOffset + 54)
+	hmtxOffset := align4(hheaOffset + 36)
+	hmtxLen := uint32(len(metrics) * 4)
+	locaOffset := align4(hmtxOffset + hmtxLen)
+	locaLen := uint32(len(offsets) * 4)
+	maxpOffset := align4(locaOffset + locaLen)
+	data := make([]byte, maxpOffset+32)
+
+	binary.BigEndian.PutUint32(data[0:4], 0x00010000)
+	binary.BigEndian.PutUint16(data[4:6], numTables)
+	writeTable := func(index int, tag string, offset, length uint32) {
+		entry := 12 + index*16
+		copy(data[entry:entry+4], tag)
+		binary.BigEndian.PutUint32(data[entry+8:entry+12], offset)
+		binary.BigEndian.PutUint32(data[entry+12:entry+16], length)
+	}
+	writeTable(0, "glyf", glyfOffset, uint32(len(glyf)))
+	writeTable(1, "head", headOffset, 54)
+	writeTable(2, "hhea", hheaOffset, 36)
+	writeTable(3, "hmtx", hmtxOffset, hmtxLen)
+	writeTable(4, "loca", locaOffset, locaLen)
+	writeTable(5, "maxp", maxpOffset, 32)
+
+	copy(data[glyfOffset:glyfOffset+uint32(len(glyf))], glyf)
+
+	head := int(headOffset)
+	binary.BigEndian.PutUint16(data[head+18:head+20], 1000)
+	binary.BigEndian.PutUint16(data[head+50:head+52], 1)
+
+	hhea := int(hheaOffset)
+	binary.BigEndian.PutUint16(data[hhea+34:hhea+36], uint16(numGlyphs))
+
+	hmtx := int(hmtxOffset)
+	for i, metric := range metrics {
+		binary.BigEndian.PutUint16(data[hmtx+i*4:hmtx+i*4+2], metric.advance)
+		binary.BigEndian.PutUint16(data[hmtx+i*4+2:hmtx+i*4+4], uint16(metric.lsb))
+	}
+
+	loca := int(locaOffset)
+	for i, offset := range offsets {
+		binary.BigEndian.PutUint32(data[loca+i*4:loca+i*4+4], offset)
+	}
+
+	maxp := int(maxpOffset)
+	binary.BigEndian.PutUint32(data[maxp:maxp+4], 0x00010000)
+	binary.BigEndian.PutUint16(data[maxp+4:maxp+6], uint16(numGlyphs))
+
+	f, err := NewLoader(&mockSystem{}).LoadFace(&mockStream{data: data})
+	if err != nil {
+		t.Fatalf("LoadFace failed: %v", err)
+	}
+	face := f.(*Face)
+	if err := face.SetPixelSizes(1000, 1000); err != nil {
+		t.Fatalf("SetPixelSizes failed: %v", err)
+	}
+	return face
+}
+
+func simpleOnePointGlyphData(x, y int16, instructions []byte) []byte {
+	data := make([]byte, 19+len(instructions))
+	binary.BigEndian.PutUint16(data[0:2], 1)
+	binary.BigEndian.PutUint16(data[2:4], uint16(x))
+	binary.BigEndian.PutUint16(data[4:6], uint16(y))
+	binary.BigEndian.PutUint16(data[6:8], uint16(x))
+	binary.BigEndian.PutUint16(data[8:10], uint16(y))
+	binary.BigEndian.PutUint16(data[10:12], 0)
+	binary.BigEndian.PutUint16(data[12:14], uint16(len(instructions)))
+	copy(data[14:14+len(instructions)], instructions)
+	flagsOffset := 14 + len(instructions)
+	data[flagsOffset] = 0x01
+	binary.BigEndian.PutUint16(data[flagsOffset+1:flagsOffset+3], uint16(x))
+	binary.BigEndian.PutUint16(data[flagsOffset+3:flagsOffset+5], uint16(y))
+	return data
+}
+
+func simpleRectGlyphData(xMin, yMin, xMax, yMax int16) []byte {
+	data := make([]byte, 34)
+	binary.BigEndian.PutUint16(data[0:2], 1)
+	binary.BigEndian.PutUint16(data[2:4], uint16(xMin))
+	binary.BigEndian.PutUint16(data[4:6], uint16(yMin))
+	binary.BigEndian.PutUint16(data[6:8], uint16(xMax))
+	binary.BigEndian.PutUint16(data[8:10], uint16(yMax))
+	binary.BigEndian.PutUint16(data[10:12], 3)
+	binary.BigEndian.PutUint16(data[12:14], 0)
+
+	for i := 0; i < 4; i++ {
+		data[14+i] = 0x01
+	}
+
+	offset := 18
+	for _, dx := range []int16{xMin, xMax - xMin, 0, xMin - xMax} {
+		binary.BigEndian.PutUint16(data[offset:offset+2], uint16(dx))
+		offset += 2
+	}
+	for _, dy := range []int16{yMin, 0, yMax - yMin, 0} {
+		binary.BigEndian.PutUint16(data[offset:offset+2], uint16(dy))
+		offset += 2
+	}
+	return data
+}
+
+type compositeMetricComponent struct {
+	glyph uint16
+	flags uint16
+	dx    int16
+	dy    int16
+}
+
+func compositeGlyphWithMetricComponents(components []compositeMetricComponent) []byte {
+	data := make([]byte, 10+len(components)*8)
+	binary.BigEndian.PutUint16(data[0:2], 0xffff)
+	offset := 10
+	for i, component := range components {
+		flags := component.flags | ARG_1_AND_2_ARE_WORDS | ARGS_ARE_XY_VALUES
+		if i < len(components)-1 {
+			flags |= MORE_COMPONENTS
+		}
+		binary.BigEndian.PutUint16(data[offset:offset+2], flags)
+		binary.BigEndian.PutUint16(data[offset+2:offset+4], component.glyph)
+		binary.BigEndian.PutUint16(data[offset+4:offset+6], uint16(component.dx))
+		binary.BigEndian.PutUint16(data[offset+6:offset+8], uint16(component.dy))
+		offset += 8
+	}
+	return data
+}
+
+type sfntTestTable struct {
+	tag  string
+	data []byte
+}
+
+func align4Test(v uint32) uint32 {
+	return (v + 3) &^ 3
+}
+
+func buildSFNTTestData(t *testing.T, tables []sfntTestTable) []byte {
+	t.Helper()
+	headerLen := align4Test(uint32(12 + len(tables)*16))
+	data := make([]byte, headerLen)
+	binary.BigEndian.PutUint32(data[0:4], 0x00010000)
+	binary.BigEndian.PutUint16(data[4:6], uint16(len(tables)))
+
+	offset := headerLen
+	for i, table := range tables {
+		if len(table.tag) != 4 {
+			t.Fatalf("table tag %q is not 4 bytes", table.tag)
+		}
+		offset = align4Test(offset)
+		for uint32(len(data)) < offset {
+			data = append(data, 0)
+		}
+		tableOffset := offset
+		data = append(data, table.data...)
+
+		entry := 12 + i*16
+		copy(data[entry:entry+4], table.tag)
+		binary.BigEndian.PutUint32(data[entry+8:entry+12], tableOffset)
+		binary.BigEndian.PutUint32(data[entry+12:entry+16], uint32(len(table.data)))
+		offset = tableOffset + uint32(len(table.data))
+	}
+	return data
+}
+
+type loaderTestImageDecoder struct{}
+
+func (loaderTestImageDecoder) Decode(data []byte) (*api.Image, error) {
+	if bytes.Equal(data, []byte("mock_png_data")) {
+		return &api.Image{Width: 10, Height: 10, Pixels: []byte{1, 2, 3}}, nil
+	}
+	return nil, errors.New("invalid data")
+}
+
+func testSbixData() []byte {
+	buf := new(bytes.Buffer)
+	binary.Write(buf, binary.BigEndian, uint16(1))
+	binary.Write(buf, binary.BigEndian, uint16(1))
+	binary.Write(buf, binary.BigEndian, uint32(1))
+	binary.Write(buf, binary.BigEndian, uint32(12))
+
+	binary.Write(buf, binary.BigEndian, uint16(109))
+	binary.Write(buf, binary.BigEndian, uint16(72))
+	binary.Write(buf, binary.BigEndian, uint32(12))
+	binary.Write(buf, binary.BigEndian, uint32(33))
+
+	binary.Write(buf, binary.BigEndian, int16(0))
+	binary.Write(buf, binary.BigEndian, int16(0))
+	binary.Write(buf, binary.BigEndian, uint32(0x706e6720))
+	buf.Write([]byte("mock_png_data"))
+	return buf.Bytes()
+}
+
+func hasNonZeroByte(buf []byte) bool {
+	for _, b := range buf {
+		if b != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func buildFvarOneAxisTable() []byte {
+	data := make([]byte, 36)
+	binary.BigEndian.PutUint16(data[0:2], 1)
+	binary.BigEndian.PutUint16(data[4:6], 16)
+	binary.BigEndian.PutUint16(data[6:8], 2)
+	binary.BigEndian.PutUint16(data[8:10], 1)
+	binary.BigEndian.PutUint16(data[10:12], 20)
+	binary.BigEndian.PutUint16(data[14:16], 4)
+	copy(data[16:20], "wght")
+	minValue := int32(-1 << 16)
+	binary.BigEndian.PutUint32(data[20:24], uint32(minValue))
+	binary.BigEndian.PutUint32(data[24:28], 0)
+	binary.BigEndian.PutUint32(data[28:32], uint32(int32(1<<16)))
+	return data
+}
+
+func buildGvarOneGlyphDeltasTable() []byte {
+	glyphData := []byte{
+		0, 1, // tupleVariationCount
+		0, 10, // dataOffset
+		0, 7, // variationDataSize
+		0x80, 0, // embedded peak tuple
+		0x40, 0, // peak = 1.0
+		4, 10, 0, 30, 0, 0, // five X byte deltas: contour, left, right, top, bottom
+		0x84, // five zero Y deltas
+	}
+	if len(glyphData)%2 != 0 {
+		glyphData = append(glyphData, 0)
+	}
+
+	data := make([]byte, 24)
+	binary.BigEndian.PutUint16(data[0:2], 1)
+	binary.BigEndian.PutUint16(data[4:6], 1)
+	binary.BigEndian.PutUint16(data[12:14], 1)
+	binary.BigEndian.PutUint32(data[16:20], 24)
+	binary.BigEndian.PutUint16(data[22:24], uint16(len(glyphData)/2))
+	return append(data, glyphData...)
+}
+
+func buildGvarCompositePseudoDeltasTable() []byte {
+	glyphData := []byte{
+		0, 1, // tupleVariationCount
+		0, 10, // dataOffset
+		0, 8, // variationDataSize
+		0x80, 0, // embedded peak tuple
+		0x40, 0, // peak = 1.0
+		5, 10, 246, 0, 40, 0, 0, // component0 +10, component1 -10, right phantom +40
+		0x85, // six zero Y deltas
+	}
+	if len(glyphData)%2 != 0 {
+		glyphData = append(glyphData, 0)
+	}
+
+	data := make([]byte, 28)
+	binary.BigEndian.PutUint16(data[0:2], 1)
+	binary.BigEndian.PutUint16(data[4:6], 1)
+	binary.BigEndian.PutUint16(data[12:14], 3)
+	binary.BigEndian.PutUint32(data[16:20], 28)
+	endOffset := uint16(len(glyphData) / 2)
+	binary.BigEndian.PutUint16(data[22:24], endOffset)
+	binary.BigEndian.PutUint16(data[24:26], endOffset)
+	binary.BigEndian.PutUint16(data[26:28], endOffset)
+	return append(data, glyphData...)
+}
+
+func buildHvarAdvanceDeltaTable(delta int16) []byte {
+	data := make([]byte, 56)
+	binary.BigEndian.PutUint16(data[0:2], 1)
+	binary.BigEndian.PutUint32(data[4:8], 20)
+
+	ivs := 20
+	binary.BigEndian.PutUint16(data[ivs:ivs+2], 1)
+	binary.BigEndian.PutUint32(data[ivs+2:ivs+6], 16)
+	binary.BigEndian.PutUint16(data[ivs+6:ivs+8], 1)
+	binary.BigEndian.PutUint32(data[ivs+8:ivs+12], 26)
+
+	regionList := ivs + 16
+	binary.BigEndian.PutUint16(data[regionList:regionList+2], 1)
+	binary.BigEndian.PutUint16(data[regionList+2:regionList+4], 1)
+	binary.BigEndian.PutUint16(data[regionList+6:regionList+8], 0x4000)
+	binary.BigEndian.PutUint16(data[regionList+8:regionList+10], 0x4000)
+
+	variationData := ivs + 26
+	binary.BigEndian.PutUint16(data[variationData:variationData+2], 1)
+	binary.BigEndian.PutUint16(data[variationData+2:variationData+4], 1)
+	binary.BigEndian.PutUint16(data[variationData+4:variationData+6], 1)
+	binary.BigEndian.PutUint16(data[variationData+8:variationData+10], uint16(delta))
+	return data
+}
+
+func loadVariableGlyphTestFace(t *testing.T, gvar []byte, hvar []byte) *Face {
+	t.Helper()
+	glyph := simpleOnePointGlyphData(50, 0, nil)
+
+	head := make([]byte, 54)
+	binary.BigEndian.PutUint16(head[18:20], 1000)
+	binary.BigEndian.PutUint16(head[50:52], 1)
+
+	hhea := make([]byte, 36)
+	binary.BigEndian.PutUint16(hhea[34:36], 1)
+
+	hmtx := make([]byte, 4)
+	binary.BigEndian.PutUint16(hmtx[0:2], 300)
+	binary.BigEndian.PutUint16(hmtx[2:4], 20)
+
+	loca := make([]byte, 8)
+	binary.BigEndian.PutUint32(loca[4:8], uint32(len(glyph)))
+
+	maxp := make([]byte, 32)
+	binary.BigEndian.PutUint32(maxp[0:4], 0x00010000)
+	binary.BigEndian.PutUint16(maxp[4:6], 1)
+
+	tables := []sfntTestTable{
+		{tag: "glyf", data: glyph},
+		{tag: "head", data: head},
+		{tag: "hhea", data: hhea},
+		{tag: "hmtx", data: hmtx},
+		{tag: "loca", data: loca},
+		{tag: "maxp", data: maxp},
+		{tag: "fvar", data: buildFvarOneAxisTable()},
+	}
+	if gvar != nil {
+		tables = append(tables, sfntTestTable{tag: "gvar", data: gvar})
+	}
+	if hvar != nil {
+		tables = append(tables, sfntTestTable{tag: "HVAR", data: hvar})
+	}
+
+	loaded, err := NewLoader(&mockSystem{}).LoadFace(&mockStream{data: buildSFNTTestData(t, tables)})
+	if err != nil {
+		t.Fatalf("LoadFace failed: %v", err)
+	}
+	face := loaded.(*Face)
+	if err := face.SetPixelSizes(1000, 1000); err != nil {
+		t.Fatalf("SetPixelSizes failed: %v", err)
+	}
+	return face
+}
+
+func TestLoadGlyphAppliesGvarDeltas(t *testing.T) {
+	face := loadVariableGlyphTestFace(t, buildGvarOneGlyphDeltasTable(), nil)
+	if err := face.SetVariationNormalizedCoordinates([]float32{1}); err != nil {
+		t.Fatalf("SetVariationNormalizedCoordinates failed: %v", err)
+	}
+
+	advance, lsb, err := face.GetGlyphMetrics(0)
+	if err != nil {
+		t.Fatalf("GetGlyphMetrics failed: %v", err)
+	}
+	if advance != 300<<6 || lsb != 20<<6 {
+		t.Fatalf("pre-load metrics got advance=%d lsb=%d, want %d %d", advance, lsb, 300<<6, 20<<6)
+	}
+
+	slot, err := face.LoadGlyph(0, api.LoadNoHinting)
+	if err != nil {
+		t.Fatalf("LoadGlyph failed: %v", err)
+	}
+	points := slot.GetOutline().GetPoints()
+	if len(points) != 1 {
+		t.Fatalf("point count = %d, want 1", len(points))
+	}
+	if got, want := points[0].X, int32(60<<6); got != want {
+		t.Fatalf("gvar-adjusted point X = %d, want %d", got, want)
+	}
+
+	advance, lsb, err = face.GetGlyphMetrics(0)
+	if err != nil {
+		t.Fatalf("GetGlyphMetrics after LoadGlyph failed: %v", err)
+	}
+	if advance != 330<<6 || lsb != 30<<6 {
+		t.Fatalf("gvar-adjusted metrics got advance=%d lsb=%d, want %d %d", advance, lsb, 330<<6, 30<<6)
+	}
+}
+
+func TestVariationCoordinatesApplyHVARAdvanceAndClearMetricsCache(t *testing.T) {
+	face := loadVariableGlyphTestFace(t, nil, buildHvarAdvanceDeltaTable(40))
+	if err := face.SetVariationNormalizedCoordinates([]float32{1}); err != nil {
+		t.Fatalf("SetVariationNormalizedCoordinates failed: %v", err)
+	}
+
+	advance, lsb, err := face.GetGlyphMetrics(0)
+	if err != nil {
+		t.Fatalf("GetGlyphMetrics failed: %v", err)
+	}
+	if advance != 340<<6 || lsb != 20<<6 {
+		t.Fatalf("HVAR metrics got advance=%d lsb=%d, want %d %d", advance, lsb, 340<<6, 20<<6)
+	}
+
+	if _, err := face.LoadGlyph(0, api.LoadNoHinting); err != nil {
+		t.Fatalf("LoadGlyph failed: %v", err)
+	}
+	if err := face.SetVariationNormalizedCoordinates([]float32{0}); err != nil {
+		t.Fatalf("reset variation coordinates failed: %v", err)
+	}
+
+	advance, lsb, err = face.GetGlyphMetrics(0)
+	if err != nil {
+		t.Fatalf("GetGlyphMetrics after reset failed: %v", err)
+	}
+	if advance != 300<<6 || lsb != 20<<6 {
+		t.Fatalf("reset metrics got advance=%d lsb=%d, want %d %d", advance, lsb, 300<<6, 20<<6)
+	}
+}
+
+func TestCompositeGlyphAppliesGvarPseudoPointDeltas(t *testing.T) {
+	composite := compositeGlyphWithMetricComponents([]compositeMetricComponent{
+		{glyph: 1},
+		{glyph: 2},
+	})
+	component1 := simpleOnePointGlyphData(30, 0, nil)
+	component2 := simpleOnePointGlyphData(90, 0, nil)
+	glyf := append(append(append([]byte{}, composite...), component1...), component2...)
+
+	head := make([]byte, 54)
+	binary.BigEndian.PutUint16(head[18:20], 1000)
+	binary.BigEndian.PutUint16(head[50:52], 1)
+
+	hhea := make([]byte, 36)
+	binary.BigEndian.PutUint16(hhea[34:36], 3)
+
+	hmtx := make([]byte, 12)
+	binary.BigEndian.PutUint16(hmtx[0:2], 100)
+	binary.BigEndian.PutUint16(hmtx[2:4], 5)
+	binary.BigEndian.PutUint16(hmtx[4:6], 300)
+	binary.BigEndian.PutUint16(hmtx[6:8], 30)
+	binary.BigEndian.PutUint16(hmtx[8:10], 700)
+	binary.BigEndian.PutUint16(hmtx[10:12], 70)
+
+	loca := make([]byte, 16)
+	binary.BigEndian.PutUint32(loca[4:8], uint32(len(composite)))
+	binary.BigEndian.PutUint32(loca[8:12], uint32(len(composite)+len(component1)))
+	binary.BigEndian.PutUint32(loca[12:16], uint32(len(glyf)))
+
+	maxp := make([]byte, 32)
+	binary.BigEndian.PutUint32(maxp[0:4], 0x00010000)
+	binary.BigEndian.PutUint16(maxp[4:6], 3)
+
+	tables := []sfntTestTable{
+		{tag: "glyf", data: glyf},
+		{tag: "head", data: head},
+		{tag: "hhea", data: hhea},
+		{tag: "hmtx", data: hmtx},
+		{tag: "loca", data: loca},
+		{tag: "maxp", data: maxp},
+		{tag: "fvar", data: buildFvarOneAxisTable()},
+		{tag: "gvar", data: buildGvarCompositePseudoDeltasTable()},
+	}
+	loaded, err := NewLoader(&mockSystem{}).LoadFace(&mockStream{data: buildSFNTTestData(t, tables)})
+	if err != nil {
+		t.Fatalf("LoadFace failed: %v", err)
+	}
+	face := loaded.(*Face)
+	if err := face.SetPixelSizes(1000, 1000); err != nil {
+		t.Fatalf("SetPixelSizes failed: %v", err)
+	}
+	if err := face.SetVariationNormalizedCoordinates([]float32{1}); err != nil {
+		t.Fatalf("SetVariationNormalizedCoordinates failed: %v", err)
+	}
+
+	slot, err := face.LoadGlyph(0, api.LoadNoHinting)
+	if err != nil {
+		t.Fatalf("LoadGlyph failed: %v", err)
+	}
+	points := slot.GetOutline().GetPoints()
+	if len(points) != 2 {
+		t.Fatalf("composite point count = %d, want 2", len(points))
+	}
+	if got, want := points[0].X, int32(40<<6); got != want {
+		t.Fatalf("component 0 X = %d, want %d", got, want)
+	}
+	if got, want := points[1].X, int32(80<<6); got != want {
+		t.Fatalf("component 1 X = %d, want %d", got, want)
+	}
+
+	advance, lsb, err := face.GetGlyphMetrics(0)
+	if err != nil {
+		t.Fatalf("GetGlyphMetrics failed: %v", err)
+	}
+	if advance != 140<<6 || lsb != 45<<6 {
+		t.Fatalf("composite gvar metrics got advance=%d lsb=%d, want %d %d", advance, lsb, 140<<6, 45<<6)
+	}
+}
+
+func TestLoadGlyphUnhintedMetricsUseBBoxLSBPhantoms(t *testing.T) {
+	glyph := simpleOnePointGlyphData(50, 0, nil)
+	face := loadGlyphMetricsTestFace(t, []uint32{0, uint32(len(glyph))}, glyph, []metricsGlyph{
+		{advance: 300, lsb: 20},
+	})
+
+	advance, lsb, err := face.GetGlyphMetrics(0)
+	if err != nil {
+		t.Fatalf("GetGlyphMetrics failed: %v", err)
+	}
+	if advance != 300<<6 || lsb != 20<<6 {
+		t.Fatalf("table metrics got advance=%d lsb=%d, want %d %d", advance, lsb, 300<<6, 20<<6)
+	}
+
+	slot, err := face.LoadGlyph(0, api.LoadNoHinting)
+	if err != nil {
+		t.Fatalf("LoadGlyph failed: %v", err)
+	}
+	points := slot.GetOutline().GetPoints()
+	if len(points) != 1 {
+		t.Fatalf("external outline point count = %d, want 1", len(points))
+	}
+
+	advance, lsb, err = face.GetGlyphMetrics(0)
+	if err != nil {
+		t.Fatalf("GetGlyphMetrics after LoadGlyph failed: %v", err)
+	}
+	if advance != 300<<6 || lsb != 20<<6 {
+		t.Fatalf("loaded metrics got advance=%d lsb=%d, want %d %d", advance, lsb, 300<<6, 20<<6)
+	}
+}
+
+func TestLoadGlyphHintedPhantomAdvanceUpdatesMetrics(t *testing.T) {
+	instructions := []byte{
+		0xB1, 2, 64, // PUSHB[2] point 2, 1px distance
+		0x38, // SHPIX
+	}
+	glyph := simpleOnePointGlyphData(50, 0, instructions)
+	face := loadGlyphMetricsTestFace(t, []uint32{0, uint32(len(glyph))}, glyph, []metricsGlyph{
+		{advance: 300, lsb: 20},
+	})
+
+	slot, err := face.LoadGlyph(0, api.LoadDefault)
+	if err != nil {
+		t.Fatalf("LoadGlyph failed: %v", err)
+	}
+	points := slot.GetOutline().GetPoints()
+	if len(points) != 1 {
+		t.Fatalf("external outline point count = %d, want 1", len(points))
+	}
+
+	advance, lsb, err := face.GetGlyphMetrics(0)
+	if err != nil {
+		t.Fatalf("GetGlyphMetrics failed: %v", err)
+	}
+	if advance != 301<<6 || lsb != 20<<6 {
+		t.Fatalf("hinted metrics got advance=%d lsb=%d, want %d %d", advance, lsb, 301<<6, 20<<6)
+	}
+	if concrete, ok := slot.(*GlyphSlot); !ok || !concrete.hasMetrics || concrete.metrics.advance != 301<<6 {
+		t.Fatalf("slot metrics were not updated from hinted phantoms: %#v", slot)
+	}
+}
+
+func TestGlyphSlotMetricsProviderUsesLoadedPhantoms(t *testing.T) {
+	glyph := simpleRectGlyphData(50, -10, 90, 40)
+	face := loadGlyphMetricsTestFace(t, []uint32{0, uint32(len(glyph))}, glyph, []metricsGlyph{
+		{advance: 300, lsb: 20},
+	})
+
+	slot, err := face.LoadGlyph(0, api.LoadNoHinting)
+	if err != nil {
+		t.Fatalf("LoadGlyph failed: %v", err)
+	}
+
+	metrics, ok := api.GetGlyphSlotMetrics(slot)
+	if !ok {
+		t.Fatal("glyph slot metrics unavailable")
+	}
+	if metrics.Width != 40<<6 || metrics.Height != 50<<6 {
+		t.Fatalf("slot bounds got width=%d height=%d, want %d %d", metrics.Width, metrics.Height, 40<<6, 50<<6)
+	}
+	if metrics.HoriBearingX != 20<<6 || metrics.HoriBearingY != 40<<6 || metrics.HoriAdvance != 300<<6 {
+		t.Fatalf("horizontal slot metrics mismatch: %+v", metrics)
+	}
+	if metrics.VertAdvance != 1000<<6 {
+		t.Fatalf("vertical advance = %d, want %d", metrics.VertAdvance, 1000<<6)
+	}
+}
+
+func TestLoadGlyphNoScaleLeavesOutlineAndSlotMetricsUnscaled(t *testing.T) {
+	glyph := simpleRectGlyphData(50, 0, 90, 40)
+	face := loadGlyphMetricsTestFace(t, []uint32{0, uint32(len(glyph))}, glyph, []metricsGlyph{
+		{advance: 300, lsb: 20},
+	})
+	if err := face.SetPixelSizes(500, 500); err != nil {
+		t.Fatalf("SetPixelSizes failed: %v", err)
+	}
+
+	slot, err := face.LoadGlyph(0, api.LoadNoScale)
+	if err != nil {
+		t.Fatalf("LoadGlyph failed: %v", err)
+	}
+	points := slot.GetOutline().GetPoints()
+	if got, want := points[0].X, int32(50<<6); got != want {
+		t.Fatalf("NoScale point X = %d, want %d", got, want)
+	}
+
+	metrics, ok := api.GetGlyphSlotMetrics(slot)
+	if !ok {
+		t.Fatal("glyph slot metrics unavailable")
+	}
+	if metrics.Width != 40<<6 || metrics.HoriBearingX != 20<<6 || metrics.HoriAdvance != 300<<6 {
+		t.Fatalf("NoScale slot metrics mismatch: %+v", metrics)
+	}
+
+	advance, lsb, err := face.GetGlyphMetrics(0)
+	if err != nil {
+		t.Fatalf("GetGlyphMetrics failed: %v", err)
+	}
+	if advance != 150<<6 || lsb != 10<<6 {
+		t.Fatalf("NoScale load polluted scaled metrics: advance=%d lsb=%d", advance, lsb)
+	}
+}
+
+func TestLoadGlyphRenderStoresBitmap(t *testing.T) {
+	glyph := simpleRectGlyphData(0, 0, 10, 10)
+	face := loadGlyphMetricsTestFace(t, []uint32{0, uint32(len(glyph))}, glyph, []metricsGlyph{
+		{advance: 12, lsb: 0},
+	})
+
+	slot, err := face.LoadGlyph(0, api.LoadRender|api.LoadNoHinting|api.LoadTargetMono)
+	if err != nil {
+		t.Fatalf("LoadGlyph failed: %v", err)
+	}
+	bitmap := slot.GetBitmap()
+	if bitmap == nil {
+		t.Fatal("rendered bitmap is nil")
+	}
+	if bitmap.GetPixelMode() != api.MODE_MONO {
+		t.Fatalf("bitmap pixel mode = %d, want MODE_MONO", bitmap.GetPixelMode())
+	}
+	if bitmap.GetWidth() != 10 || bitmap.GetRows() != 10 || bitmap.GetPitch() != 10 {
+		t.Fatalf("bitmap geometry got width=%d rows=%d pitch=%d", bitmap.GetWidth(), bitmap.GetRows(), bitmap.GetPitch())
+	}
+	if !hasNonZeroByte(bitmap.GetBuffer()) {
+		t.Fatal("rendered bitmap buffer is empty")
+	}
+}
+
+func TestLoadGlyphNoBitmapSkipsEmbeddedImages(t *testing.T) {
+	sys := core.NewSystem()
+	sys.SetImageDecoder(loaderTestImageDecoder{})
+	sbix, err := parseSbix(&mockStream{data: testSbixData()})
+	if err != nil {
+		t.Fatalf("parseSbix failed: %v", err)
+	}
+	face := &Face{sys: sys, sbix: &sbix}
+
+	slot, err := face.LoadGlyph(0, 0)
+	if err != nil {
+		t.Fatalf("LoadGlyph with bitmap failed: %v", err)
+	}
+	if slot.GetImage() == nil {
+		t.Fatal("expected embedded image")
+	}
+	if _, err := face.LoadGlyph(0, api.LoadNoBitmap); err == nil {
+		t.Fatal("expected LoadNoBitmap to skip embedded image and expose missing outline error")
+	}
+}
+
+func TestCompositeUseMyMetricsUsesComponentPhantoms(t *testing.T) {
+	composite := compositeGlyphWithMetricComponents([]compositeMetricComponent{
+		{glyph: 1},
+		{glyph: 2, flags: USE_MY_METRICS},
+	})
+	component1 := simpleOnePointGlyphData(30, 0, nil)
+	component2 := simpleOnePointGlyphData(90, 0, nil)
+	glyf := append(append(append([]byte{}, composite...), component1...), component2...)
+	offsets := []uint32{0, uint32(len(composite)), uint32(len(composite) + len(component1)), uint32(len(glyf))}
+	face := loadGlyphMetricsTestFace(t, offsets, glyf, []metricsGlyph{
+		{advance: 100, lsb: 5},
+		{advance: 300, lsb: 30},
+		{advance: 700, lsb: 70},
+	})
+
+	advance, lsb, err := face.GetGlyphMetrics(0)
+	if err != nil {
+		t.Fatalf("GetGlyphMetrics before LoadGlyph failed: %v", err)
+	}
+	if advance != 700<<6 || lsb != 70<<6 {
+		t.Fatalf("pre-load composite metrics got advance=%d lsb=%d, want %d %d", advance, lsb, 700<<6, 70<<6)
+	}
+
+	slot, err := face.LoadGlyph(0, api.LoadNoHinting)
+	if err != nil {
+		t.Fatalf("LoadGlyph failed: %v", err)
+	}
+	points := slot.GetOutline().GetPoints()
+	if len(points) != 2 {
+		t.Fatalf("external composite outline point count = %d, want 2", len(points))
+	}
+
+	advance, lsb, err = face.GetGlyphMetrics(0)
+	if err != nil {
+		t.Fatalf("GetGlyphMetrics after LoadGlyph failed: %v", err)
+	}
+	if advance != 700<<6 || lsb != 70<<6 {
+		t.Fatalf("USE_MY_METRICS got advance=%d lsb=%d, want %d %d", advance, lsb, 700<<6, 70<<6)
+	}
+}
+
+func TestLoadGlyphRejectsDecreasingLocaOffsets(t *testing.T) {
+	tests := []struct {
+		name             string
+		indexToLocFormat int16
+	}{
+		{name: "short", indexToLocFormat: 0},
+		{name: "long", indexToLocFormat: 1},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			face := loadGlyphBoundsTestFace(t, tc.indexToLocFormat, []uint32{20, 10}, make([]byte, 20))
+			if _, err := face.LoadGlyph(0, 0); err == nil {
+				t.Fatal("expected decreasing loca offsets to fail")
+			}
+		})
+	}
+}
+
+func TestLoadGlyphRejectsGlyfRangeOutOfBounds(t *testing.T) {
+	face := loadGlyphBoundsTestFace(t, 1, []uint32{4, 20}, make([]byte, 10))
+	if _, err := face.LoadGlyph(0, 0); err == nil {
+		t.Fatal("expected glyph range outside glyf table to fail")
+	}
+}
+
+func TestLoadGlyphHonorsLocaLength(t *testing.T) {
+	face := loadGlyphBoundsTestFace(t, 1, []uint32{0, 12}, onePointGlyphData())
+	if _, err := face.LoadGlyph(0, 0); err == nil {
+		t.Fatal("expected glyph parser to reject reads past loca length")
+	}
+}
+
+func TestLoadGlyphRejectsCompositeCycles(t *testing.T) {
+	t.Run("self", func(t *testing.T) {
+		glyf := compositeGlyphData(0)
+		face := loadGlyphBoundsTestFace(t, 1, []uint32{0, uint32(len(glyf))}, glyf)
+		if _, err := face.LoadGlyph(0, 0); err == nil {
+			t.Fatal("expected self-referential composite glyph to fail")
+		}
+	})
+
+	t.Run("mutual", func(t *testing.T) {
+		glyph0 := compositeGlyphData(1)
+		glyph1 := compositeGlyphData(0)
+		glyf := append(append([]byte{}, glyph0...), glyph1...)
+		face := loadGlyphBoundsTestFace(t, 1, []uint32{0, uint32(len(glyph0)), uint32(len(glyf))}, glyf)
+		if _, err := face.LoadGlyph(0, 0); err == nil {
+			t.Fatal("expected mutually recursive composite glyphs to fail")
+		}
+	})
+}
+
+func TestLoadGlyphRejectsCompositeDepthLimit(t *testing.T) {
+	numGlyphs := maxCompositeGlyphDepth + 2
+	offsets := make([]uint32, numGlyphs+1)
+	var glyf []byte
+	for i := 0; i < numGlyphs-1; i++ {
+		offsets[i] = uint32(len(glyf))
+		glyf = append(glyf, compositeGlyphData(uint16(i+1))...)
+	}
+	offsets[numGlyphs-1] = uint32(len(glyf))
+	offsets[numGlyphs] = uint32(len(glyf))
+
+	face := loadGlyphBoundsTestFace(t, 1, offsets, glyf)
+	if _, err := face.LoadGlyph(0, 0); err == nil {
+		t.Fatal("expected excessive composite glyph depth to fail")
+	}
+}
+
+func TestLoadGlyphRejectsCompositeComponentLimit(t *testing.T) {
+	glyph0 := compositeGlyphWithComponents(1, maxCompositeGlyphComponents+1)
+	glyf := append([]byte{}, glyph0...)
+	face := loadGlyphBoundsTestFace(t, 1, []uint32{0, uint32(len(glyph0)), uint32(len(glyf))}, glyf)
+	if _, err := face.LoadGlyph(0, 0); err == nil {
+		t.Fatal("expected excessive composite glyph components to fail")
 	}
 }
 
@@ -185,8 +1305,8 @@ func TestLoadGlyphSimple(t *testing.T) {
 	}
 
 	points := outline.GetPoints()
-	if len(points) != 7 {
-		t.Errorf("expected 7 points, got %d", len(points))
+	if len(points) != 3 {
+		t.Errorf("expected 3 points, got %d", len(points))
 	}
 
 	// Point 0: (10, 30) -> (640, 1920) in 26.6

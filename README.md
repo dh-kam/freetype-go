@@ -10,7 +10,8 @@ A work-in-progress, pure Go port inspired by the **FreeType 2.13.2** font engine
 - **CGO-free by design**: The repository is implemented in Go and can be built without linking to the C FreeType library.
 - **Experimental API**: Import the subpackages you need. The root package currently provides documentation only so `go list .` and pkg.go.dev can discover the module.
 - **Partial FreeType coverage**: The project includes implementations for SFNT/OpenType parsing, TrueType/CFF-related code, rasterization, selected bitmap/color/variation tables, and early layout support. It is not yet a drop-in replacement for FreeType.
-- **Conformance is evolving**: Tests exist for many packages, but the project does not currently claim bit-for-bit rendering parity or full specification coverage.
+- **Conformance is evolving**: Tests exist for many packages, and `tools/conformance` can compare Go dumps against optional C FreeType dumps. The project does not currently claim bit-for-bit rendering parity or full specification coverage.
+- **FreeType-like API concepts**: `api` exposes load flag names, render modes, and optional glyph slot metrics plumbing. Drivers may implement only a subset while conformance tracks the remaining semantic gaps.
 
 ## Quick Start
 
@@ -24,25 +25,28 @@ go get github.com/dh-kam/freetype-go
 package main
 
 import (
+	"github.com/dh-kam/freetype-go/api"
 	"github.com/dh-kam/freetype-go/core"
+	"github.com/dh-kam/freetype-go/helper"
 	"github.com/dh-kam/freetype-go/raster"
 	"github.com/dh-kam/freetype-go/sfnt"
 	"os"
 )
 
 func main() {
-	f, _ := os.Open("font.ttf")
+	f, _ := os.Open("font.ttf") // TTF, OTF, TTC/OTC, WOFF, or WOFF2
 	defer f.Close()
 
 	// 1. Load Font
-	stream, _ := core.NewFileStream(f)
-	loader := sfnt.NewLoader(core.NewSystem())
-	face, _ := loader.LoadFace(stream)
+	fileStream, _ := core.NewFileStream(f)
+	var stream api.Stream = fileStream
+	stream, _ = helper.DecodeWOFFIfNeeded(stream)
+	face, _ := sfnt.LoadFaceIndex(core.NewSystem(), stream, 0)
 
 	// 2. Set Size and Load Glyph
 	face.SetPixelSizes(64, 64)
 	glyphIndex, _ := face.GetGlyphIndex('A')
-	slot, _ := face.LoadGlyph(glyphIndex, 0)
+	slot, _ := face.LoadGlyph(glyphIndex, api.LoadDefault)
 
 	// 3. Render to Bitmap
 	outline := slot.GetOutline()
@@ -55,6 +59,7 @@ func main() {
 ## Documentation
 - [Full Feature List](docs/features.md)
 - [Architecture Guide](docs/architecture.md)
+- [Conformance Workflow](docs/conformance.md)
 - [CLI ASCII Renderer](cmd/ftgo)
 - [Web Demo (WASM)](https://dh-kam.github.com/freetype-go/)
 

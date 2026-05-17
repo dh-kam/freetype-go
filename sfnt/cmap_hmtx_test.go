@@ -162,7 +162,7 @@ func TestFaceCMapAndHmtx(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetGlyphMetrics failed: %v", err)
 	}
-	if advance != 1000 || lsb != 200 {
-		t.Errorf("expected (1000, 200), got (%d, %d)", advance, lsb)
+	if advance != 24<<6 || lsb != 307 {
+		t.Errorf("expected (1536, 307), got (%d, %d)", advance, lsb)
 	}
 }

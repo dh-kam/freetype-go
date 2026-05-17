@@ -2,20 +2,35 @@ package truetype
 
 import (
 	"fmt"
+	stdmath "math"
 
 	"github.com/dh-kam/freetype-go/api"
-	"github.com/dh-kam/freetype-go/math"
+	ftmath "github.com/dh-kam/freetype-go/math"
 )
 
 // push adds a value to the stack.
 func (e *ExecutionEnv) push(val int32) error {
 	if e.StackTop >= len(e.Stack) {
-		e.Stack = append(e.Stack, make([]int32, 1024)...)
+		return e.recordError(fmt.Errorf("%w: max stack elements %d", ErrStackOverflow, len(e.Stack)))
 	}
 	// BCE hint
 	_ = e.Stack[e.StackTop]
 	e.Stack[e.StackTop] = val
 	e.StackTop++
+	return nil
+}
+
+func (e *ExecutionEnv) checkCallDepth() error {
+	if len(e.CallStack) >= e.effectiveMaxCallDepth() {
+		return fmt.Errorf("%w: limit %d", ErrCallDepthExceeded, e.effectiveMaxCallDepth())
+	}
+	return nil
+}
+
+func (e *ExecutionEnv) checkLoopCallRepeat(count int32) error {
+	if count > e.effectiveMaxLoopCallRepeat() {
+		return fmt.Errorf("%w: limit %d", ErrLoopCallRepeatExceeded, e.effectiveMaxLoopCallRepeat())
+	}
 	return nil
 }
 
@@ -90,6 +105,372 @@ func (e *ExecutionEnv) getProjectedDistance(p1, p2 api.Vector) int32 {
 	return e.project(p2) - e.project(p1)
 }
 
+func (e *ExecutionEnv) moveProjected(p *api.Vector, distance int32) error {
+	denom := int64(e.GS.FreeVector.X)*int64(e.GS.ProjVector.X) + int64(e.GS.FreeVector.Y)*int64(e.GS.ProjVector.Y)
+	if denom == 0 {
+		return fmt.Errorf("freedom vector is perpendicular to projection vector")
+	}
+	num := int64(distance) * 0x4000 * 0x4000
+	freeDistance := divRound(num, denom)
+	if freeDistance > int64(^uint32(0)>>1) || freeDistance < -int64(^uint32(0)>>1)-1 {
+		return fmt.Errorf("projected move overflows int32: %d", freeDistance)
+	}
+	e.move(p, int32(freeDistance))
+	return nil
+}
+
+func divRound(num, den int64) int64 {
+	if den < 0 {
+		num = -num
+		den = -den
+	}
+	if num >= 0 {
+		return (num + den/2) / den
+	}
+	return -((-num + den/2) / den)
+}
+
+func normalizeLineVector(p1, p2 api.Vector, perpendicular bool) (api.Vector, error) {
+	dx := int64(p2.X - p1.X)
+	dy := int64(p2.Y - p1.Y)
+	if dx == 0 && dy == 0 {
+		return api.Vector{}, fmt.Errorf("cannot set vector from coincident points")
+	}
+	length := stdmath.Hypot(float64(dx), float64(dy))
+	x := int32(stdmath.Round(float64(dx) * 0x4000 / length))
+	y := int32(stdmath.Round(float64(dy) * 0x4000 / length))
+	if perpendicular {
+		x, y = -y, x
+	}
+	return api.Vector{X: x, Y: y}, nil
+}
+
+func normalizeStackVector(x, y int32) (api.Vector, error) {
+	if x == 0 && y == 0 {
+		return api.Vector{}, fmt.Errorf("cannot set vector from zero stack vector")
+	}
+	length := stdmath.Hypot(float64(x), float64(y))
+	return api.Vector{
+		X: int32(stdmath.Round(float64(x) * 0x4000 / length)),
+		Y: int32(stdmath.Round(float64(y) * 0x4000 / length)),
+	}, nil
+}
+
+func stackF2Dot14(v int32) int32 {
+	return int32(int16(v))
+}
+
+func zonePointer(val int32) (int, error) {
+	if val != 0 && val != 1 {
+		return 0, fmt.Errorf("invalid zone pointer: %d", val)
+	}
+	return int(val), nil
+}
+
+func (e *ExecutionEnv) scaleFUnits(value int32) int32 {
+	if e.UnitsPerEm == 0 || e.PPEM <= 0 {
+		return value
+	}
+	num := int64(value) * int64(e.PPEM) * 64
+	return int32(divRound(num, int64(e.UnitsPerEm)))
+}
+
+func applyMinimumDistance(distance int32, minimum F26Dot6) int32 {
+	minDist := int32(minimum)
+	if minDist < 0 {
+		minDist = -minDist
+	}
+	if distance >= 0 {
+		if distance < minDist {
+			return minDist
+		}
+		return distance
+	}
+	if distance > -minDist {
+		return -minDist
+	}
+	return distance
+}
+
+func applyMinimumDistanceForSign(distance, original int32, minimum F26Dot6) int32 {
+	minDist := int32(minimum)
+	if minDist < 0 {
+		minDist = -minDist
+	}
+	if original >= 0 {
+		if distance < minDist {
+			return minDist
+		}
+		return distance
+	}
+	if distance > -minDist {
+		return -minDist
+	}
+	return distance
+}
+
+func abs32(v int32) int32 {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
+
+func (e *ExecutionEnv) shiftReference(opcode byte) (int, int, int32, error) {
+	refZoneIdx := e.ZP1
+	refIdx := e.RP2
+	if opcode&0x01 != 0 {
+		refZoneIdx = e.ZP0
+		refIdx = e.RP1
+	}
+	refZone := &e.Zones[refZoneIdx]
+	if refIdx < 0 || refIdx >= len(refZone.Points) || refIdx >= len(refZone.OriginalPoints) {
+		return 0, 0, 0, fmt.Errorf("reference point out of bounds: %d", refIdx)
+	}
+	shift := e.project(refZone.Points[refIdx]) - e.project(refZone.OriginalPoints[refIdx])
+	return refZoneIdx, refIdx, shift, nil
+}
+
+func contourBounds(zone *Zone, contour int32) (int, int, error) {
+	if contour < 0 {
+		return 0, 0, fmt.Errorf("contour index out of bounds: %d", contour)
+	}
+	if len(zone.Contours) == 0 {
+		if contour != 0 {
+			return 0, 0, fmt.Errorf("contour index out of bounds: %d", contour)
+		}
+		return 0, len(zone.Points), nil
+	}
+	if int(contour) >= len(zone.Contours) {
+		return 0, 0, fmt.Errorf("contour index out of bounds: %d", contour)
+	}
+	start := 0
+	if contour > 0 {
+		start = zone.Contours[contour-1] + 1
+	}
+	limit := zone.Contours[contour] + 1
+	if start < 0 || start > len(zone.Points) || limit < start || limit > len(zone.Points) {
+		return 0, 0, fmt.Errorf("invalid contour bounds: contour=%d start=%d limit=%d", contour, start, limit)
+	}
+	return start, limit, nil
+}
+
+func realPointLimit(zone *Zone, zoneIdx int) int {
+	if zoneIdx == 1 && len(zone.Contours) > 0 {
+		limit := zone.Contours[len(zone.Contours)-1] + 1
+		if limit >= 0 && limit < len(zone.Points) {
+			return limit
+		}
+	}
+	return len(zone.Points)
+}
+
+func (e *ExecutionEnv) deltaAmount(opcode byte, arg int32) (int32, bool) {
+	ppemBase := e.GS.DeltaBase
+	switch opcode {
+	case 0x71, 0x74:
+		ppemBase += 16
+	case 0x72, 0x75:
+		ppemBase += 32
+	}
+	targetPPEM := ppemBase + int32((uint32(arg)&0xF0)>>4)
+	if int32(e.PPEM) != targetPPEM {
+		return 0, false
+	}
+
+	steps := int32(uint32(arg)&0x0F) - 8
+	if steps >= 0 {
+		steps++
+	}
+	shift := e.GS.DeltaShift
+	if shift < 0 {
+		shift = 0
+	}
+	if shift > 6 {
+		return 0, true
+	}
+	return steps << uint(6-shift), true
+}
+
+func intersectLines(a0, a1, b0, b1 api.Vector) (api.Vector, bool) {
+	dax := float64(a1.X - a0.X)
+	day := float64(a1.Y - a0.Y)
+	dbx := float64(b1.X - b0.X)
+	dby := float64(b1.Y - b0.Y)
+	dx := float64(b0.X - a0.X)
+	dy := float64(b0.Y - a0.Y)
+
+	discriminant := dax*(-dby) + day*dbx
+	dotproduct := dax*dbx + day*dby
+	if 19*stdmath.Abs(discriminant) <= stdmath.Abs(dotproduct) {
+		return api.Vector{
+			X: int32((int64(a0.X) + int64(a1.X) + int64(b0.X) + int64(b1.X)) / 4),
+			Y: int32((int64(a0.Y) + int64(a1.Y) + int64(b0.Y) + int64(b1.Y)) / 4),
+		}, false
+	}
+
+	val := dx*(-dby) + dy*dbx
+	return api.Vector{
+		X: a0.X + int32(stdmath.Round(val*dax/discriminant)),
+		Y: a0.Y + int32(stdmath.Round(val*day/discriminant)),
+	}, true
+}
+
+func (e *ExecutionEnv) setSuperRound(gridPeriod, selector int32) {
+	var period int32
+	switch selector & 0xC0 {
+	case 0:
+		period = gridPeriod / 2
+	case 0x40:
+		period = gridPeriod
+	case 0x80:
+		period = gridPeriod * 2
+	default:
+		period = gridPeriod
+	}
+
+	var phase int32
+	switch selector & 0x30 {
+	case 0x10:
+		phase = period / 4
+	case 0x20:
+		phase = period / 2
+	case 0x30:
+		phase = period * 3 / 4
+	}
+
+	var threshold int32
+	if selector&0x0F == 0 {
+		threshold = period - 1
+	} else {
+		threshold = ((selector & 0x0F) - 4) * period / 8
+	}
+
+	e.GS.SuperRoundPeriod = period >> 8
+	e.GS.SuperRoundPhase = phase >> 8
+	e.GS.SuperRoundThreshold = threshold >> 8
+}
+
+func (e *ExecutionEnv) roundSuper(value int32, useDivision bool) int32 {
+	period := e.GS.SuperRoundPeriod
+	if period <= 0 {
+		return value
+	}
+	phase := e.GS.SuperRoundPhase
+	threshold := e.GS.SuperRoundThreshold
+	if value >= 0 {
+		base := value + threshold - phase
+		var rounded int32
+		if useDivision {
+			rounded = (base / period) * period
+		} else {
+			rounded = base & -period
+		}
+		rounded += phase
+		if rounded < 0 {
+			return phase
+		}
+		return rounded
+	}
+
+	base := threshold - phase - value
+	var rounded int32
+	if useDivision {
+		rounded = -((base / period) * period)
+	} else {
+		rounded = -(base & -period)
+	}
+	rounded -= phase
+	if rounded > 0 {
+		return -phase
+	}
+	return rounded
+}
+
+func (e *ExecutionEnv) applySingleWidthDistance(distance int32, useOriginalBand bool) int32 {
+	cutIn := int32(e.GS.SingleWidthCutIn)
+	if cutIn <= 0 {
+		return distance
+	}
+	width := int32(e.GS.SingleWidthValue)
+	if useOriginalBand {
+		if distance < width+cutIn && distance > width-cutIn {
+			if distance >= 0 {
+				return width
+			}
+			return -width
+		}
+		return distance
+	}
+	if abs32(distance-width) < cutIn {
+		if distance >= 0 {
+			return width
+		}
+		return -width
+	}
+	return distance
+}
+
+func (e *ExecutionEnv) effectiveInterpreterVersion() int32 {
+	if e.InterpreterVersion > 0 {
+		return e.InterpreterVersion
+	}
+	return 35
+}
+
+func (e *ExecutionEnv) isMonoRenderMode() bool {
+	return e.RenderMode == api.RenderModeMono
+}
+
+func (e *ExecutionEnv) isGrayscaleRendering() bool {
+	if e.Grayscale {
+		return true
+	}
+	return e.RenderMode != api.RenderModeNone && e.RenderMode != api.RenderModeMono
+}
+
+func (e *ExecutionEnv) getInfo(selector int32) int32 {
+	var res int32
+	if selector&0x0001 != 0 {
+		res = e.effectiveInterpreterVersion()
+	}
+	if selector&0x0002 != 0 && e.Rotated {
+		res |= 1 << 8
+	}
+	if selector&0x0004 != 0 && e.Stretched {
+		res |= 1 << 9
+	}
+	if selector&0x0008 != 0 && e.Variation {
+		res |= 1 << 10
+	}
+	if selector&0x0020 != 0 && e.isGrayscaleRendering() {
+		res |= 1 << 12
+	}
+
+	if e.effectiveInterpreterVersion() >= 40 && e.RenderMode != api.RenderModeNone && !e.isMonoRenderMode() {
+		if selector&0x0040 != 0 {
+			res |= 1 << 13
+		}
+		if selector&0x0100 != 0 && e.RenderMode == api.RenderModeLCDV {
+			res |= 1 << 15
+		}
+		if selector&0x0400 != 0 {
+			res |= 1 << 17
+		}
+		if selector&0x0800 != 0 {
+			res |= 1 << 18
+		}
+		if selector&0x1000 != 0 &&
+			e.RenderMode != api.RenderModeMono &&
+			e.RenderMode != api.RenderModeLCD &&
+			e.RenderMode != api.RenderModeLCDV {
+			res |= 1 << 19
+		}
+	}
+
+	return res
+}
+
 func (e *ExecutionEnv) touch(pIdx int, axis int, zoneIdx int) {
 	zone := &e.Zones[zoneIdx]
 	if axis == 0 { // y
@@ -104,10 +485,10 @@ func (e *ExecutionEnv) touch(pIdx int, axis int, zoneIdx int) {
 }
 
 func (e *ExecutionEnv) touchCurrent(pIdx int, zoneIdx int) {
-	if e.GS.ProjVector.X != 0 {
+	if e.GS.FreeVector.X != 0 {
 		e.touch(pIdx, 1, zoneIdx)
 	}
-	if e.GS.ProjVector.Y != 0 {
+	if e.GS.FreeVector.Y != 0 {
 		e.touch(pIdx, 0, zoneIdx)
 	}
 }
@@ -126,10 +507,10 @@ func (e *ExecutionEnv) untouch(pIdx int, axis int, zoneIdx int) {
 }
 
 func (e *ExecutionEnv) untouchCurrent(pIdx int, zoneIdx int) {
-	if e.GS.ProjVector.X != 0 {
+	if e.GS.FreeVector.X != 0 {
 		e.untouch(pIdx, 1, zoneIdx)
 	}
-	if e.GS.ProjVector.Y != 0 {
+	if e.GS.FreeVector.Y != 0 {
 		e.untouch(pIdx, 0, zoneIdx)
 	}
 }
@@ -299,6 +680,22 @@ func (e *ExecutionEnv) round(value int32) int32 {
 		} else {
 			return -((-value + 16) & ^31)
 		}
+	case 3: // Round Up To Grid
+		if value >= 0 {
+			return (value + 63) & ^63
+		}
+		return -((-value + 63) & ^63)
+	case 4: // Round Down To Grid
+		if value >= 0 {
+			return value & ^63
+		}
+		return -((-value) & ^63)
+	case 5: // Round Off
+		return value
+	case 6: // Super Round
+		return e.roundSuper(value, false)
+	case 7: // Super Round 45 degrees
+		return e.roundSuper(value, true)
 	default:
 		return value
 	}
@@ -337,12 +734,121 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 		}
 		e.IP++
 
+	case opcode == 0x06 || opcode == 0x07 || opcode == 0x08 || opcode == 0x09: // SPVTL[a], SFVTL[a]
+		p1Idx, err := e.pop()
+		if err != nil {
+			return err
+		}
+		p2Idx, err := e.pop()
+		if err != nil {
+			return err
+		}
+		zone2 := &e.Zones[e.ZP2]
+		zone1 := &e.Zones[e.ZP1]
+		if p1Idx < 0 || int(p1Idx) >= len(zone2.Points) || p2Idx < 0 || int(p2Idx) >= len(zone1.Points) {
+			return fmt.Errorf("index out of bounds in vector-to-line: p1=%d p2=%d", p1Idx, p2Idx)
+		}
+		vec, err := normalizeLineVector(zone2.Points[p1Idx], zone1.Points[p2Idx], opcode&0x01 != 0)
+		if err != nil {
+			return err
+		}
+		if opcode == 0x06 || opcode == 0x07 {
+			e.GS.ProjVector = vec
+			e.GS.DualVector = vec
+		} else {
+			e.GS.FreeVector = vec
+		}
+		e.IP++
+
+	case opcode == 0x0A || opcode == 0x0B: // SPVFS, SFVFS
+		y, err := e.pop()
+		if err != nil {
+			return err
+		}
+		x, err := e.pop()
+		if err != nil {
+			return err
+		}
+		vec, err := normalizeStackVector(stackF2Dot14(x), stackF2Dot14(y))
+		if err != nil {
+			return err
+		}
+		if opcode == 0x0A {
+			e.GS.ProjVector = vec
+			e.GS.DualVector = vec
+		} else {
+			e.GS.FreeVector = vec
+		}
+		e.IP++
+
+	case opcode == 0x0C: // GPV
+		if err := e.push(e.GS.ProjVector.X); err != nil {
+			return err
+		}
+		if err := e.push(e.GS.ProjVector.Y); err != nil {
+			return err
+		}
+		e.IP++
+
+	case opcode == 0x0D: // GFV
+		if err := e.push(e.GS.FreeVector.X); err != nil {
+			return err
+		}
+		if err := e.push(e.GS.FreeVector.Y); err != nil {
+			return err
+		}
+		e.IP++
+
+	case opcode == 0x0E: // SFVTPV
+		e.GS.FreeVector = e.GS.ProjVector
+		e.IP++
+
+	case opcode == 0x0F: // ISECT
+		b1Idx, err := e.pop()
+		if err != nil {
+			return err
+		}
+		b0Idx, err := e.pop()
+		if err != nil {
+			return err
+		}
+		a1Idx, err := e.pop()
+		if err != nil {
+			return err
+		}
+		a0Idx, err := e.pop()
+		if err != nil {
+			return err
+		}
+		pIdx, err := e.pop()
+		if err != nil {
+			return err
+		}
+		zone2 := &e.Zones[e.ZP2]
+		zone1 := &e.Zones[e.ZP1]
+		zone0 := &e.Zones[e.ZP0]
+		if pIdx < 0 || int(pIdx) >= len(zone2.Points) ||
+			a0Idx < 0 || int(a0Idx) >= len(zone1.Points) ||
+			a1Idx < 0 || int(a1Idx) >= len(zone1.Points) ||
+			b0Idx < 0 || int(b0Idx) >= len(zone0.Points) ||
+			b1Idx < 0 || int(b1Idx) >= len(zone0.Points) {
+			return fmt.Errorf("index out of bounds in ISECT: p=%d a0=%d a1=%d b0=%d b1=%d", pIdx, a0Idx, a1Idx, b0Idx, b1Idx)
+		}
+		zone2.Points[pIdx], _ = intersectLines(zone1.Points[a0Idx], zone1.Points[a1Idx], zone0.Points[b0Idx], zone0.Points[b1Idx])
+		e.touch(int(pIdx), 0, e.ZP2)
+		e.touch(int(pIdx), 1, e.ZP2)
+		e.IP++
+
 	case opcode == 0x13: // SZP0
 		val, err := e.pop()
 		if err != nil {
 			return err
 		}
-		e.ZP0 = int(val)
+		zp, err := zonePointer(val)
+		if err != nil {
+			return err
+		}
+		e.ZP0 = zp
 		e.IP++
 
 	case opcode == 0x14: // SZP1
@@ -350,7 +856,11 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 		if err != nil {
 			return err
 		}
-		e.ZP1 = int(val)
+		zp, err := zonePointer(val)
+		if err != nil {
+			return err
+		}
+		e.ZP1 = zp
 		e.IP++
 
 	case opcode == 0x15: // SZP2
@@ -358,7 +868,25 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 		if err != nil {
 			return err
 		}
-		e.ZP2 = int(val)
+		zp, err := zonePointer(val)
+		if err != nil {
+			return err
+		}
+		e.ZP2 = zp
+		e.IP++
+
+	case opcode == 0x16: // SZPS
+		val, err := e.pop()
+		if err != nil {
+			return err
+		}
+		zp, err := zonePointer(val)
+		if err != nil {
+			return err
+		}
+		e.ZP0 = zp
+		e.ZP1 = zp
+		e.ZP2 = zp
 		e.IP++
 
 	case opcode == 0x10: // SRP0
@@ -390,6 +918,9 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 		if err != nil {
 			return err
 		}
+		if err := e.checkLoopCallRepeat(val); err != nil {
+			return err
+		}
 		e.GS.Loop = val
 		e.IP++
 
@@ -402,24 +933,27 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 		e.IP++
 
 	case opcode == 0x1D: // SCVTCI
-		_, err := e.pop() // Control Value Cut-In
+		val, err := e.pop()
 		if err != nil {
 			return err
 		}
+		e.GS.ControlValueCutIn = F26Dot6(val)
 		e.IP++
 
 	case opcode == 0x1E: // SSWCI
-		_, err := e.pop() // Single Width Cut-In
+		val, err := e.pop()
 		if err != nil {
 			return err
 		}
+		e.GS.SingleWidthCutIn = F26Dot6(val)
 		e.IP++
 
 	case opcode == 0x1F: // SSW
-		_, err := e.pop() // Single Width
+		val, err := e.pop()
 		if err != nil {
 			return err
 		}
+		e.GS.SingleWidthValue = F26Dot6(e.scaleFUnits(val))
 		e.IP++
 
 	case opcode == 0x18: // RTG
@@ -434,55 +968,184 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 		e.GS.RoundState = 2
 		e.IP++
 
+	case opcode == 0x7A: // ROFF
+		e.GS.RoundState = 5
+		e.IP++
+
+	case opcode == 0x7C: // RUTG
+		e.GS.RoundState = 3
+		e.IP++
+
+	case opcode == 0x7D: // RDTG
+		e.GS.RoundState = 4
+		e.IP++
+
 	case opcode == 0x76: // SROUND
-		_, err := e.pop()
-		if err != nil {
-			return err
-		}
-		e.IP++
-
-	case opcode == 0x77: // S45ROUND
-		_, err := e.pop()
-		if err != nil {
-			return err
-		}
-		e.IP++
-
-	case opcode == 0x85: // SCANCTRL
-		_, err := e.pop()
-		if err != nil {
-			return err
-		}
-		e.IP++
-
-	case opcode == 0x8D: // SCANTYPE
-		_, err := e.pop()
-		if err != nil {
-			return err
-		}
-		e.IP++
-
-	case opcode == 0x8E: // INSTCTRL
-		_, err := e.pop() // selector
-		if err != nil {
-			return err
-		}
-		_, err = e.pop() // value
-		if err != nil {
-			return err
-		}
-		e.IP++
-
-	case opcode == 0x91: // GETINFO
 		selector, err := e.pop()
 		if err != nil {
 			return err
 		}
-		var res int32
-		if selector&0x01 != 0 {
-			res = 35 // Version 35
+		e.setSuperRound(0x4000, selector)
+		e.GS.RoundState = 6
+		e.IP++
+
+	case opcode == 0x77: // S45ROUND
+		selector, err := e.pop()
+		if err != nil {
+			return err
 		}
-		e.push(res)
+		e.setSuperRound(0x2D41, selector)
+		e.GS.RoundState = 7
+		e.IP++
+
+	case opcode == 0x85: // SCANCTRL
+		val, err := e.pop()
+		if err != nil {
+			return err
+		}
+		threshold := val & 0xFF
+		switch threshold {
+		case 0xFF:
+			e.GS.ScanControl = true
+		case 0:
+			e.GS.ScanControl = false
+		default:
+			if val&0x0100 != 0 && int32(e.PPEM) <= threshold {
+				e.GS.ScanControl = true
+			}
+			if val&0x0200 != 0 && e.Rotated {
+				e.GS.ScanControl = true
+			}
+			if val&0x0400 != 0 && e.Stretched {
+				e.GS.ScanControl = true
+			}
+			if val&0x0800 != 0 && int32(e.PPEM) > threshold {
+				e.GS.ScanControl = false
+			}
+			if val&0x1000 != 0 && e.Rotated {
+				e.GS.ScanControl = false
+			}
+			if val&0x2000 != 0 && e.Stretched {
+				e.GS.ScanControl = false
+			}
+		}
+		e.IP++
+
+	case opcode == 0x8D: // SCANTYPE
+		val, err := e.pop()
+		if err != nil {
+			return err
+		}
+		if val >= 0 {
+			e.GS.ScanType = val & 0xFFFF
+		}
+		e.IP++
+
+	case opcode == 0x86 || opcode == 0x87: // SDPVTL[a]
+		p1Idx, err := e.pop()
+		if err != nil {
+			return err
+		}
+		p2Idx, err := e.pop()
+		if err != nil {
+			return err
+		}
+		zone2 := &e.Zones[e.ZP2]
+		zone1 := &e.Zones[e.ZP1]
+		if p1Idx < 0 || int(p1Idx) >= len(zone2.Points) || p2Idx < 0 || int(p2Idx) >= len(zone1.Points) {
+			return fmt.Errorf("index out of bounds in SDPVTL: p1=%d p2=%d", p1Idx, p2Idx)
+		}
+		if int(p1Idx) >= len(zone2.OriginalPoints) || int(p2Idx) >= len(zone1.OriginalPoints) {
+			return fmt.Errorf("original point index out of bounds in SDPVTL: p1=%d p2=%d", p1Idx, p2Idx)
+		}
+		perpendicular := opcode&0x01 != 0
+		dualVec, dualErr := normalizeLineVector(zone2.OriginalPoints[p1Idx], zone1.OriginalPoints[p2Idx], perpendicular)
+		if dualErr != nil {
+			if zone2.OriginalPoints[p1Idx] != zone1.OriginalPoints[p2Idx] {
+				return dualErr
+			}
+			dualVec = api.Vector{X: 0x4000, Y: 0}
+			perpendicular = false
+		}
+		projVec, projErr := normalizeLineVector(zone2.Points[p1Idx], zone1.Points[p2Idx], perpendicular)
+		if projErr != nil {
+			if zone2.Points[p1Idx] != zone1.Points[p2Idx] {
+				return projErr
+			}
+			projVec = api.Vector{X: 0x4000, Y: 0}
+		}
+		e.GS.DualVector = dualVec
+		e.GS.ProjVector = projVec
+		e.IP++
+
+	case opcode == 0x8E: // INSTCTRL
+		selector, err := e.pop()
+		if err != nil {
+			return err
+		}
+		value, err := e.pop()
+		if err != nil {
+			return err
+		}
+		if selector >= 1 && selector <= 3 {
+			flag := int32(1 << uint(selector-1))
+			if value == 0 || value == flag {
+				e.GS.InstructControl &^= byte(flag)
+				e.GS.InstructControl |= byte(value)
+				if selector == 3 && e.effectiveInterpreterVersion() >= 40 {
+					e.GS.BackwardCompatibility = value&flag == 0
+				}
+			}
+		}
+		e.IP++
+
+	case opcode == 0x4D: // FLIPON
+		e.GS.AutoFlip = true
+		e.IP++
+
+	case opcode == 0x4E: // FLIPOFF
+		e.GS.AutoFlip = false
+		e.IP++
+
+	case opcode == 0x4F: // DEBUG
+		if _, err := e.pop(); err != nil {
+			return err
+		}
+		e.IP++
+
+	case opcode == 0x7E || opcode == 0x7F: // SANGW, AA
+		if _, err := e.pop(); err != nil {
+			return err
+		}
+		e.IP++
+
+	case opcode == 0x5E: // SDB
+		val, err := e.pop()
+		if err != nil {
+			return err
+		}
+		e.GS.DeltaBase = val
+		e.IP++
+
+	case opcode == 0x5F: // SDS
+		val, err := e.pop()
+		if err != nil {
+			return err
+		}
+		if val < 0 || val > 6 {
+			return fmt.Errorf("invalid delta shift: %d", val)
+		}
+		e.GS.DeltaShift = val
+		e.IP++
+
+	case opcode == 0x88: // GETINFO
+		selector, err := e.pop()
+		if err != nil {
+			return err
+		}
+		if err := e.push(e.getInfo(selector)); err != nil {
+			return err
+		}
 		e.IP++
 
 	case opcode == 0x4B: // MPPEM
@@ -491,6 +1154,49 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 
 	case opcode == 0x4C: // MPS
 		e.push(e.PointSize)
+		e.IP++
+
+	case opcode == 0x46 || opcode == 0x47: // GC[a]
+		pIdx, err := e.pop()
+		if err != nil {
+			return err
+		}
+		zone := &e.Zones[e.ZP2]
+		if opcode == 0x46 {
+			if pIdx < 0 || int(pIdx) >= len(zone.Points) {
+				return fmt.Errorf("point index out of bounds in GC[0]: %d", pIdx)
+			}
+			if err := e.push(e.project(zone.Points[pIdx])); err != nil {
+				return err
+			}
+		} else {
+			if pIdx < 0 || int(pIdx) >= len(zone.OriginalPoints) {
+				return fmt.Errorf("point index out of bounds in GC[1]: %d", pIdx)
+			}
+			if err := e.push(e.project(zone.OriginalPoints[pIdx])); err != nil {
+				return err
+			}
+		}
+		e.IP++
+
+	case opcode == 0x48: // SCFS
+		value, err := e.pop()
+		if err != nil {
+			return err
+		}
+		pIdx, err := e.pop()
+		if err != nil {
+			return err
+		}
+		zone := &e.Zones[e.ZP2]
+		if pIdx < 0 || int(pIdx) >= len(zone.Points) {
+			return fmt.Errorf("point index out of bounds in SCFS: %d", pIdx)
+		}
+		curDist := e.project(zone.Points[pIdx])
+		if err := e.moveProjected(&zone.Points[pIdx], value-curDist); err != nil {
+			return err
+		}
+		e.touchCurrent(int(pIdx), e.ZP2)
 		e.IP++
 
 	case opcode == 0x49: // MD[0]
@@ -546,10 +1252,14 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 		curDist := e.project(p)
 		if opcode&0x01 != 0 { // round
 			targetDist := e.round(curDist)
-			e.move(&p, targetDist-curDist)
+			if err := e.moveProjected(&p, targetDist-curDist); err != nil {
+				return err
+			}
 			zone.Points[pIdx] = p
 		}
 		e.touchCurrent(int(pIdx), e.ZP0)
+		e.RP0 = int(pIdx)
+		e.RP1 = int(pIdx)
 		e.IP++
 
 	case opcode == 0x3E || opcode == 0x3F: // MIAP[r]
@@ -569,14 +1279,22 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 			return fmt.Errorf("point index out of bounds: %d", pIdx)
 		}
 		targetDist := e.CVT[cvtIdx]
+		originalDist := e.project(zone.OriginalPoints[pIdx])
+		if opcode&0x01 != 0 && abs32(targetDist-originalDist) > int32(e.GS.ControlValueCutIn) {
+			targetDist = originalDist
+		}
 		if opcode&0x01 != 0 { // round
 			targetDist = e.round(targetDist)
 		}
 		p := zone.Points[pIdx]
 		curDist := e.project(p)
-		e.move(&p, targetDist-curDist)
+		if err := e.moveProjected(&p, targetDist-curDist); err != nil {
+			return err
+		}
 		zone.Points[pIdx] = p
 		e.touchCurrent(int(pIdx), e.ZP0)
+		e.RP0 = int(pIdx)
+		e.RP1 = int(pIdx)
 		e.IP++
 
 	case opcode >= 0xC0 && opcode <= 0xDF: // MDRP[abcde]
@@ -596,19 +1314,25 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 		}
 
 		orgDist := e.getProjectedDistance(zone0.OriginalPoints[e.RP0], zone1.OriginalPoints[pIdx])
+		orgDist = e.applySingleWidthDistance(orgDist, true)
 		curDist := e.getProjectedDistance(zone0.Points[e.RP0], zone1.Points[pIdx])
 
 		targetDist := orgDist
 		if round {
 			targetDist = e.round(targetDist)
 		}
-		if minDist && targetDist < int32(e.GS.MinimumDistance) {
-			targetDist = int32(e.GS.MinimumDistance)
+		if minDist {
+			targetDist = applyMinimumDistanceForSign(targetDist, orgDist, e.GS.MinimumDistance)
 		}
 
-		e.move(&zone1.Points[pIdx], targetDist-curDist)
+		oldRP0 := e.RP0
+		if err := e.moveProjected(&zone1.Points[pIdx], targetDist-curDist); err != nil {
+			return err
+		}
 		e.touchCurrent(int(pIdx), e.ZP1)
 
+		e.RP1 = oldRP0
+		e.RP2 = int(pIdx)
 		if setRP0 {
 			e.RP0 = int(pIdx)
 		}
@@ -638,19 +1362,32 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 			return fmt.Errorf("index out of bounds in MIRP: rp0=%d, p=%d", e.RP0, pIdx)
 		}
 
+		orgDist := e.getProjectedDistance(zone0.OriginalPoints[e.RP0], zone1.OriginalPoints[pIdx])
 		targetDist := e.CVT[cvtIdx]
+		targetDist = e.applySingleWidthDistance(targetDist, false)
+		if e.GS.AutoFlip && ((orgDist < 0 && targetDist > 0) || (orgDist > 0 && targetDist < 0)) {
+			targetDist = -targetDist
+		}
+		if round && e.ZP0 == e.ZP1 && abs32(targetDist-orgDist) > int32(e.GS.ControlValueCutIn) {
+			targetDist = orgDist
+		}
 		if round {
 			targetDist = e.round(targetDist)
 		}
-		if minDist && targetDist < int32(e.GS.MinimumDistance) {
-			targetDist = int32(e.GS.MinimumDistance)
+		if minDist {
+			targetDist = applyMinimumDistanceForSign(targetDist, orgDist, e.GS.MinimumDistance)
 		}
 
 		curDist := e.getProjectedDistance(zone0.Points[e.RP0], zone1.Points[pIdx])
 
-		e.move(&zone1.Points[pIdx], targetDist-curDist)
+		oldRP0 := e.RP0
+		if err := e.moveProjected(&zone1.Points[pIdx], targetDist-curDist); err != nil {
+			return err
+		}
 		e.touchCurrent(int(pIdx), e.ZP1)
 
+		e.RP1 = oldRP0
+		e.RP2 = int(pIdx)
 		if setRP0 {
 			e.RP0 = int(pIdx)
 		}
@@ -722,6 +1459,135 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 		e.untouchCurrent(int(pIdx), e.ZP0)
 		e.IP++
 
+	case opcode == 0x27: // ALIGNPTS
+		p2Idx, err := e.pop()
+		if err != nil {
+			return err
+		}
+		p1Idx, err := e.pop()
+		if err != nil {
+			return err
+		}
+		zone1 := &e.Zones[e.ZP1]
+		zone0 := &e.Zones[e.ZP0]
+		if p1Idx < 0 || int(p1Idx) >= len(zone1.Points) || p2Idx < 0 || int(p2Idx) >= len(zone0.Points) {
+			return fmt.Errorf("index out of bounds in ALIGNPTS: p1=%d p2=%d", p1Idx, p2Idx)
+		}
+		distance := (e.project(zone0.Points[p2Idx]) - e.project(zone1.Points[p1Idx])) / 2
+		if err := e.moveProjected(&zone1.Points[p1Idx], distance); err != nil {
+			return err
+		}
+		if err := e.moveProjected(&zone0.Points[p2Idx], -distance); err != nil {
+			return err
+		}
+		e.touchCurrent(int(p1Idx), e.ZP1)
+		e.touchCurrent(int(p2Idx), e.ZP0)
+		e.IP++
+
+	case opcode == 0x32 || opcode == 0x33: // SHP[a]
+		var refZone *Zone
+		var refIdx int
+		if opcode&0x01 == 0 {
+			refZone = &e.Zones[e.ZP1]
+			refIdx = e.RP2
+		} else {
+			refZone = &e.Zones[e.ZP0]
+			refIdx = e.RP1
+		}
+		if refIdx < 0 || refIdx >= len(refZone.Points) || refIdx >= len(refZone.OriginalPoints) {
+			return fmt.Errorf("reference point out of bounds in SHP: %d", refIdx)
+		}
+		shift := e.project(refZone.Points[refIdx]) - e.project(refZone.OriginalPoints[refIdx])
+		zone := &e.Zones[e.ZP2]
+		for i := 0; i < int(e.GS.Loop); i++ {
+			pIdx, err := e.pop()
+			if err != nil {
+				return err
+			}
+			if pIdx < 0 || int(pIdx) >= len(zone.Points) {
+				return fmt.Errorf("point index out of bounds in SHP: %d", pIdx)
+			}
+			if err := e.moveProjected(&zone.Points[pIdx], shift); err != nil {
+				return err
+			}
+			e.touchCurrent(int(pIdx), e.ZP2)
+		}
+		e.GS.Loop = 1
+		e.IP++
+
+	case opcode == 0x34 || opcode == 0x35: // SHC[a]
+		contour, err := e.pop()
+		if err != nil {
+			return err
+		}
+		refZoneIdx, refIdx, shift, err := e.shiftReference(opcode)
+		if err != nil {
+			return fmt.Errorf("reference point out of bounds in SHC: %w", err)
+		}
+		zone := &e.Zones[e.ZP2]
+		start, limit, err := contourBounds(zone, contour)
+		if err != nil {
+			return fmt.Errorf("invalid contour in SHC: %w", err)
+		}
+		for i := start; i < limit; i++ {
+			if refZoneIdx == e.ZP2 && refIdx == i {
+				continue
+			}
+			if err := e.moveProjected(&zone.Points[i], shift); err != nil {
+				return err
+			}
+			e.touchCurrent(i, e.ZP2)
+		}
+		e.IP++
+
+	case opcode == 0x36 || opcode == 0x37: // SHZ[a]
+		zoneVal, err := e.pop()
+		if err != nil {
+			return err
+		}
+		zoneIdx, err := zonePointer(zoneVal)
+		if err != nil {
+			return err
+		}
+		refZoneIdx, refIdx, shift, err := e.shiftReference(opcode)
+		if err != nil {
+			return fmt.Errorf("reference point out of bounds in SHZ: %w", err)
+		}
+		zone := &e.Zones[zoneIdx]
+		limit := realPointLimit(zone, zoneIdx)
+		for i := 0; i < limit; i++ {
+			if refZoneIdx == zoneIdx && refIdx == i {
+				continue
+			}
+			if err := e.moveProjected(&zone.Points[i], shift); err != nil {
+				return err
+			}
+		}
+		e.IP++
+
+	case opcode == 0x3C: // ALIGNRP
+		zone1 := &e.Zones[e.ZP1]
+		zone0 := &e.Zones[e.ZP0]
+		if e.RP0 < 0 || e.RP0 >= len(zone0.Points) {
+			return fmt.Errorf("reference point out of bounds in ALIGNRP: rp0=%d", e.RP0)
+		}
+		for i := 0; i < int(e.GS.Loop); i++ {
+			pIdx, err := e.pop()
+			if err != nil {
+				return err
+			}
+			if pIdx < 0 || int(pIdx) >= len(zone1.Points) {
+				return fmt.Errorf("point index out of bounds in ALIGNRP: %d", pIdx)
+			}
+			distance := e.project(zone0.Points[e.RP0]) - e.project(zone1.Points[pIdx])
+			if err := e.moveProjected(&zone1.Points[pIdx], distance); err != nil {
+				return err
+			}
+			e.touchCurrent(int(pIdx), e.ZP1)
+		}
+		e.GS.Loop = 1
+		e.IP++
+
 	case opcode == 0x38: // SHPIX
 		dist, err := e.pop()
 		if err != nil {
@@ -751,11 +1617,42 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 		e.GS.Loop = 1
 		e.IP++
 
+	case opcode == 0x3A || opcode == 0x3B: // MSIRP[a]
+		distance, err := e.pop()
+		if err != nil {
+			return err
+		}
+		pIdx, err := e.pop()
+		if err != nil {
+			return err
+		}
+		zone1 := &e.Zones[e.ZP1]
+		zone0 := &e.Zones[e.ZP0]
+		if e.RP0 < 0 || e.RP0 >= len(zone0.Points) || pIdx < 0 || int(pIdx) >= len(zone1.Points) {
+			return fmt.Errorf("index out of bounds in MSIRP: rp0=%d, p=%d", e.RP0, pIdx)
+		}
+		curDist := e.getProjectedDistance(zone0.Points[e.RP0], zone1.Points[pIdx])
+		oldRP0 := e.RP0
+		if err := e.moveProjected(&zone1.Points[pIdx], distance-curDist); err != nil {
+			return err
+		}
+		e.touchCurrent(int(pIdx), e.ZP1)
+		e.RP1 = oldRP0
+		e.RP2 = int(pIdx)
+		if opcode&0x01 != 0 {
+			e.RP0 = int(pIdx)
+		}
+		e.IP++
+
 	case opcode == 0x5D || opcode == 0x71 || opcode == 0x72: // DELTAP1, DELTAP2, DELTAP3
 		n, err := e.pop()
 		if err != nil {
 			return err
 		}
+		if n < 0 {
+			return fmt.Errorf("negative DELTAP count: %d", n)
+		}
+		zone := &e.Zones[e.ZP0]
 		for i := 0; i < int(n); i++ {
 			pIdx, err := e.pop()
 			if err != nil {
@@ -769,9 +1666,81 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 			if e.GS.BackwardCompatibility && e.GS.FreeVector.X != 0 {
 				continue // Ignore delta on X-axis
 			}
-			// Basic framework: normally would compute delta from arg and apply to pIdx
-			_ = pIdx
-			_ = arg
+			amount, apply := e.deltaAmount(opcode, arg)
+			if !apply || amount == 0 || pIdx < 0 || int(pIdx) >= len(zone.Points) {
+				continue
+			}
+			e.move(&zone.Points[pIdx], amount)
+			e.touchCurrent(int(pIdx), e.ZP0)
+		}
+		e.IP++
+
+	case opcode == 0x73 || opcode == 0x74 || opcode == 0x75: // DELTAC1, DELTAC2, DELTAC3
+		n, err := e.pop()
+		if err != nil {
+			return err
+		}
+		if n < 0 {
+			return fmt.Errorf("negative DELTAC count: %d", n)
+		}
+		for i := 0; i < int(n); i++ {
+			cvtIdx, err := e.pop()
+			if err != nil {
+				return err
+			}
+			arg, err := e.pop()
+			if err != nil {
+				return err
+			}
+			amount, apply := e.deltaAmount(opcode, arg)
+			if !apply || amount == 0 || cvtIdx < 0 || int(cvtIdx) >= len(e.CVT) {
+				continue
+			}
+			e.CVT[cvtIdx] += amount
+		}
+		e.IP++
+
+	case opcode == 0x80: // FLIPPT
+		zone := &e.Zones[e.ZP0]
+		for i := 0; i < int(e.GS.Loop); i++ {
+			pIdx, err := e.pop()
+			if err != nil {
+				return err
+			}
+			if pIdx < 0 || int(pIdx) >= len(zone.Points) {
+				return fmt.Errorf("point index out of bounds in FLIPPT: %d", pIdx)
+			}
+			if int(pIdx) < len(zone.Tags) {
+				zone.Tags[pIdx] ^= 0x01
+			}
+		}
+		e.GS.Loop = 1
+		e.IP++
+
+	case opcode == 0x81 || opcode == 0x82: // FLIPRGON, FLIPRGOFF
+		high, err := e.pop()
+		if err != nil {
+			return err
+		}
+		low, err := e.pop()
+		if err != nil {
+			return err
+		}
+		zone := &e.Zones[e.ZP0]
+		if low < 0 || high < 0 || int(low) >= len(zone.Points) || int(high) >= len(zone.Points) {
+			return fmt.Errorf("point range out of bounds in FLIPRG: low=%d high=%d", low, high)
+		}
+		if low <= high {
+			for i := int(low); i <= int(high); i++ {
+				if i >= len(zone.Tags) {
+					continue
+				}
+				if opcode == 0x81 {
+					zone.Tags[i] |= 0x01
+				} else {
+					zone.Tags[i] &^= 0x01
+				}
+			}
 		}
 		e.IP++
 
@@ -808,7 +1777,9 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 			}
 
 			cp := e.project(zone2.Points[pIdx])
-			e.move(&zone2.Points[pIdx], targetDist-cp)
+			if err := e.moveProjected(&zone2.Points[pIdx], targetDist-cp); err != nil {
+				return err
+			}
 			e.touchCurrent(int(pIdx), e.ZP2)
 		}
 		e.GS.Loop = 1
@@ -974,6 +1945,9 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 		if err != nil {
 			return err
 		}
+		if err := e.checkCallDepth(); err != nil {
+			return err
+		}
 		fnCode, ok := e.Functions[funcID]
 		if !ok {
 			return fmt.Errorf("undefined function %d", funcID)
@@ -998,6 +1972,12 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 		if count <= 0 {
 			e.IP++
 			return nil
+		}
+		if err := e.checkLoopCallRepeat(count); err != nil {
+			return err
+		}
+		if err := e.checkCallDepth(); err != nil {
+			return err
 		}
 		fnCode, ok := e.Functions[funcID]
 		if !ok {
@@ -1059,6 +2039,12 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 		e.push(a)
 		e.IP++
 
+	case opcode == 0x24: // DEPTH
+		if err := e.push(int32(e.StackTop)); err != nil {
+			return err
+		}
+		e.IP++
+
 	case opcode == 0x25: // CINDEX
 		k, err := e.pop()
 		if err != nil {
@@ -1118,7 +2104,7 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 		if err != nil {
 			return err
 		}
-		e.push(math.Mul26(a, b))
+		e.push(ftmath.Mul26(a, b))
 		e.IP++
 
 	case opcode == 0x63: // DIV
@@ -1133,7 +2119,7 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 		if b == 0 {
 			return fmt.Errorf("division by zero")
 		}
-		e.push(math.Div26(a, b))
+		e.push(ftmath.Div26(a, b))
 		e.IP++
 
 	case opcode == 0x64: // ABS
@@ -1281,6 +2267,21 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 		e.CVT[idx] = val
 		e.IP++
 
+	case opcode == 0x70: // WCVTF
+		val, err := e.pop()
+		if err != nil {
+			return err
+		}
+		idx, err := e.pop()
+		if err != nil {
+			return err
+		}
+		if idx < 0 || int(idx) >= len(e.CVT) {
+			return fmt.Errorf("CVT index out of bounds: %d", idx)
+		}
+		e.CVT[idx] = e.scaleFUnits(val)
+		e.IP++
+
 	case opcode == 0x45: // RCVT
 		idx, err := e.pop()
 		if err != nil {
@@ -1387,6 +2388,35 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 			e.push(1)
 		} else {
 			e.push(0)
+		}
+		e.IP++
+
+	case opcode == 0x56 || opcode == 0x57: // ODD, EVEN
+		a, err := e.pop()
+		if err != nil {
+			return err
+		}
+		rounded := e.round(a)
+		if opcode == 0x56 {
+			if rounded&127 == 64 {
+				if err := e.push(1); err != nil {
+					return err
+				}
+			} else {
+				if err := e.push(0); err != nil {
+					return err
+				}
+			}
+		} else {
+			if rounded&127 == 0 {
+				if err := e.push(1); err != nil {
+					return err
+				}
+			} else {
+				if err := e.push(0); err != nil {
+					return err
+				}
+			}
 		}
 		e.IP++
 
