@@ -174,6 +174,9 @@ func (c *type1CharStringContext) interpret(data []byte) (type1CharStringStop, er
 	for i := 0; i < len(data); {
 		b := data[i]
 		if b >= 32 {
+			if err := c.ensureOtherSubrResultsConsumed("operand"); err != nil {
+				return 0, err
+			}
 			v, next, err := decodeType1CharStringNumber(data, i)
 			if err != nil {
 				return 0, err
@@ -193,6 +196,12 @@ func (c *type1CharStringContext) interpret(data []byte) (type1CharStringStop, er
 			}
 			op = 1200 + int(data[i])
 			i++
+		}
+
+		if op != 1217 {
+			if err := c.ensureOtherSubrResultsConsumed(type1CharStringOperatorName(op)); err != nil {
+				return 0, err
+			}
 		}
 
 		switch op {
@@ -653,10 +662,71 @@ func (c *type1CharStringContext) ensureTerminatorReady(op string) error {
 	if c.flexState {
 		return fmt.Errorf("unterminated flex sequence before %s", op)
 	}
+	return c.ensureOtherSubrResultsConsumed(op)
+}
+
+func (c *type1CharStringContext) ensureOtherSubrResultsConsumed(next string) error {
 	if len(c.otherSubrResults) != 0 {
-		return fmt.Errorf("pending OtherSubr pop results before %s", op)
+		return fmt.Errorf("pending OtherSubr pop results before %s", next)
 	}
 	return nil
+}
+
+func type1CharStringOperatorName(op int) string {
+	switch op {
+	case 1:
+		return "hstem"
+	case 3:
+		return "vstem"
+	case 4:
+		return "vmoveto"
+	case 5:
+		return "rlineto"
+	case 6:
+		return "hlineto"
+	case 7:
+		return "vlineto"
+	case 8:
+		return "rrcurveto"
+	case 9:
+		return "closepath"
+	case 10:
+		return "callsubr"
+	case 11:
+		return "return"
+	case 13:
+		return "hsbw"
+	case 14:
+		return "endchar"
+	case 21:
+		return "rmoveto"
+	case 22:
+		return "hmoveto"
+	case 30:
+		return "vhcurveto"
+	case 31:
+		return "hvcurveto"
+	case 1200:
+		return "dotsection"
+	case 1201:
+		return "vstem3"
+	case 1202:
+		return "hstem3"
+	case 1206:
+		return "seac"
+	case 1207:
+		return "sbw"
+	case 1212:
+		return "div"
+	case 1216:
+		return "callothersubr"
+	case 1217:
+		return "pop"
+	case 1233:
+		return "setcurrentpoint"
+	default:
+		return fmt.Sprintf("operator %d", op)
+	}
 }
 
 func (c *type1CharStringContext) drawFlex() error {

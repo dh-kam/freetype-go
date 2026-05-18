@@ -364,7 +364,8 @@ Recommended glyph sets for the next conformance rounds:
 - Type 1: glyphs with lines, cubic curves, Subrs, flex, SEAC composition,
   custom encoding entries, AFM/PFM companion metrics, known stem/blue-zone
   hints, malformed terminator/flex cases, and pending OtherSubr result queues
-  for rejection-only checks. Companion metric runs should cover both parsed
+  before non-`pop` tokens for rejection-only checks. Companion metric runs
+  should cover both parsed
   `CompanionMetrics` attachment, explicit `SetCompanionMetricsFiles` paths,
   path-based `SetCompanionMetricsForFont` discovery, and file-backed streams
   implementing `Type1FontPath()`, including `core.FileStream` when present.

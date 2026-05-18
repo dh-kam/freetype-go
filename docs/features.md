@@ -26,8 +26,8 @@ areas.
   `FontPathStream`, including ordinary `core.FileStream` values when
   `Type1FontPath()` is present. Charstring guard coverage includes terminators,
   Subr returns, unterminated flex, limited OtherSubr 3 result-pop handling, and
-  pending OtherSubr result queues, with return values scoped to supported
-  pop-result cases.
+  pending OtherSubr result queues before any non-`pop` token, with return
+  values scoped to supported pop-result cases.
   Coverage should be treated as evolving.
 - **TrueType/OpenType collections (.ttc/.otc)**: The SFNT loader can open the
   first face by default or a requested face via `sfnt.LoadFaceIndex`.

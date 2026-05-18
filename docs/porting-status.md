@@ -64,11 +64,10 @@ comparison:
   decoding now has bounded operand-stack handling for malformed inputs,
   including `callsubr` paths. Top-level charstrings must terminate with
   `endchar` or SEAC, and local Subrs must return instead of silently ending at
-  EOF. Pending OtherSubr pop-result queues are rejected before `endchar` or
-  SEAC, `return`, or another `callothersubr`. OtherSubr return-value handling
-  is limited to the currently supported flex and OtherSubr 3 pop-value paths,
-  and queued values must be consumed by `pop` before control reaches another
-  terminator, Subr return, or OtherSubr call. This is guarded compatibility
+  EOF. Pending OtherSubr pop-result queues are rejected before any non-`pop`
+  operand or operator, including `endchar`, SEAC, `return`, or another
+  `callothersubr`. OtherSubr return-value handling is limited to the currently
+  supported flex and OtherSubr 3 pop-value paths. This is guarded compatibility
   work, not full OtherSubrs support.
 - Type 1 flex coverage includes direct `callothersubr` flex handling and the
   standard flex Subr pattern where `callsubr` must preserve flex-end operands;
@@ -151,8 +150,8 @@ Implemented or partially implemented:
   still respects the operand stack limit. Limited OtherSubr 3 result-pop queue
   handling is implemented, with guards for malformed terminators and pending
   result queues. Supported OtherSubr return values are intentionally narrow:
-  they must be consumed by `pop` before `endchar`, SEAC, `return`, or another
-  `callothersubr`.
+  they must be consumed by `pop` before any later operand or non-`pop`
+  operator.
 - Basic flex handling through direct `callothersubr` and standard flex Subr
   patterns.
 - SEAC composite glyph outline composition through the Type 1 face loader.
