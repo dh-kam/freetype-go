@@ -39,6 +39,7 @@ type CFF struct {
 	OffSize uint8 // Absolute offset size
 
 	TopDictSize uint16
+	MaxStack    int
 
 	NameIndex        Index
 	TopDictIndex     Index
@@ -175,6 +176,7 @@ const (
 	opPrivate        = 18
 	opLocalSubrs     = 19
 	opVariationStore = 24
+	opCFF2MaxStack   = 25
 	opFDArray        = 12<<8 | 36
 	opFDSelect       = 12<<8 | 37
 	opPrivateVSIndex = 22
@@ -361,6 +363,11 @@ func parseCFF2(stream api.Stream, offset int64, cff *CFF) (*CFF, error) {
 		return nil, fmt.Errorf("failed to parse CFF2 Top DICT: %v", err)
 	}
 	cff.TopDict = topDict
+	maxStack, err := parseCFF2MaxStack(topDict)
+	if err != nil {
+		return nil, err
+	}
+	cff.MaxStack = maxStack
 
 	globalSubrOffset := offset + int64(cff.HdrSize) + int64(topDictSize)
 	globalSubrs, _, err := parseIndex32(stream, globalSubrOffset)
@@ -524,7 +531,10 @@ func (c *CFF) loadGlyphOutline(glyphIndex int, variationCoords []float64) (*core
 		localSubrs:  localSubrs,
 	}
 	if c.Major == 2 {
-		opts.maxStack = maxCFF2ArgumentStack
+		opts.maxStack = c.MaxStack
+		if opts.maxStack == 0 {
+			opts.maxStack = defaultCFF2MaxStack
+		}
 		fdIndex := 0
 		if c.FDSelect != nil {
 			fdIndex, err = c.FDSelect.FDIndex(glyphIndex)
@@ -638,6 +648,24 @@ func requiredDictUint(dict map[int][]float64, op int, name string) (int64, error
 		return 0, fmt.Errorf("%s offset missing", name)
 	}
 	return dictUint(operands, 0, name)
+}
+
+func parseCFF2MaxStack(dict map[int][]float64) (int, error) {
+	operands, ok := dict[opCFF2MaxStack]
+	if !ok {
+		return defaultCFF2MaxStack, nil
+	}
+	if len(operands) != 1 {
+		return 0, errors.New("invalid CFF2 maxstack operand count")
+	}
+	v, err := dictUint(operands, 0, "CFF2 maxstack")
+	if err != nil {
+		return 0, err
+	}
+	if v < defaultCFF2MaxStack || v > maxCFF2ArgumentStack {
+		return 0, errors.New("CFF2 maxstack out of range")
+	}
+	return int(v), nil
 }
 
 func dictUint(operands []float64, index int, name string) (int64, error) {

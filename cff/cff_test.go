@@ -182,7 +182,7 @@ func testCFF2Fixture() ([]byte, testCFF2Offsets) {
 	private1 := append(dictInt32(1), byte(opPrivateVSIndex))
 	vstore := testVariationStoreBytes()
 
-	const topDictSize = 26
+	const topDictSize = 32
 	charStringsOffset := 5 + topDictSize + len(globalSubrs)
 	fdSelectOffset := charStringsOffset + len(charStrings)
 	fdArrayOffset := fdSelectOffset + len(fdSelect)
@@ -201,6 +201,7 @@ func testCFF2Fixture() ([]byte, testCFF2Offsets) {
 	topDict := make([]byte, 0, topDictSize)
 	topDict = append(topDict, dictEntry(opCharStrings, charStringsOffset)...)
 	topDict = append(topDict, dictEntry(opVariationStore, vstoreOffset)...)
+	topDict = append(topDict, dictEntry(opCFF2MaxStack, defaultCFF2MaxStack)...)
 	topDict = append(topDict, dictEntry(opFDArray, fdArrayOffset)...)
 	topDict = append(topDict, dictEntry(opFDSelect, fdSelectOffset)...)
 	if len(topDict) != topDictSize {
@@ -538,8 +539,11 @@ func TestParseCFF2FDArrayPrivateVariationStore(t *testing.T) {
 	if face.Major != 2 || face.Minor != 0 {
 		t.Fatalf("wrong CFF2 version: %d.%d", face.Major, face.Minor)
 	}
-	if face.TopDictSize != 26 {
-		t.Fatalf("TopDictSize = %d, want 26", face.TopDictSize)
+	if face.TopDictSize != 32 {
+		t.Fatalf("TopDictSize = %d, want 32", face.TopDictSize)
+	}
+	if face.MaxStack != defaultCFF2MaxStack {
+		t.Fatalf("MaxStack = %d, want %d", face.MaxStack, defaultCFF2MaxStack)
 	}
 	if got := int(face.TopDict[opCharStrings][0]); got != offsets.charStrings {
 		t.Fatalf("CharStrings offset = %d, want %d", got, offsets.charStrings)
@@ -604,6 +608,56 @@ func TestParseCFF2FDArrayPrivateVariationStore(t *testing.T) {
 		t.Fatalf("LoadGlyphOutline with stored CFF2 coordinates failed: %v", err)
 	}
 	assertPoint(t, outline, 0, 15, 17)
+}
+
+func TestParseCFF2MaxStack(t *testing.T) {
+	tests := []struct {
+		name    string
+		dict    map[int][]float64
+		want    int
+		wantErr bool
+	}{
+		{name: "default", dict: map[int][]float64{}, want: defaultCFF2MaxStack},
+		{name: "explicit", dict: map[int][]float64{opCFF2MaxStack: {256}}, want: 256},
+		{name: "too low", dict: map[int][]float64{opCFF2MaxStack: {defaultCFF2MaxStack - 1}}, wantErr: true},
+		{name: "too high", dict: map[int][]float64{opCFF2MaxStack: {maxCFF2ArgumentStack + 1}}, wantErr: true},
+		{name: "non-integer", dict: map[int][]float64{opCFF2MaxStack: {200.5}}, wantErr: true},
+		{name: "extra operands", dict: map[int][]float64{opCFF2MaxStack: {200, 201}}, wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseCFF2MaxStack(tt.dict)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("parseCFF2MaxStack unexpectedly succeeded")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseCFF2MaxStack failed: %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("parseCFF2MaxStack = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestLoadGlyphOutlineUsesCFF2MaxStack(t *testing.T) {
+	n := csNumber
+	face := &CFF{
+		Major:    2,
+		MaxStack: defaultCFF2MaxStack,
+		CharStringsIndex: *testIndex(
+			bytes.Repeat([]byte{n(0)}, defaultCFF2MaxStack+1),
+		),
+		FontDicts: []FontDict{{}},
+	}
+
+	if _, err := face.LoadGlyphOutline(0); err == nil {
+		t.Fatal("LoadGlyphOutline accepted CFF2 charstring beyond maxstack")
+	}
 }
 
 func TestParseCFF2RejectsMalformedBounds(t *testing.T) {
@@ -832,7 +886,9 @@ func TestParseDict(t *testing.T) {
 		0x0c, 0x07, // operator 12, 7
 		0x1e, 0x1a, 0x5f, // 1.5 (BCD)
 		0x1e, 0xe0, 0xa1, 0x23, 0xff, // -0.123 (BCD)
-		0x01, // operator 1
+		0x01,                         // operator 1
+		0x1d, 0x00, 0x00, 0x00, 0xc1, // 193 (32-bit)
+		0x19, // operator 25
 	}
 
 	dict, err := ParseDict(data)
@@ -858,6 +914,11 @@ func TestParseDict(t *testing.T) {
 	// Op 1: [1.5, -0.123]
 	if val, ok := dict[1]; !ok || len(val) != 2 || val[0] != 1.5 || val[1] != -0.123 {
 		t.Errorf("expected op 1 to be [1.5, -0.123], got %v", val)
+	}
+
+	// Op 25: [193]
+	if val, ok := dict[25]; !ok || len(val) != 1 || val[0] != 193 {
+		t.Errorf("expected op 25 to be [193], got %v", val)
 	}
 }
 
