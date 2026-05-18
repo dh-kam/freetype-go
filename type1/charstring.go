@@ -270,6 +270,9 @@ func (c *type1CharStringContext) interpret(data []byte) (type1CharStringStop, er
 				return 0, fmt.Errorf("type1 local subr %d missing return", idx)
 			}
 		case 11: // return
+			if len(c.otherSubrResults) != 0 {
+				return 0, errors.New("pending OtherSubr pop results before return")
+			}
 			return type1CharStringStopReturn, nil
 		case 13: // hsbw
 			args, err := c.consumeArgs(2, "hsbw")

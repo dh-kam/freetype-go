@@ -1767,6 +1767,70 @@ func TestAlignReferencePoint(t *testing.T) {
 	}
 }
 
+func TestALIGNRPPreflightsLoopPointIndexes(t *testing.T) {
+	sys := core.NewSystem()
+	ctx := NewContext(sys)
+
+	ctx.Zones[1].Points = []api.Vector{{X: 100, Y: 0}, {X: 40, Y: 0}}
+	ctx.Zones[1].OriginalPoints = []api.Vector{{X: 100, Y: 0}, {X: 40, Y: 0}}
+	ctx.Zones[1].TouchedX = make([]bool, 2)
+	ctx.Zones[1].TouchedY = make([]bool, 2)
+	ctx.ZP0 = 1
+	ctx.ZP1 = 1
+	ctx.RP0 = 0
+
+	ctx.Code = []byte{
+		0xB0, 0x02, 0x17, // SLOOP 2
+		0xB1, 0x05, 0x01, // invalid point 5 below valid point 1 on stack
+		0x3C, // ALIGNRP
+	}
+
+	if err := ctx.Run(); err == nil {
+		t.Fatalf("ALIGNRP with an invalid loop point should fail")
+	}
+	if got := ctx.Zones[1].Points[1]; got != (api.Vector{X: 40, Y: 0}) {
+		t.Fatalf("ALIGNRP partially moved valid point before invalid operand: %#v", got)
+	}
+	if ctx.Zones[1].TouchedX[1] || ctx.Zones[1].TouchedY[1] {
+		t.Fatalf("ALIGNRP touched valid point before invalid operand: X=%v Y=%v", ctx.Zones[1].TouchedX[1], ctx.Zones[1].TouchedY[1])
+	}
+	if ctx.GS.Loop != 2 {
+		t.Fatalf("ALIGNRP invalid operand changed loop to %d, want 2", ctx.GS.Loop)
+	}
+}
+
+func TestALIGNRPPreflightsLoopStackDepth(t *testing.T) {
+	sys := core.NewSystem()
+	ctx := NewContext(sys)
+
+	ctx.Zones[1].Points = []api.Vector{{X: 100, Y: 0}, {X: 40, Y: 0}}
+	ctx.Zones[1].OriginalPoints = []api.Vector{{X: 100, Y: 0}, {X: 40, Y: 0}}
+	ctx.Zones[1].TouchedX = make([]bool, 2)
+	ctx.Zones[1].TouchedY = make([]bool, 2)
+	ctx.ZP0 = 1
+	ctx.ZP1 = 1
+	ctx.RP0 = 0
+
+	ctx.Code = []byte{
+		0xB0, 0x02, 0x17, // SLOOP 2
+		0xB0, 0x01, // one point for two ALIGNRP loop iterations
+		0x3C, // ALIGNRP
+	}
+
+	if err := ctx.Run(); err == nil {
+		t.Fatalf("ALIGNRP with too few loop operands should fail")
+	}
+	if got := ctx.Zones[1].Points[1]; got != (api.Vector{X: 40, Y: 0}) {
+		t.Fatalf("ALIGNRP partially moved valid point before stack underflow: %#v", got)
+	}
+	if ctx.Zones[1].TouchedX[1] || ctx.Zones[1].TouchedY[1] {
+		t.Fatalf("ALIGNRP touched valid point before stack underflow: X=%v Y=%v", ctx.Zones[1].TouchedX[1], ctx.Zones[1].TouchedY[1])
+	}
+	if ctx.GS.Loop != 2 {
+		t.Fatalf("ALIGNRP stack underflow changed loop to %d, want 2", ctx.GS.Loop)
+	}
+}
+
 func TestSLOOPRejectsNegativeCount(t *testing.T) {
 	ctx := NewContext(core.NewSystem())
 

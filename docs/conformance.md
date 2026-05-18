@@ -321,16 +321,19 @@ type-specific tracking templates:
   left/top placement, and buffer/hash comparison.
 - `truetype-size-vm-request.json`: hinted TrueType ppem/load-target sweep for
   size model, CVT/prep, slot metric, outline, and VM delta tracking, including
-  glyphs that can expose MIRP/SDPVTL, guard/error-path, and rollback-related
-  differences when a suitable corpus font is supplied.
+  glyphs that can expose MIRP/SDPVTL, ALIGNRP, guard/error-path, and
+  rollback-related differences when a suitable corpus font is supplied.
 - `type1-segments-request.json`: Type 1 outline and native
   `type1_segments` tracking for segment-aware reference runs. Use Type 1
   fonts that also exercise explicit AFM/PFM companion attachment and guarded
-  flex/OtherSubr result-pop cases when those areas are under measurement.
+  flex/OtherSubr result-pop and return-value policy cases when those areas are
+  under measurement.
 - `woff2-collection-request.json`: WOFF2 transformed `glyf`/`loca`, `hmtx`,
   instruction/bbox, short/long-loca multiglyph, per-glyph overlap bitmap,
   collection long-multiglyph, collection `hmtx` dependency comparison, and
-  shared outline/composite collection tracking.
+  shared outline/composite collection tracking. Malformed long-`loca` and
+  raw-glyph shared-`hmtx` cases are narrow package-level rejection coverage to
+  keep near this request scope.
   This is a request scope for licensed WOFF2 corpus fonts; rerun with `-face`
   overrides for additional collection faces.
 - `expected-gap-policy-request.json`: tiny request for validating stale
@@ -362,18 +365,24 @@ Recommended glyph sets for the next conformance rounds:
   hints, malformed terminator/flex cases, and pending OtherSubr result queues
   for rejection-only checks. Companion metric runs should cover both parsed
   `CompanionMetrics` attachment, explicit `SetCompanionMetricsFiles` paths,
-  and path-based `SetCompanionMetricsForFont` discovery.
+  path-based `SetCompanionMetricsForFont` discovery, and file-backed streams
+  implementing `Type1FontPath()`, including `core.FileStream` when present.
+  OtherSubr return-value checks should remain scoped to supported flex and
+  OtherSubr 3 pop-result behavior until broader OtherSubrs semantics are
+  implemented.
 - TrueType VM/size: glyphs that execute prep and glyph programs, touch CVT and
   storage, use composites, exercise MIRP/SDPVTL-sensitive paths, and have
   visible differences across ppem and target modes. Keep guard/error-path
-  cases such as negative loop counts and rollback-triggering program failures
-  as package tests unless a licensed corpus font naturally exercises them.
+  cases such as negative loop counts, ALIGNRP preflight failures, and
+  rollback-triggering program failures as package tests unless a licensed
+  corpus font naturally exercises them.
 - WOFF2: transformed `glyf`/`loca`, transformed `hmtx`, composite glyphs,
   instruction streams, explicit bounding boxes, per-glyph overlap bitmaps,
   short and long `loca`, multiglyph `hmtx` dependencies, collections with
   shared outline or `hmtx` dependencies, collection long-multiglyph cases, and
-  malformed shared-`hmtx`, raw/transformed outline mismatch, shared-composite,
-  or truncated streams kept for rejection-only tests.
+  malformed shared-`hmtx`, long-`loca`/raw-glyph shared-`hmtx`,
+  raw/transformed outline mismatch, shared-composite, or truncated streams kept
+  for rejection-only tests.
 - Scripts: representative Latin, CJK, symbol, and missing-glyph lookups.
 - Bitmap/color: bitmap strikes, COLR/CPAL layers, sbix/CBDT payloads.
 - Variations: default instance plus one non-default axis tuple.

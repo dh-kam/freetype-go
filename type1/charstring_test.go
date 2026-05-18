@@ -439,6 +439,28 @@ func TestDecodeCharStringRejectsPendingOtherSubrPopResultsBeforeCallOtherSubr(t 
 	}
 }
 
+func TestDecodeCharStringRejectsPendingOtherSubrPopResultsBeforeReturn(t *testing.T) {
+	subrs := [][]byte{
+		t1prog(
+			t1nums(123, 1, 3), t1ops(12, 16), // OtherSubr 3 returns one value via pop.
+			t1ops(11),
+		),
+	}
+	data := t1prog(
+		t1nums(0, 500), t1ops(13),
+		t1nums(0), t1ops(10),
+		t1ops(14),
+	)
+
+	_, err := DecodeCharString(data, subrs)
+	if err == nil {
+		t.Fatal("DecodeCharString unexpectedly accepted pending OtherSubr pop results before return")
+	}
+	if !strings.Contains(err.Error(), "pending OtherSubr pop results before return") {
+		t.Fatalf("error = %q, want pending OtherSubr return error", err)
+	}
+}
+
 func TestDecodeCharStringRejectsNonIntegerCallOtherSubrOperands(t *testing.T) {
 	tests := []struct {
 		name    string

@@ -1815,6 +1815,15 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 		if e.RP0 < 0 || e.RP0 >= len(zone0.Points) {
 			return fmt.Errorf("reference point out of bounds in ALIGNRP: rp0=%d", e.RP0)
 		}
+		if int64(e.GS.Loop) > int64(e.StackTop) {
+			return fmt.Errorf("stack underflow in ALIGNRP: need %d operands, have %d", e.GS.Loop, e.StackTop)
+		}
+		for i := 0; i < int(e.GS.Loop); i++ {
+			pIdx := e.Stack[e.StackTop-1-i]
+			if pIdx < 0 || int(pIdx) >= len(zone1.Points) {
+				return fmt.Errorf("point index out of bounds in ALIGNRP: %d", pIdx)
+			}
+		}
 		for i := 0; i < int(e.GS.Loop); i++ {
 			pIdx, err := e.pop()
 			if err != nil {

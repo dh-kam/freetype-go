@@ -55,6 +55,9 @@ func TestFileStreamReadAtAndSize(t *testing.T) {
 	if stream.Size() != 4 {
 		t.Fatalf("Size = %d, want 4", stream.Size())
 	}
+	if stream.Type1FontPath() != file.Name() {
+		t.Fatalf("Type1FontPath = %q, want %q", stream.Type1FontPath(), file.Name())
+	}
 
 	buf := make([]byte, 2)
 	n, err := stream.ReadAt(buf, 1)

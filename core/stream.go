@@ -60,5 +60,13 @@ func (s *FileStream) Size() int64 {
 	return s.size
 }
 
+// Type1FontPath returns the filesystem path backing this stream, when known.
+func (s *FileStream) Type1FontPath() string {
+	if s == nil || s.file == nil {
+		return ""
+	}
+	return s.file.Name()
+}
+
 var _ api.Stream = (*MemoryStream)(nil)
 var _ api.Stream = (*FileStream)(nil)

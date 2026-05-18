@@ -3,7 +3,8 @@
 This page summarizes implemented areas in the current repository. It is not a
 statement of full FreeType compatibility or stable API coverage.
 Use [Porting Status and Remaining Gaps](porting-status.md) for the current
-parity tracking criteria and known incomplete areas.
+parity tracking criteria, narrow next tracking items, and known incomplete
+areas.
 
 ## Implemented Areas
 
@@ -11,7 +12,7 @@ parity tracking criteria and known incomplete areas.
 - **TrueType (.ttf)**: SFNT directory parsing, common table parsing, glyph
   loading, cmap/hmtx support, and TrueType instruction machinery with focused
   size/CVT/prep, MIRP CVT[-1], SDPVTL, negative SLOOP, DELTAP invalid-point,
-  and rollback regression coverage.
+  ALIGNRP preflight, and rollback regression coverage.
 - **OpenType/CFF (.otf)**: CFF parsing and charstring-related support are
   present. Coverage should be treated as evolving.
 - **Type 1 (.pfa/.pfb)**: PFA/PFB parsing, Type 1 dictionary and encoding
@@ -22,9 +23,11 @@ parity tracking criteria and known incomplete areas.
   adjacent companion discovery through `DiscoverCompanionMetricsFiles`,
   `ReadCompanionMetricsForFont`, and `SetCompanionMetricsForFont`. `LoadFace`
   can auto-attach discovered companions when the stream implements
-  `FontPathStream`. Charstring guard coverage includes terminators, Subr
-  returns, unterminated flex, limited OtherSubr 3 result-pop handling, and
-  pending OtherSubr result queues.
+  `FontPathStream`, including ordinary `core.FileStream` values when
+  `Type1FontPath()` is present. Charstring guard coverage includes terminators,
+  Subr returns, unterminated flex, limited OtherSubr 3 result-pop handling, and
+  pending OtherSubr result queues, with return values scoped to supported
+  pop-result cases.
   Coverage should be treated as evolving.
 - **TrueType/OpenType collections (.ttc/.otc)**: The SFNT loader can open the
   first face by default or a requested face via `sfnt.LoadFaceIndex`.
@@ -33,8 +36,9 @@ parity tracking criteria and known incomplete areas.
   and collection directory reconstruction. Current focused regression coverage
   includes transformed-hmtx, instruction/bbox, short/long-loca multiglyph,
   per-glyph overlap bitmap, collection long-multiglyph, collection hmtx
-  dependency cases, raw/transformed outline mismatch rejection, and malformed
-  shared-composite rejection.
+  dependency cases, malformed shared-hmtx metadata, raw/transformed outline
+  mismatch rejection, malformed long-loca/raw-glyph shared-hmtx rejection, and
+  malformed shared-composite rejection. This is still not a parity claim.
 - **Bitmap Fonts**: BDF, PCF, FNT, and selected embedded bitmap table support.
 - **Color Fonts**: Parsers/helpers for selected `COLR`/`CPAL` and `sbix`
   data exist.
