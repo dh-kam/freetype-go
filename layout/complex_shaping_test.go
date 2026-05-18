@@ -181,3 +181,230 @@ func TestGPOS_MarkToMark(t *testing.T) {
 		t.Fatalf("expected mark-to-mark Y adjustment 137, got %d", adjustments[1].Y)
 	}
 }
+
+func TestGPOS_MarkToLigature(t *testing.T) {
+	data := make([]byte, 80)
+
+	// MarkToLigaturePos format 1 at 0: mark 501 attaches to ligature 300.
+	binary.BigEndian.PutUint16(data[0:2], 1)
+	binary.BigEndian.PutUint16(data[2:4], 12)
+	binary.BigEndian.PutUint16(data[4:6], 18)
+	binary.BigEndian.PutUint16(data[6:8], 1)
+	binary.BigEndian.PutUint16(data[8:10], 24)
+	binary.BigEndian.PutUint16(data[10:12], 36)
+	putCoverageFormat1(data, 12, 501)
+	putCoverageFormat1(data, 18, 300)
+
+	// MarkArray at 24.
+	binary.BigEndian.PutUint16(data[24:26], 1)
+	binary.BigEndian.PutUint16(data[26:28], 0)
+	binary.BigEndian.PutUint16(data[28:30], 6)
+	binary.BigEndian.PutUint16(data[30:32], 1)
+	binary.BigEndian.PutUint16(data[32:34], 10)
+	binary.BigEndian.PutUint16(data[34:36], 20)
+
+	// LigatureArray at 36. Component 0 anchor is (100, 150).
+	binary.BigEndian.PutUint16(data[36:38], 1)
+	binary.BigEndian.PutUint16(data[38:40], 4)
+	binary.BigEndian.PutUint16(data[40:42], 2)
+	binary.BigEndian.PutUint16(data[42:44], 6)
+	binary.BigEndian.PutUint16(data[44:46], 12)
+	binary.BigEndian.PutUint16(data[46:48], 1)
+	binary.BigEndian.PutUint16(data[48:50], 100)
+	binary.BigEndian.PutUint16(data[50:52], 150)
+	binary.BigEndian.PutUint16(data[52:54], 1)
+	binary.BigEndian.PutUint16(data[54:56], 200)
+	binary.BigEndian.PutUint16(data[56:58], 250)
+
+	gpos := &GPOS{Data: data}
+	lookup := &LookupTable{Type: 5, SubtableOffsets: []uint16{0}}
+	adjustments := make([]api.Vector, 2)
+	gpos.applyLookup(lookup, []int{300, 501}, adjustments)
+
+	if adjustments[1].X != 90 {
+		t.Fatalf("expected mark-to-ligature X adjustment 90, got %d", adjustments[1].X)
+	}
+	if adjustments[1].Y != 130 {
+		t.Fatalf("expected mark-to-ligature Y adjustment 130, got %d", adjustments[1].Y)
+	}
+}
+
+func TestGPOS_MarkToLigatureUsesNonMarkComponentHeuristic(t *testing.T) {
+	data := make([]byte, 90)
+
+	// MarkToLigaturePos format 1 at 0: marks 501 and 502 attach to ligature 300.
+	binary.BigEndian.PutUint16(data[0:2], 1)
+	binary.BigEndian.PutUint16(data[2:4], 12)
+	binary.BigEndian.PutUint16(data[4:6], 20)
+	binary.BigEndian.PutUint16(data[6:8], 1)
+	binary.BigEndian.PutUint16(data[8:10], 26)
+	binary.BigEndian.PutUint16(data[10:12], 50)
+	putCoverageFormat1(data, 12, 501, 502)
+	putCoverageFormat1(data, 20, 300)
+
+	// MarkArray at 26. Both marks are class 0 with the same anchor.
+	binary.BigEndian.PutUint16(data[26:28], 2)
+	binary.BigEndian.PutUint16(data[28:30], 0)
+	binary.BigEndian.PutUint16(data[30:32], 10)
+	binary.BigEndian.PutUint16(data[32:34], 0)
+	binary.BigEndian.PutUint16(data[34:36], 16)
+	binary.BigEndian.PutUint16(data[36:38], 1)
+	binary.BigEndian.PutUint16(data[38:40], 10)
+	binary.BigEndian.PutUint16(data[40:42], 20)
+	binary.BigEndian.PutUint16(data[42:44], 1)
+	binary.BigEndian.PutUint16(data[44:46], 10)
+	binary.BigEndian.PutUint16(data[46:48], 20)
+
+	// LigatureArray at 50. Component 0 anchor is (100,150);
+	// component 1 anchor is intentionally different.
+	binary.BigEndian.PutUint16(data[50:52], 1)
+	binary.BigEndian.PutUint16(data[52:54], 4)
+	binary.BigEndian.PutUint16(data[54:56], 2)
+	binary.BigEndian.PutUint16(data[56:58], 6)
+	binary.BigEndian.PutUint16(data[58:60], 12)
+	binary.BigEndian.PutUint16(data[60:62], 1)
+	binary.BigEndian.PutUint16(data[62:64], 100)
+	binary.BigEndian.PutUint16(data[64:66], 150)
+	binary.BigEndian.PutUint16(data[66:68], 1)
+	binary.BigEndian.PutUint16(data[68:70], 200)
+	binary.BigEndian.PutUint16(data[70:72], 250)
+
+	gpos := &GPOS{Data: data, GDEF: makeTestGDEFWithMarks(501, 502)}
+	lookup := &LookupTable{Type: 5, SubtableOffsets: []uint16{0}}
+	adjustments := make([]api.Vector, 3)
+	gpos.applyLookup(lookup, []int{300, 501, 502}, adjustments)
+
+	if adjustments[1].X != 90 || adjustments[1].Y != 130 {
+		t.Fatalf("expected first mark to use component 0 anchor, got %+v", adjustments[1])
+	}
+	if adjustments[2].X != 90 || adjustments[2].Y != 130 {
+		t.Fatalf("expected consecutive mark to reuse component 0 anchor, got %+v", adjustments[2])
+	}
+}
+
+func TestGPOS_MarkFilteringSetFiltersMarks(t *testing.T) {
+	data := make([]byte, 80)
+
+	// MarkToBasePos format 1 at 0. Both marks are covered by the lookup.
+	binary.BigEndian.PutUint16(data[0:2], 1)
+	binary.BigEndian.PutUint16(data[2:4], 12)
+	binary.BigEndian.PutUint16(data[4:6], 20)
+	binary.BigEndian.PutUint16(data[6:8], 1)
+	binary.BigEndian.PutUint16(data[8:10], 26)
+	binary.BigEndian.PutUint16(data[10:12], 48)
+	putCoverageFormat1(data, 12, 500, 501)
+	putCoverageFormat1(data, 20, 100)
+
+	// MarkArray at 26.
+	binary.BigEndian.PutUint16(data[26:28], 2)
+	binary.BigEndian.PutUint16(data[28:30], 0)
+	binary.BigEndian.PutUint16(data[30:32], 10)
+	binary.BigEndian.PutUint16(data[32:34], 0)
+	binary.BigEndian.PutUint16(data[34:36], 16)
+	binary.BigEndian.PutUint16(data[36:38], 1)
+	binary.BigEndian.PutUint16(data[38:40], 10)
+	binary.BigEndian.PutUint16(data[40:42], 20)
+	binary.BigEndian.PutUint16(data[42:44], 1)
+	binary.BigEndian.PutUint16(data[44:46], 30)
+	binary.BigEndian.PutUint16(data[46:48], 40)
+
+	// BaseArray at 48.
+	binary.BigEndian.PutUint16(data[48:50], 1)
+	binary.BigEndian.PutUint16(data[50:52], 4)
+	binary.BigEndian.PutUint16(data[52:54], 1)
+	binary.BigEndian.PutUint16(data[54:56], 100)
+	binary.BigEndian.PutUint16(data[56:58], 100)
+
+	gdefData := make([]byte, 64)
+	binary.BigEndian.PutUint32(gdefData[0:4], 0x00010002)
+	binary.BigEndian.PutUint16(gdefData[4:6], 20)
+	binary.BigEndian.PutUint16(gdefData[12:14], 40)
+	binary.BigEndian.PutUint16(gdefData[20:22], 2)
+	binary.BigEndian.PutUint16(gdefData[22:24], 2)
+	binary.BigEndian.PutUint16(gdefData[24:26], 100)
+	binary.BigEndian.PutUint16(gdefData[26:28], 100)
+	binary.BigEndian.PutUint16(gdefData[28:30], gdefGlyphClassBase)
+	binary.BigEndian.PutUint16(gdefData[30:32], 500)
+	binary.BigEndian.PutUint16(gdefData[32:34], 501)
+	binary.BigEndian.PutUint16(gdefData[34:36], gdefGlyphClassMark)
+	binary.BigEndian.PutUint16(gdefData[40:42], 1)
+	binary.BigEndian.PutUint16(gdefData[42:44], 1)
+	binary.BigEndian.PutUint32(gdefData[44:48], 8)
+	putCoverageFormat1(gdefData, 48, 501)
+
+	gdef, err := ParseGDEF(gdefData)
+	if err != nil {
+		t.Fatalf("ParseGDEF failed: %v", err)
+	}
+
+	gpos := &GPOS{Data: data, GDEF: gdef}
+	lookup := &LookupTable{
+		Type:             4,
+		Flag:             lookupFlagUseMarkFilteringSet,
+		SubtableOffsets:  []uint16{0},
+		MarkFilteringSet: 0,
+	}
+	adjustments := make([]api.Vector, 3)
+	gpos.applyLookup(lookup, []int{100, 500, 501}, adjustments)
+
+	if adjustments[1] != (api.Vector{}) {
+		t.Fatalf("expected filtered mark to remain unadjusted, got %+v", adjustments[1])
+	}
+	if adjustments[2].X != 70 {
+		t.Fatalf("expected allowed mark X adjustment 70, got %d", adjustments[2].X)
+	}
+	if adjustments[2].Y != 60 {
+		t.Fatalf("expected allowed mark Y adjustment 60, got %d", adjustments[2].Y)
+	}
+}
+
+func TestGPOS_CursivePositioning(t *testing.T) {
+	data := make([]byte, 100)
+
+	// GPOS Header
+	binary.BigEndian.PutUint16(data[0:2], 1)
+	binary.BigEndian.PutUint16(data[2:4], 0)
+	binary.BigEndian.PutUint16(data[4:6], 10)
+	binary.BigEndian.PutUint16(data[6:8], 20)
+	binary.BigEndian.PutUint16(data[8:10], 30)
+
+	binary.BigEndian.PutUint16(data[10:12], 0)
+	binary.BigEndian.PutUint16(data[20:22], 0)
+
+	putLookupList(data, 30, 34)
+	putLookupTable(data, 34, 3, 42)
+
+	// CursivePos format 1 at 42. Glyph 200 has an exit anchor; glyph 201 has
+	// an entry anchor, so glyph 201 is moved by exit-entry.
+	binary.BigEndian.PutUint16(data[42:44], 1)
+	binary.BigEndian.PutUint16(data[44:46], 14) // Coverage at 56.
+	binary.BigEndian.PutUint16(data[46:48], 2)
+	binary.BigEndian.PutUint16(data[48:50], 0)
+	binary.BigEndian.PutUint16(data[50:52], 22) // Exit anchor at 64.
+	binary.BigEndian.PutUint16(data[52:54], 28) // Entry anchor at 70.
+	binary.BigEndian.PutUint16(data[54:56], 0)
+	putCoverageFormat1(data, 56, 200, 201)
+
+	binary.BigEndian.PutUint16(data[64:66], 1)
+	binary.BigEndian.PutUint16(data[66:68], 300)
+	binary.BigEndian.PutUint16(data[68:70], 40)
+	binary.BigEndian.PutUint16(data[70:72], 1)
+	binary.BigEndian.PutUint16(data[72:74], 30)
+	binary.BigEndian.PutUint16(data[74:76], 10)
+
+	gpos, err := ParseGPOS(data)
+	if err != nil {
+		t.Fatalf("ParseGPOS failed: %v", err)
+	}
+
+	adjustments := gpos.Position([]int{200, 201, 202})
+	if adjustments[1].X != 270 {
+		t.Fatalf("expected cursive X adjustment 270, got %d", adjustments[1].X)
+	}
+	if adjustments[1].Y != 30 {
+		t.Fatalf("expected cursive Y adjustment 30, got %d", adjustments[1].Y)
+	}
+	if adjustments[2] != (api.Vector{}) {
+		t.Fatalf("expected uncovered glyph adjustment to remain zero, got %+v", adjustments[2])
+	}
+}

@@ -11,8 +11,15 @@ import (
 func main() {
 	if err := run(os.Args[1:], os.Stdout, os.Stderr); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(1)
+		os.Exit(commandExitCode(err))
 	}
+}
+
+func commandExitCode(err error) int {
+	if errors.Is(err, errComparisonFailed) {
+		return 1
+	}
+	return 2
 }
 
 func run(args []string, stdout, stderr io.Writer) error {
@@ -35,6 +42,8 @@ func run(args []string, stdout, stderr io.Writer) error {
 		return runBatchCommand(args[1:], stdout, stderr)
 	case "batch-compare":
 		return runBatchCompareCommand(args[1:], stdout, stderr)
+	case "smoke":
+		return runSmokeCommand(args[1:], stdout, stderr)
 	default:
 		printUsage(stderr)
 		return fmt.Errorf("unknown command %q", args[0])
@@ -51,6 +60,7 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  go run ./tools/conformance dump -request request.json")
 	fmt.Fprintln(w, "  go run ./tools/conformance batch -requests 'testdata/conformance/*.json' -font font.ttf")
 	fmt.Fprintln(w, "  go run ./tools/conformance batch-compare -requests 'testdata/conformance/*.json'")
+	fmt.Fprintln(w, "  go run ./tools/conformance smoke")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Commands:")
 	fmt.Fprintln(w, "  dump     Write a JSON metrics/outline/bitmap dump from the Go engine.")
@@ -59,11 +69,15 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  batch    Run dump or ftdump over multiple request JSON files.")
 	fmt.Fprintln(w, "  batch-compare")
 	fmt.Fprintln(w, "           Compare per-request reference and candidate dump files.")
+	fmt.Fprintln(w, "  smoke    Best-effort Go dumps for auto-discovered local system fonts.")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Common dump flags:")
 	fmt.Fprintln(w, "  -load-flags  comma-separated sets such as default,no-hinting+target-light")
 	fmt.Fprintln(w, "  -render-mode comma-separated modes: none, normal, light, mono, lcd, lcd-v")
+	fmt.Fprintln(w, "  -include-bitmap-buffer include hex bitmap buffers for byte-level mismatch diagnostics")
 	fmt.Fprintln(w, "  -request     JSON request file; explicit CLI flags override request fields")
+	fmt.Fprintln(w, "  -accept-expected-gaps and -fail-stale-expected-gaps tighten corpus comparison policy")
+	fmt.Fprintln(w, "  smoke -font/-font-dir can pin local font files or scan system font locations")
 }
 
 func isHelp(err error) bool {

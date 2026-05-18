@@ -70,6 +70,57 @@ func TestParseVmtx(t *testing.T) {
 	}
 }
 
+func TestParseVheaVersion11FullHeader(t *testing.T) {
+	data := make([]byte, 36)
+	binary.BigEndian.PutUint32(data[0:4], 0x00011000)
+	putTestInt16(data[4:6], 500)
+	putTestInt16(data[6:8], -500)
+	putTestInt16(data[8:10], 0)
+	binary.BigEndian.PutUint16(data[10:12], 2079)
+	putTestInt16(data[12:14], -342)
+	putTestInt16(data[14:16], -333)
+	putTestInt16(data[16:18], 2036)
+	putTestInt16(data[18:20], 0)
+	putTestInt16(data[20:22], 1)
+	putTestInt16(data[22:24], 12)
+	putTestInt16(data[24:26], 1)
+	putTestInt16(data[26:28], -1)
+	putTestInt16(data[28:30], 2)
+	putTestInt16(data[30:32], -2)
+	putTestInt16(data[32:34], 0)
+	binary.BigEndian.PutUint16(data[34:36], 258)
+
+	vhea, err := parseVhea(&mockStream{data: data})
+	if err != nil {
+		t.Fatalf("parseVhea failed: %v", err)
+	}
+	if vhea.Version != 0x00011000 || vhea.Ascent != 500 || vhea.Descent != -500 {
+		t.Fatalf("unexpected vhea header: %+v", vhea)
+	}
+	if vhea.AdvanceHeightMax != 2079 || vhea.MinTopSideBearing != -342 || vhea.MinBottomSideBearing != -333 || vhea.YMaxExtent != 2036 {
+		t.Fatalf("unexpected vhea vertical metrics: %+v", vhea)
+	}
+	if vhea.CaretSlopeRise != 0 || vhea.CaretSlopeRun != 1 || vhea.CaretOffset != 12 {
+		t.Fatalf("unexpected vhea caret fields: %+v", vhea)
+	}
+	if vhea.Reserved != [4]int16{1, -1, 2, -2} {
+		t.Fatalf("unexpected vhea reserved fields: %+v", vhea.Reserved)
+	}
+	if vhea.MetricDataFormat != 0 || vhea.NumOfLongVerMetrics != 258 {
+		t.Fatalf("unexpected vhea metric format/count: %+v", vhea)
+	}
+}
+
+func putTestInt16(dst []byte, v int16) {
+	binary.BigEndian.PutUint16(dst, uint16(v))
+}
+
+func TestParseVheaRejectsShortHeader(t *testing.T) {
+	if _, err := parseVhea(&mockStream{data: make([]byte, 35)}); err == nil {
+		t.Fatal("expected short vhea table to fail")
+	}
+}
+
 func TestParseVORG(t *testing.T) {
 	data := make([]byte, 8+2*4)
 	binary.BigEndian.PutUint16(data[0:2], 1)                   // major
@@ -138,6 +189,125 @@ func TestParseGasp(t *testing.T) {
 	}
 	if gasp.GaspRanges[1].RangeMaxPPEM != 65535 || gasp.GaspRanges[1].RangeGaspBehavior != 15 {
 		t.Errorf("range 1 mismatch")
+	}
+}
+
+func TestParseJstfScriptLangSysAndPriority(t *testing.T) {
+	data := make([]byte, 112)
+	binary.BigEndian.PutUint16(data[0:2], 1)
+	binary.BigEndian.PutUint16(data[2:4], 0)
+	binary.BigEndian.PutUint16(data[4:6], 1)
+	binary.BigEndian.PutUint32(data[6:10], stringToTag("arab"))
+	binary.BigEndian.PutUint16(data[10:12], 12)
+
+	script := 12
+	binary.BigEndian.PutUint16(data[script:script+2], 12)
+	binary.BigEndian.PutUint16(data[script+2:script+4], 20)
+	binary.BigEndian.PutUint16(data[script+4:script+6], 1)
+	binary.BigEndian.PutUint32(data[script+6:script+10], stringToTag("FAR "))
+	binary.BigEndian.PutUint16(data[script+10:script+12], 68)
+
+	extenders := script + 12
+	binary.BigEndian.PutUint16(data[extenders:extenders+2], 2)
+	binary.BigEndian.PutUint16(data[extenders+2:extenders+4], 0x01d3)
+	binary.BigEndian.PutUint16(data[extenders+4:extenders+6], 0x01d4)
+
+	defaultLangSys := script + 20
+	binary.BigEndian.PutUint16(data[defaultLangSys:defaultLangSys+2], 1)
+	binary.BigEndian.PutUint16(data[defaultLangSys+2:defaultLangSys+4], 4)
+
+	defaultPriority := defaultLangSys + 4
+	binary.BigEndian.PutUint16(data[defaultPriority:defaultPriority+2], 20)
+	binary.BigEndian.PutUint16(data[defaultPriority+18:defaultPriority+20], 26)
+
+	modList := defaultPriority + 20
+	binary.BigEndian.PutUint16(data[modList:modList+2], 2)
+	binary.BigEndian.PutUint16(data[modList+2:modList+4], 46)
+	binary.BigEndian.PutUint16(data[modList+4:modList+6], 99)
+
+	jstfMax := defaultPriority + 26
+	binary.BigEndian.PutUint16(data[jstfMax:jstfMax+2], 1)
+	binary.BigEndian.PutUint16(data[jstfMax+2:jstfMax+4], 8)
+	lookup := jstfMax + 8
+	binary.BigEndian.PutUint16(data[lookup:lookup+2], 1)
+	binary.BigEndian.PutUint16(data[lookup+2:lookup+4], 0)
+	binary.BigEndian.PutUint16(data[lookup+4:lookup+6], 0)
+
+	farsiLangSys := script + 68
+	binary.BigEndian.PutUint16(data[farsiLangSys:farsiLangSys+2], 1)
+	binary.BigEndian.PutUint16(data[farsiLangSys+2:farsiLangSys+4], 4)
+	farsiPriority := farsiLangSys + 4
+	binary.BigEndian.PutUint16(data[farsiPriority+14:farsiPriority+16], 20)
+	farsiModList := farsiPriority + 20
+	binary.BigEndian.PutUint16(data[farsiModList:farsiModList+2], 1)
+	binary.BigEndian.PutUint16(data[farsiModList+2:farsiModList+4], 108)
+
+	jstf, err := ParseJstf(&mockStream{data: data})
+	if err != nil {
+		t.Fatalf("ParseJstf failed: %v", err)
+	}
+	if jstf.JstfScriptCount != 1 || len(jstf.JstfScripts) != 1 {
+		t.Fatalf("unexpected JSTF script records: %+v", jstf)
+	}
+	record := jstf.JstfScripts[0]
+	if record.JstfScriptTag != stringToTag("arab") || record.JstfScript == nil {
+		t.Fatalf("unexpected JSTF script record: %+v", record)
+	}
+	if got := record.JstfScript.ExtenderGlyphs; len(got) != 2 || got[0] != 0x01d3 || got[1] != 0x01d4 {
+		t.Fatalf("unexpected extender glyphs: %+v", got)
+	}
+	defaultPriorityTable := record.JstfScript.DefJstfLangSys.JstfPriorities[0]
+	if got := defaultPriorityTable.GsubShrinkageEnable.LookupIndices; len(got) != 2 || got[0] != 46 || got[1] != 99 {
+		t.Fatalf("unexpected shrinkage mod list: %+v", got)
+	}
+	if defaultPriorityTable.ExtensionJstfMax == nil || defaultPriorityTable.ExtensionJstfMax.LookupOffsets[0] != 8 {
+		t.Fatalf("unexpected JstfMax: %+v", defaultPriorityTable.ExtensionJstfMax)
+	}
+	langRecord := record.JstfScript.JstfLangSysRecords[0]
+	if langRecord.JstfLangSysTag != stringToTag("FAR ") || langRecord.JstfLangSys == nil {
+		t.Fatalf("unexpected langsys record: %+v", langRecord)
+	}
+	if got := langRecord.JstfLangSys.JstfPriorities[0].GposExtensionEnable.LookupIndices; len(got) != 1 || got[0] != 108 {
+		t.Fatalf("unexpected extension mod list: %+v", got)
+	}
+}
+
+func TestParseJstfRejectsMalformedOffsets(t *testing.T) {
+	data := make([]byte, 12)
+	binary.BigEndian.PutUint16(data[0:2], 1)
+	binary.BigEndian.PutUint16(data[4:6], 1)
+	binary.BigEndian.PutUint32(data[6:10], stringToTag("latn"))
+	binary.BigEndian.PutUint16(data[10:12], 100)
+
+	if _, err := ParseJstf(&mockStream{data: data}); err == nil {
+		t.Fatal("expected malformed JSTF script offset to fail")
+	}
+}
+
+func TestParseHdmxAndLookupWidth(t *testing.T) {
+	data := make([]byte, 24)
+	binary.BigEndian.PutUint16(data[0:2], 0)
+	binary.BigEndian.PutUint16(data[2:4], 2)
+	binary.BigEndian.PutUint32(data[4:8], 8)
+	data[8] = 12
+	data[9] = 9
+	copy(data[10:13], []byte{4, 5, 6})
+	data[16] = 14
+	data[17] = 11
+	copy(data[18:21], []byte{7, 8, 9})
+
+	hdmx, err := parseHdmx(&mockStream{data: data}, 3)
+	if err != nil {
+		t.Fatalf("parseHdmx failed: %v", err)
+	}
+	if len(hdmx.Records) != 2 || hdmx.Records[1].PixelSize != 14 {
+		t.Fatalf("unexpected hdmx records: %+v", hdmx.Records)
+	}
+	if width, ok := hdmx.Width(2, 14); !ok || width != 9 {
+		t.Fatalf("hdmx width got %d ok=%v, want 9 true", width, ok)
+	}
+	if _, ok := hdmx.Width(3, 14); ok {
+		t.Fatal("expected out-of-range glyph lookup to fail")
 	}
 }
 

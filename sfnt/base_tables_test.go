@@ -98,13 +98,53 @@ func TestParseBASECoordFormats(t *testing.T) {
 	format3 := make([]byte, 6)
 	binary.BigEndian.PutUint16(format3[0:2], 3)
 	binary.BigEndian.PutUint16(format3[2:4], 240)
-	binary.BigEndian.PutUint16(format3[4:6], 6)
+	binary.BigEndian.PutUint16(format3[4:6], 0)
 	coord, err = parseBASECoord(&mockStream{data: format3}, 0)
 	if err != nil {
 		t.Fatalf("parseBASECoord format 3 failed: %v", err)
 	}
-	if coord.Coordinate != 240 || coord.DeviceOffset != 6 {
+	if coord.Coordinate != 240 || coord.DeviceOffset != 0 {
 		t.Fatalf("unexpected format 3 coord: %+v", coord)
+	}
+}
+
+func TestParseBASECoordFormat3DeviceAndVariationIndex(t *testing.T) {
+	format3 := make([]byte, 14)
+	binary.BigEndian.PutUint16(format3[0:2], 3)
+	binary.BigEndian.PutUint16(format3[2:4], 0xfee8)
+	binary.BigEndian.PutUint16(format3[4:6], 6)
+	binary.BigEndian.PutUint16(format3[6:8], 11)
+	binary.BigEndian.PutUint16(format3[8:10], 15)
+	binary.BigEndian.PutUint16(format3[10:12], 1)
+	binary.BigEndian.PutUint16(format3[12:14], 0x5540)
+
+	coord, err := parseBASECoord(&mockStream{data: format3}, 0)
+	if err != nil {
+		t.Fatalf("parseBASECoord format 3 device failed: %v", err)
+	}
+	if coord.Device == nil {
+		t.Fatal("expected parsed Device table")
+	}
+	if coord.Device.StartSize != 11 || coord.Device.EndSize != 15 || coord.Device.DeltaFormat != 1 {
+		t.Fatalf("unexpected Device header: %+v", coord.Device)
+	}
+	if got, want := coord.Device.DeltaValues, []int16{1, 1, 1, 1, 1}; len(got) != len(want) || got[0] != want[0] || got[4] != want[4] {
+		t.Fatalf("unexpected Device deltas: %+v", got)
+	}
+
+	variation := make([]byte, 12)
+	binary.BigEndian.PutUint16(variation[0:2], 3)
+	binary.BigEndian.PutUint16(variation[4:6], 6)
+	binary.BigEndian.PutUint16(variation[6:8], 2)
+	binary.BigEndian.PutUint16(variation[8:10], 7)
+	binary.BigEndian.PutUint16(variation[10:12], 0x8000)
+
+	coord, err = parseBASECoord(&mockStream{data: variation}, 0)
+	if err != nil {
+		t.Fatalf("parseBASECoord format 3 variation index failed: %v", err)
+	}
+	if coord.Device == nil || coord.Device.DeltaSetOuterIndex != 2 || coord.Device.DeltaSetInnerIndex != 7 {
+		t.Fatalf("unexpected VariationIndex table: %+v", coord.Device)
 	}
 }
 

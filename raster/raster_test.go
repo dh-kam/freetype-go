@@ -1,8 +1,10 @@
 package raster
 
 import (
-	"github.com/dh-kam/freetype-go/api"
 	"testing"
+
+	"github.com/dh-kam/freetype-go/api"
+	"github.com/dh-kam/freetype-go/core"
 )
 
 type mockOutline struct {
@@ -154,5 +156,143 @@ func TestSmoothRasterizerWinding(t *testing.T) {
 	val20 := bitmap.buffer[20*40+20]
 	if val20 != 0 {
 		t.Errorf("Pixel at (20,20) should be 0 (hole), got %d", val20)
+	}
+}
+
+func TestSmoothRasterizerSameWindingContoursFill(t *testing.T) {
+	rasterizer := NewSmoothRasterizer()
+
+	outline := &mockOutline{
+		points: []api.Vector{
+			{X: 10 * 64, Y: 10 * 64},
+			{X: 30 * 64, Y: 10 * 64},
+			{X: 30 * 64, Y: 30 * 64},
+			{X: 10 * 64, Y: 30 * 64},
+			{X: 15 * 64, Y: 15 * 64},
+			{X: 25 * 64, Y: 15 * 64},
+			{X: 25 * 64, Y: 25 * 64},
+			{X: 15 * 64, Y: 25 * 64},
+		},
+		tags:     []byte{1, 1, 1, 1, 1, 1, 1, 1},
+		contours: []int{3, 7},
+	}
+
+	bitmap := core.NewBitmap(40, 40)
+
+	if err := rasterizer.Render(outline, bitmap); err != nil {
+		t.Fatalf("Render failed: %v", err)
+	}
+	if got := bitmap.Buffer[20*bitmap.Pitch+20]; got != 255 {
+		t.Fatalf("same-winding nested contour pixel = %d, want 255 for non-zero fill", got)
+	}
+}
+
+func TestSmoothRasterizerEmptyOutlineLeavesBitmapUnchanged(t *testing.T) {
+	rasterizer := NewSmoothRasterizer()
+	bitmap := core.NewBitmap(8, 8)
+	for i := range bitmap.Buffer {
+		bitmap.Buffer[i] = 0x5a
+	}
+
+	err := rasterizer.Render(&core.Outline{}, bitmap)
+	if err != nil {
+		t.Fatalf("Render failed: %v", err)
+	}
+	for i, got := range bitmap.Buffer {
+		if got != 0x5a {
+			t.Fatalf("buffer[%d] changed to %#02x, want sentinel 0x5a", i, got)
+		}
+	}
+}
+
+func TestSmoothRasterizerNilOutlineLeavesBitmapUnchanged(t *testing.T) {
+	rasterizer := NewSmoothRasterizer()
+	bitmap := core.NewBitmap(4, 4)
+	for i := range bitmap.Buffer {
+		bitmap.Buffer[i] = 0xa5
+	}
+
+	if err := rasterizer.Render(nil, bitmap); err != nil {
+		t.Fatalf("Render failed: %v", err)
+	}
+	for i, got := range bitmap.Buffer {
+		if got != 0xa5 {
+			t.Fatalf("buffer[%d] changed to %#02x, want sentinel 0xa5", i, got)
+		}
+	}
+}
+
+func TestSmoothRasterizerDegenerateContourLeavesBitmapUnchanged(t *testing.T) {
+	rasterizer := NewSmoothRasterizer()
+	outline := &core.Outline{
+		Points: []api.Vector{
+			{X: 2 << 6, Y: 2 << 6},
+			{X: 2 << 6, Y: 2 << 6},
+			{X: 2 << 6, Y: 2 << 6},
+		},
+		Tags:     []byte{1, 1, 1},
+		Contours: []int{2},
+	}
+	bitmap := core.NewBitmap(8, 8)
+	for i := range bitmap.Buffer {
+		bitmap.Buffer[i] = 0x3c
+	}
+
+	if err := rasterizer.Render(outline, bitmap); err != nil {
+		t.Fatalf("Render failed: %v", err)
+	}
+	for i, got := range bitmap.Buffer {
+		if got != 0x3c {
+			t.Fatalf("buffer[%d] changed to %#02x, want sentinel 0x3c", i, got)
+		}
+	}
+}
+
+func TestSmoothRasterizerNegativeBoundsClipToBitmap(t *testing.T) {
+	rasterizer := NewSmoothRasterizer()
+	outline := &core.Outline{
+		Points: []api.Vector{
+			{X: -4 << 6, Y: -4 << 6},
+			{X: 4 << 6, Y: -4 << 6},
+			{X: 4 << 6, Y: 4 << 6},
+			{X: -4 << 6, Y: 4 << 6},
+		},
+		Tags:     []byte{1, 1, 1, 1},
+		Contours: []int{3},
+	}
+	bitmap := core.NewBitmap(8, 8)
+
+	if err := rasterizer.Render(outline, bitmap); err != nil {
+		t.Fatalf("Render failed: %v", err)
+	}
+	if got := bitmap.Buffer[2*bitmap.Pitch+2]; got != 255 {
+		t.Fatalf("clipped interior pixel = %d, want 255", got)
+	}
+	if got := bitmap.Buffer[6*bitmap.Pitch+6]; got != 0 {
+		t.Fatalf("outside pixel = %d, want 0", got)
+	}
+}
+
+func TestSmoothRasterizerOutsideNegativeBoundsLeavesBitmapEmpty(t *testing.T) {
+	rasterizer := NewSmoothRasterizer()
+	outline := &core.Outline{
+		Points: []api.Vector{
+			{X: -12 << 6, Y: -12 << 6},
+			{X: -4 << 6, Y: -12 << 6},
+			{X: -4 << 6, Y: -4 << 6},
+			{X: -12 << 6, Y: -4 << 6},
+		},
+		Tags:     []byte{1, 1, 1, 1},
+		Contours: []int{3},
+	}
+	bitmap := core.NewBitmap(8, 8)
+
+	if err := rasterizer.Render(outline, bitmap); err != nil {
+		t.Fatalf("Render failed: %v", err)
+	}
+	for i, got := range bitmap.Buffer {
+		if got != 0 {
+			t.Fatalf("buffer[%d] = %d, want 0 for fully clipped outline", i, got)
+		}
 	}
 }

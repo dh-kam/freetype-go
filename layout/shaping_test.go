@@ -131,6 +131,174 @@ func TestGSUB_Substitute_Ligature(t *testing.T) {
 	}
 }
 
+func TestGSUB_Substitute_Multiple(t *testing.T) {
+	data := make([]byte, 32)
+
+	// MultipleSubst format 1 at 0: glyph 20 -> [21 22].
+	binary.BigEndian.PutUint16(data[0:2], 1)
+	binary.BigEndian.PutUint16(data[2:4], 10)
+	binary.BigEndian.PutUint16(data[4:6], 1)
+	binary.BigEndian.PutUint16(data[6:8], 16)
+	putCoverageFormat1(data, 10, 20)
+	binary.BigEndian.PutUint16(data[16:18], 2)
+	binary.BigEndian.PutUint16(data[18:20], 21)
+	binary.BigEndian.PutUint16(data[20:22], 22)
+
+	gsub := &GSUB{Data: data}
+	lookup := &LookupTable{Type: 2, SubtableOffsets: []uint16{0}}
+	got := gsub.applyLookup(lookup, []int{10, 20, 30})
+	assertGlyphs(t, got, []int{10, 21, 22, 30})
+}
+
+func TestGSUB_Substitute_AlternateUsesFirstAlternate(t *testing.T) {
+	data := make([]byte, 32)
+
+	// AlternateSubst format 1 at 0: glyph 20 -> first alternate 120.
+	binary.BigEndian.PutUint16(data[0:2], 1)
+	binary.BigEndian.PutUint16(data[2:4], 10)
+	binary.BigEndian.PutUint16(data[4:6], 1)
+	binary.BigEndian.PutUint16(data[6:8], 16)
+	putCoverageFormat1(data, 10, 20)
+	binary.BigEndian.PutUint16(data[16:18], 2)
+	binary.BigEndian.PutUint16(data[18:20], 120)
+	binary.BigEndian.PutUint16(data[20:22], 121)
+
+	gsub := &GSUB{Data: data}
+	lookup := &LookupTable{Type: 3, SubtableOffsets: []uint16{0}}
+	got := gsub.applyLookup(lookup, []int{10, 20, 30})
+	assertGlyphs(t, got, []int{10, 120, 30})
+}
+
+func TestGSUB_LookupFlagIgnoreMarksSkipsSingleSubstTargets(t *testing.T) {
+	data := make([]byte, 18)
+
+	// SingleSubst format 1 at 0 covers a base and a mark.
+	binary.BigEndian.PutUint16(data[0:2], 1)
+	binary.BigEndian.PutUint16(data[2:4], 6)
+	binary.BigEndian.PutUint16(data[4:6], 100)
+	putCoverageFormat1(data, 6, 20, 500)
+
+	gsub := &GSUB{Data: data, GDEF: makeTestGDEFWithMarks(500)}
+	lookup := &LookupTable{
+		Type:            1,
+		Flag:            lookupFlagIgnoreMarks,
+		SubtableOffsets: []uint16{0},
+	}
+
+	got := gsub.applyLookup(lookup, []int{20, 500})
+	assertGlyphs(t, got, []int{120, 500})
+}
+
+func TestGSUB_MarkAttachmentTypeFiltersMarks(t *testing.T) {
+	data := make([]byte, 18)
+
+	// SingleSubst format 1 at 0 covers both marks.
+	binary.BigEndian.PutUint16(data[0:2], 1)
+	binary.BigEndian.PutUint16(data[2:4], 6)
+	binary.BigEndian.PutUint16(data[4:6], 100)
+	putCoverageFormat1(data, 6, 500, 501)
+
+	gsub := &GSUB{Data: data, GDEF: makeTestGDEFWithMarkAttachment(map[uint16]uint16{
+		500: 1,
+		501: 2,
+	})}
+	lookup := &LookupTable{
+		Type:            1,
+		Flag:            1 << 8,
+		SubtableOffsets: []uint16{0},
+	}
+
+	got := gsub.applyLookup(lookup, []int{500, 501})
+	assertGlyphs(t, got, []int{600, 501})
+}
+
+func TestGSUB_MarkFilteringSetFiltersMarks(t *testing.T) {
+	data := make([]byte, 18)
+
+	// SingleSubst format 1 at 0 covers both marks.
+	binary.BigEndian.PutUint16(data[0:2], 1)
+	binary.BigEndian.PutUint16(data[2:4], 6)
+	binary.BigEndian.PutUint16(data[4:6], 100)
+	putCoverageFormat1(data, 6, 500, 501)
+
+	gdef := makeTestGDEFWithMarks(500, 501)
+	gdef.MarkGlyphSets = []CoverageTable{&CoverageFormat1{Glyphs: []uint16{501}}}
+	gsub := &GSUB{Data: data, GDEF: gdef}
+	lookup := &LookupTable{
+		Type:             1,
+		Flag:             lookupFlagUseMarkFilteringSet,
+		SubtableOffsets:  []uint16{0},
+		MarkFilteringSet: 0,
+	}
+
+	got := gsub.applyLookup(lookup, []int{500, 501})
+	assertGlyphs(t, got, []int{500, 601})
+}
+
+func TestGSUB_LigatureSubstSkipsIgnoredMarksAndPreservesThem(t *testing.T) {
+	data := make([]byte, 32)
+
+	// LigatureSubst format 1 at 0: glyphs 10,11 -> 100.
+	binary.BigEndian.PutUint16(data[0:2], 1)
+	binary.BigEndian.PutUint16(data[2:4], 22)
+	binary.BigEndian.PutUint16(data[4:6], 1)
+	binary.BigEndian.PutUint16(data[6:8], 8)
+	binary.BigEndian.PutUint16(data[8:10], 1)
+	binary.BigEndian.PutUint16(data[10:12], 4)
+	binary.BigEndian.PutUint16(data[12:14], 100)
+	binary.BigEndian.PutUint16(data[14:16], 2)
+	binary.BigEndian.PutUint16(data[16:18], 11)
+	putCoverageFormat1(data, 22, 10)
+
+	gsub := &GSUB{Data: data, GDEF: makeTestGDEFWithMarks(500)}
+	lookup := &LookupTable{
+		Type:            4,
+		Flag:            lookupFlagIgnoreMarks,
+		SubtableOffsets: []uint16{0},
+	}
+
+	got := gsub.applyLookup(lookup, []int{10, 500, 11, 12})
+	assertGlyphs(t, got, []int{100, 500, 12})
+}
+
+func TestGSUB_ContextMatchingSkipsIgnoredMarks(t *testing.T) {
+	data := make([]byte, 48)
+
+	// ContextSubst format 3 at 0: match 10,11 and apply lookup 1 to sequence index 1.
+	binary.BigEndian.PutUint16(data[0:2], 3)
+	binary.BigEndian.PutUint16(data[2:4], 2)
+	binary.BigEndian.PutUint16(data[4:6], 1)
+	binary.BigEndian.PutUint16(data[6:8], 18)
+	binary.BigEndian.PutUint16(data[8:10], 24)
+	binary.BigEndian.PutUint16(data[10:12], 1)
+	binary.BigEndian.PutUint16(data[12:14], 1)
+	putCoverageFormat1(data, 18, 10)
+	putCoverageFormat1(data, 24, 11)
+
+	// Nested SingleSubst format 1 at 30: glyph 11 -> 111.
+	binary.BigEndian.PutUint16(data[30:32], 1)
+	binary.BigEndian.PutUint16(data[32:34], 6)
+	binary.BigEndian.PutUint16(data[34:36], 100)
+	putCoverageFormat1(data, 36, 11)
+
+	contextLookup := &LookupTable{
+		Type:            5,
+		Flag:            lookupFlagIgnoreMarks,
+		SubtableOffsets: []uint16{0},
+	}
+	gsub := &GSUB{
+		Data: data,
+		GDEF: makeTestGDEFWithMarks(500),
+		LookupList: &LookupList{Lookups: []*LookupTable{
+			contextLookup,
+			{Type: 1, Flag: lookupFlagIgnoreMarks, SubtableOffsets: []uint16{30}},
+		}},
+	}
+
+	got := gsub.applyLookup(contextLookup, []int{10, 500, 11})
+	assertGlyphs(t, got, []int{10, 500, 111})
+}
+
 func TestGPOS_Position_Pair(t *testing.T) {
 	data := make([]byte, 200)
 
@@ -262,6 +430,43 @@ func TestGPOS_Position_PairFormat2ClassPair(t *testing.T) {
 	}
 	if adj[4] != (api.Vector{}) || adj[5] != (api.Vector{}) {
 		t.Fatalf("expected uncovered first glyph pair to remain unchanged, got %+v %+v", adj[4], adj[5])
+	}
+}
+
+func TestGPOS_PairPosSkipsIgnoredMarksBetweenPairGlyphs(t *testing.T) {
+	data := make([]byte, 32)
+
+	// PairPos format 1 at 0: glyph 20 followed by glyph 21 adjusts both glyphs.
+	binary.BigEndian.PutUint16(data[0:2], 1)
+	binary.BigEndian.PutUint16(data[2:4], 24)
+	binary.BigEndian.PutUint16(data[4:6], 0x0004)
+	binary.BigEndian.PutUint16(data[6:8], 0x0001)
+	binary.BigEndian.PutUint16(data[8:10], 1)
+	binary.BigEndian.PutUint16(data[10:12], 12)
+	binary.BigEndian.PutUint16(data[12:14], 1)
+	binary.BigEndian.PutUint16(data[14:16], 21)
+	binary.BigEndian.PutUint16(data[16:18], uint16(0xffce))
+	binary.BigEndian.PutUint16(data[18:20], 15)
+	putCoverageFormat1(data, 24, 20)
+
+	gpos := &GPOS{Data: data, GDEF: makeTestGDEFWithMarks(500)}
+	lookup := &LookupTable{
+		Type:            2,
+		Flag:            lookupFlagIgnoreMarks,
+		SubtableOffsets: []uint16{0},
+	}
+	adjustments := make([]api.Vector, 3)
+
+	gpos.applyLookup(lookup, []int{20, 500, 21}, adjustments)
+
+	if adjustments[0].X != -50 {
+		t.Fatalf("expected first pair glyph X adjustment -50, got %d", adjustments[0].X)
+	}
+	if adjustments[1] != (api.Vector{}) {
+		t.Fatalf("expected ignored mark adjustment to remain zero, got %+v", adjustments[1])
+	}
+	if adjustments[2].X != 15 {
+		t.Fatalf("expected second pair glyph X adjustment 15, got %d", adjustments[2].X)
 	}
 }
 
@@ -519,6 +724,140 @@ func TestGSUB_ChainedContextFormat3AppliesLigatureAtSequenceIndex(t *testing.T) 
 	}
 }
 
+func TestGSUB_ContextFormat1SubRuleAppliesAtSequenceIndex(t *testing.T) {
+	data := makeGSUBContextTestData(180)
+
+	putLookupList(data, 40, 46, 120)
+	putLookupTable(data, 46, 5, 54)
+
+	// ContextSubst format 1 at 54: match 10,11,12 and substitute sequence index 2.
+	binary.BigEndian.PutUint16(data[54:56], 1)
+	binary.BigEndian.PutUint16(data[56:58], 36) // Coverage at 90.
+	binary.BigEndian.PutUint16(data[58:60], 1)
+	binary.BigEndian.PutUint16(data[60:62], 8) // SubRuleSet at 62.
+	binary.BigEndian.PutUint16(data[62:64], 1)
+	binary.BigEndian.PutUint16(data[64:66], 4) // SubRule at 66.
+	binary.BigEndian.PutUint16(data[66:68], 3)
+	binary.BigEndian.PutUint16(data[68:70], 1)
+	binary.BigEndian.PutUint16(data[70:72], 11)
+	binary.BigEndian.PutUint16(data[72:74], 12)
+	binary.BigEndian.PutUint16(data[74:76], 2)
+	binary.BigEndian.PutUint16(data[76:78], 1)
+	putCoverageFormat1(data, 90, 10)
+
+	putSingleSubstDeltaLookup(data, 120, 128, 12, 100)
+
+	gsub, err := ParseGSUB(data)
+	if err != nil {
+		t.Fatalf("ParseGSUB failed: %v", err)
+	}
+
+	got := gsub.Substitute([]int{10, 11, 12, 10, 11, 13, 12})
+	assertGlyphs(t, got, []int{10, 11, 112, 10, 11, 13, 12})
+}
+
+func TestGSUB_ContextFormat2ClassRuleAppliesAtSequenceIndex(t *testing.T) {
+	data := makeGSUBContextTestData(220)
+
+	putLookupList(data, 40, 46, 150)
+	putLookupTable(data, 46, 5, 54)
+
+	// ContextSubst format 2 at 54: first glyph class 1, then classes 2 and 3.
+	binary.BigEndian.PutUint16(data[54:56], 2)
+	binary.BigEndian.PutUint16(data[56:58], 36) // Coverage at 90.
+	binary.BigEndian.PutUint16(data[58:60], 44) // ClassDef at 98.
+	binary.BigEndian.PutUint16(data[60:62], 2)
+	binary.BigEndian.PutUint16(data[62:64], 0)
+	binary.BigEndian.PutUint16(data[64:66], 12) // SubClassSet for class 1 at 66.
+	binary.BigEndian.PutUint16(data[66:68], 1)
+	binary.BigEndian.PutUint16(data[68:70], 4) // SubClassRule at 70.
+	binary.BigEndian.PutUint16(data[70:72], 3)
+	binary.BigEndian.PutUint16(data[72:74], 1)
+	binary.BigEndian.PutUint16(data[74:76], 2)
+	binary.BigEndian.PutUint16(data[76:78], 3)
+	binary.BigEndian.PutUint16(data[78:80], 2)
+	binary.BigEndian.PutUint16(data[80:82], 1)
+	putCoverageFormat1(data, 90, 20)
+	putClassDefFormat1(data, 98, 20, []uint16{1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 3})
+
+	putSingleSubstDeltaLookup(data, 150, 158, 31, 100)
+
+	gsub, err := ParseGSUB(data)
+	if err != nil {
+		t.Fatalf("ParseGSUB failed: %v", err)
+	}
+
+	got := gsub.Substitute([]int{20, 30, 31, 20, 30, 32, 31})
+	assertGlyphs(t, got, []int{20, 30, 131, 20, 30, 32, 31})
+}
+
+func TestGSUB_ChainedContextFormat2ClassRuleUsesBacktrackAndLookahead(t *testing.T) {
+	data := makeGSUBContextTestData(320)
+
+	putLookupList(data, 40, 46, 260)
+	putLookupTable(data, 46, 6, 54)
+
+	// ChainedContextSubst format 2 at 54: backtrack class 1, input class 2,
+	// lookahead class 3, then substitute the input glyph.
+	binary.BigEndian.PutUint16(data[54:56], 2)
+	binary.BigEndian.PutUint16(data[56:58], 106) // Coverage at 160.
+	binary.BigEndian.PutUint16(data[58:60], 116) // Backtrack ClassDef at 170.
+	binary.BigEndian.PutUint16(data[60:62], 130) // Input ClassDef at 184.
+	binary.BigEndian.PutUint16(data[62:64], 144) // Lookahead ClassDef at 198.
+	binary.BigEndian.PutUint16(data[64:66], 3)
+	binary.BigEndian.PutUint16(data[66:68], 0)
+	binary.BigEndian.PutUint16(data[68:70], 0)
+	binary.BigEndian.PutUint16(data[70:72], 26) // ClassSet for input class 2 at 80.
+
+	binary.BigEndian.PutUint16(data[80:82], 1)
+	binary.BigEndian.PutUint16(data[82:84], 4) // ChainSubClassRule at 84.
+	binary.BigEndian.PutUint16(data[84:86], 1)
+	binary.BigEndian.PutUint16(data[86:88], 1)
+	binary.BigEndian.PutUint16(data[88:90], 1)
+	binary.BigEndian.PutUint16(data[90:92], 1)
+	binary.BigEndian.PutUint16(data[92:94], 3)
+	binary.BigEndian.PutUint16(data[94:96], 1)
+	binary.BigEndian.PutUint16(data[96:98], 0)
+	binary.BigEndian.PutUint16(data[98:100], 1)
+
+	putCoverageFormat1(data, 160, 40)
+	putClassDefFormat1(data, 170, 10, []uint16{1})
+	putClassDefFormat1(data, 184, 40, []uint16{2})
+	putClassDefFormat1(data, 198, 60, []uint16{3, 0})
+	putSingleSubstDeltaLookup(data, 260, 268, 40, 100)
+
+	gsub, err := ParseGSUB(data)
+	if err != nil {
+		t.Fatalf("ParseGSUB failed: %v", err)
+	}
+
+	got := gsub.Substitute([]int{10, 40, 60, 40, 60, 10, 40, 61})
+	assertGlyphs(t, got, []int{10, 140, 60, 40, 60, 10, 40, 61})
+}
+
+func TestGSUB_ReverseChainingContextSingleSubst(t *testing.T) {
+	data := make([]byte, 48)
+
+	// ReverseChainSingleSubst format 1 at 0:
+	// replace glyph 50 with 200 only between backtrack 40 and lookahead 60.
+	binary.BigEndian.PutUint16(data[0:2], 1)
+	binary.BigEndian.PutUint16(data[2:4], 20)
+	binary.BigEndian.PutUint16(data[4:6], 1)
+	binary.BigEndian.PutUint16(data[6:8], 26)
+	binary.BigEndian.PutUint16(data[8:10], 1)
+	binary.BigEndian.PutUint16(data[10:12], 32)
+	binary.BigEndian.PutUint16(data[12:14], 1)
+	binary.BigEndian.PutUint16(data[14:16], 200)
+	putCoverageFormat1(data, 20, 50)
+	putCoverageFormat1(data, 26, 40)
+	putCoverageFormat1(data, 32, 60)
+
+	gsub := &GSUB{Data: data}
+	lookup := &LookupTable{Type: 8, SubtableOffsets: []uint16{0}}
+	got := gsub.applyLookup(lookup, []int{40, 50, 60, 41, 50, 60})
+	assertGlyphs(t, got, []int{40, 200, 60, 41, 50, 60})
+}
+
 func TestGPOS_SinglePosFormat2MalformedValueRecordsDoesNotPanic(t *testing.T) {
 	data := make([]byte, 14)
 
@@ -546,5 +885,113 @@ func TestGPOS_SinglePosFormat2MalformedValueRecordsDoesNotPanic(t *testing.T) {
 	gpos.applySinglePos(lookup, []int{5}, adjustments)
 	if adjustments[0] != (api.Vector{}) {
 		t.Fatalf("expected no adjustment for malformed table, got %+v", adjustments[0])
+	}
+}
+
+func makeGSUBContextTestData(size int) []byte {
+	data := make([]byte, size)
+	binary.BigEndian.PutUint16(data[0:2], 1)
+	binary.BigEndian.PutUint16(data[2:4], 0)
+	binary.BigEndian.PutUint16(data[4:6], 10)
+	binary.BigEndian.PutUint16(data[6:8], 20)
+	binary.BigEndian.PutUint16(data[8:10], 40)
+	binary.BigEndian.PutUint16(data[10:12], 0)
+	putFeatureListWithLookup0(data, 20)
+	return data
+}
+
+func putFeatureListWithLookup0(data []byte, offset int) {
+	binary.BigEndian.PutUint16(data[offset:offset+2], 1)
+	binary.BigEndian.PutUint32(data[offset+2:offset+6], 0x74657374)
+	binary.BigEndian.PutUint16(data[offset+6:offset+8], 8)
+	featureOffset := offset + 8
+	binary.BigEndian.PutUint16(data[featureOffset:featureOffset+2], 0)
+	binary.BigEndian.PutUint16(data[featureOffset+2:featureOffset+4], 1)
+	binary.BigEndian.PutUint16(data[featureOffset+4:featureOffset+6], 0)
+}
+
+func putLookupList(data []byte, offset int, lookupOffsets ...int) {
+	binary.BigEndian.PutUint16(data[offset:offset+2], uint16(len(lookupOffsets)))
+	for i, lookupOffset := range lookupOffsets {
+		binary.BigEndian.PutUint16(data[offset+2+i*2:offset+4+i*2], uint16(lookupOffset-offset))
+	}
+}
+
+func putLookupTable(data []byte, offset int, lookupType uint16, subtableOffset int) {
+	binary.BigEndian.PutUint16(data[offset:offset+2], lookupType)
+	binary.BigEndian.PutUint16(data[offset+2:offset+4], 0)
+	binary.BigEndian.PutUint16(data[offset+4:offset+6], 1)
+	binary.BigEndian.PutUint16(data[offset+6:offset+8], uint16(subtableOffset-offset))
+}
+
+func putSingleSubstDeltaLookup(data []byte, lookupOffset int, subtableOffset int, glyph uint16, delta uint16) {
+	putLookupTable(data, lookupOffset, 1, subtableOffset)
+	binary.BigEndian.PutUint16(data[subtableOffset:subtableOffset+2], 1)
+	binary.BigEndian.PutUint16(data[subtableOffset+2:subtableOffset+4], 6)
+	binary.BigEndian.PutUint16(data[subtableOffset+4:subtableOffset+6], delta)
+	putCoverageFormat1(data, subtableOffset+6, glyph)
+}
+
+func putCoverageFormat1(data []byte, offset int, glyphs ...uint16) {
+	binary.BigEndian.PutUint16(data[offset:offset+2], 1)
+	binary.BigEndian.PutUint16(data[offset+2:offset+4], uint16(len(glyphs)))
+	for i, glyph := range glyphs {
+		binary.BigEndian.PutUint16(data[offset+4+i*2:offset+6+i*2], glyph)
+	}
+}
+
+func putClassDefFormat1(data []byte, offset int, startGlyph uint16, classes []uint16) {
+	binary.BigEndian.PutUint16(data[offset:offset+2], 1)
+	binary.BigEndian.PutUint16(data[offset+2:offset+4], startGlyph)
+	binary.BigEndian.PutUint16(data[offset+4:offset+6], uint16(len(classes)))
+	for i, class := range classes {
+		binary.BigEndian.PutUint16(data[offset+6+i*2:offset+8+i*2], class)
+	}
+}
+
+func assertGlyphs(t *testing.T, got []int, want []int) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("expected glyphs %v, got %v", want, got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("expected glyphs %v, got %v", want, got)
+		}
+	}
+}
+
+func makeTestGDEFWithMarks(glyphs ...uint16) *GDEF {
+	ranges := make([]ClassRangeRecord, len(glyphs))
+	for i, glyph := range glyphs {
+		ranges[i] = ClassRangeRecord{
+			Start: glyph,
+			End:   glyph,
+			Class: gdefGlyphClassMark,
+		}
+	}
+	return &GDEF{
+		GlyphClassDef: &ClassDefFormat2{Ranges: ranges},
+	}
+}
+
+func makeTestGDEFWithMarkAttachment(classes map[uint16]uint16) *GDEF {
+	glyphRanges := make([]ClassRangeRecord, 0, len(classes))
+	attachRanges := make([]ClassRangeRecord, 0, len(classes))
+	for glyph, class := range classes {
+		glyphRanges = append(glyphRanges, ClassRangeRecord{
+			Start: glyph,
+			End:   glyph,
+			Class: gdefGlyphClassMark,
+		})
+		attachRanges = append(attachRanges, ClassRangeRecord{
+			Start: glyph,
+			End:   glyph,
+			Class: class,
+		})
+	}
+	return &GDEF{
+		GlyphClassDef:      &ClassDefFormat2{Ranges: glyphRanges},
+		MarkAttachClassDef: &ClassDefFormat2{Ranges: attachRanges},
 	}
 }

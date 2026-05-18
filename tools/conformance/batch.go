@@ -17,15 +17,16 @@ type batchOptions struct {
 	OutputDir    string
 	OutputSuffix string
 
-	FontPath       string
-	Corpus         string
-	FaceIndex      int
-	PPEMList       string
-	GlyphList      string
-	CharList       string
-	LoadFlagList   string
-	RenderModeList string
-	visited        map[string]bool
+	FontPath            string
+	Corpus              string
+	FaceIndex           int
+	PPEMList            string
+	GlyphList           string
+	CharList            string
+	LoadFlagList        string
+	RenderModeList      string
+	IncludeBitmapBuffer bool
+	visited             map[string]bool
 }
 
 type batchCompareOptions struct {
@@ -35,6 +36,26 @@ type batchCompareOptions struct {
 	ReferenceSuffix string
 	CandidateSuffix string
 	Compare         compareOptions
+}
+
+type batchCompareSummary struct {
+	Requests            int
+	Clean               int
+	ExpectedGap         int
+	Mismatched          int
+	ReadErrors          int
+	Diffs               int
+	ExpectedDiffs       int
+	UnexpectedDiffs     int
+	StaleExpectedGaps   int
+	ExpectedKinds       map[string]int
+	UnexpectedKinds     map[string]int
+	UnexpectedSizeKeys  map[string]int
+	UnexpectedLoadFlags map[string]int
+	RenderDetails       map[string]int
+	MetricDetails       map[string]metricDeltaStats
+	OutlinePointTags    outlinePointTagSummary
+	StaleKinds          map[string]int
 }
 
 type stringValues []string
@@ -94,43 +115,80 @@ func runBatchCompareCommand(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 
-	diffFailures := 0
-	readFailures := 0
+	summary := newBatchCompareSummary(len(opts.Requests))
 	for i, requestPath := range opts.Requests {
 		refPath := batchOutputPath(opts.ReferenceDir, requestPath, opts.ReferenceSuffix)
 		candPath := batchOutputPath(opts.CandidateDir, requestPath, opts.CandidateSuffix)
 		fmt.Fprintf(stdout, "[%d/%d] %s\n", i+1, len(opts.Requests), requestPath)
 
+		request, err := readDumpRequest(requestPath)
+		if err != nil {
+			summary.ReadErrors++
+			fmt.Fprintf(stdout, "  FAIL: read request %s: %v\n", requestPath, err)
+			continue
+		}
+		compareOpts := opts.Compare
+		compareOpts.ExpectedGaps = append(append([]ExpectedGap(nil), opts.Compare.ExpectedGaps...), request.ExpectedGaps...)
+
 		reference, err := readDump(refPath)
 		if err != nil {
-			readFailures++
+			summary.ReadErrors++
 			fmt.Fprintf(stdout, "  FAIL: read reference %s: %v\n", refPath, err)
 			continue
 		}
 		candidate, err := readDump(candPath)
 		if err != nil {
-			readFailures++
+			summary.ReadErrors++
 			fmt.Fprintf(stdout, "  FAIL: read candidate %s: %v\n", candPath, err)
 			continue
 		}
 
-		diffs := compareDumps(reference, candidate, opts.Compare)
+		diffs := compareDumps(reference, candidate, compareOpts)
+		gaps := expectedGapsForCompare(reference, candidate, compareOpts)
+		stale := staleExpectedGaps(expectedGapUsage(diffs, gaps))
+		summary.StaleExpectedGaps += len(stale)
+		addBatchStaleKinds(summary, stale)
 		if len(diffs) == 0 {
+			summary.Clean++
 			fmt.Fprintln(stdout, "  PASS")
+			printStaleExpectedGaps(stdout, stale, "  ", compareOpts.MaxDiffs)
 			continue
 		}
-		diffFailures++
-		fmt.Fprintf(stdout, "  FAIL (%d diffs)\n", len(diffs))
-		printKnownGapSummary(stdout, diffs, "  ")
-		printDiffList(stdout, diffs, opts.Compare.MaxDiffs, "  ")
+		expected, unexpected := splitExpectedDiffs(diffs, gaps)
+		addBatchDiffSummary(summary, diffs, expected, unexpected)
+		if len(unexpected) == 0 && compareOpts.AcceptExpectedGaps {
+			summary.ExpectedGap++
+			fmt.Fprintf(stdout, "  PASS with expected gaps (%d diffs)\n", len(expected))
+			printExpectedGapSummary(stdout, expected, "  ")
+			printRenderMismatchSummary(stdout, expected, "  ")
+			printMetricDeltaSummary(stdout, expected, "  ")
+			printOutlinePointTagSummary(stdout, expected, "  ")
+			printDiffList(stdout, expected, compareOpts.MaxDiffs, "  ")
+			printStaleExpectedGaps(stdout, stale, "  ", compareOpts.MaxDiffs)
+			continue
+		}
+		summary.Mismatched++
+		printCompareFailure(stdout, "", diffs, expected, unexpected, compareOpts, "  ")
+		printStaleExpectedGaps(stdout, stale, "  ", compareOpts.MaxDiffs)
 	}
 
+	printBatchCompareSummary(stdout, summary)
+
 	switch {
-	case readFailures > 0:
-		return fmt.Errorf("conformance batch compare failed: %d read errors, %d mismatched requests", readFailures, diffFailures)
-	case diffFailures > 0:
+	case summary.ReadErrors > 0:
+		fmt.Fprintf(stdout, "conformance batch compare: FAIL (%d requests: %d passed, %d expected-gap, %d mismatched, %d read errors)\n", len(opts.Requests), summary.Clean, summary.ExpectedGap, summary.Mismatched, summary.ReadErrors)
+		return fmt.Errorf("conformance batch compare failed: %d read errors, %d mismatched requests", summary.ReadErrors, summary.Mismatched)
+	case summary.Mismatched > 0:
+		fmt.Fprintf(stdout, "conformance batch compare: FAIL (%d requests: %d passed, %d expected-gap, %d mismatched)\n", len(opts.Requests), summary.Clean, summary.ExpectedGap, summary.Mismatched)
+		return errComparisonFailed
+	case summary.StaleExpectedGaps > 0 && opts.Compare.FailStaleExpectedGaps:
+		fmt.Fprintf(stdout, "conformance batch compare: FAIL (%d requests: %d stale expected gaps)\n", len(opts.Requests), summary.StaleExpectedGaps)
 		return errComparisonFailed
 	default:
+		if summary.ExpectedGap > 0 || summary.StaleExpectedGaps > 0 {
+			fmt.Fprintf(stdout, "conformance batch compare: PASS (%d requests: %d clean, %d expected-gap, %d stale expected gaps)\n", len(opts.Requests), summary.Clean, summary.ExpectedGap, summary.StaleExpectedGaps)
+			return nil
+		}
 		fmt.Fprintf(stdout, "conformance batch compare: PASS (%d requests)\n", len(opts.Requests))
 		return nil
 	}
@@ -158,6 +216,7 @@ func parseBatchOptions(args []string, output io.Writer) (batchOptions, error) {
 	fs.StringVar(&opts.CharList, "chars", "", "optional char override for every request")
 	fs.StringVar(&opts.LoadFlagList, "load-flags", "", "optional load flag override for every request")
 	fs.StringVar(&opts.RenderModeList, "render-mode", "", "optional render mode override for every request")
+	fs.BoolVar(&opts.IncludeBitmapBuffer, "include-bitmap-buffer", false, "include raw bitmap buffers as hex for byte-level comparison diagnostics")
 
 	if err := fs.Parse(args); err != nil {
 		return opts, err
@@ -209,6 +268,8 @@ func parseBatchCompareOptions(args []string, output io.Writer) (batchCompareOpti
 	fs.Int64Var(&opts.Compare.PointTolerance, "point-tolerance", 0, "allowed absolute 26.6 outline point delta")
 	fs.BoolVar(&opts.Compare.AllowMissingBitmap, "allow-missing-bitmap", false, "do not fail when only one dump has bitmap data")
 	fs.BoolVar(&opts.Compare.AllowMissingSlotMetrics, "allow-missing-slot-metrics", false, "do not fail when only one dump has rich glyph slot metrics")
+	fs.BoolVar(&opts.Compare.AcceptExpectedGaps, "accept-expected-gaps", false, "treat request/dump expected_gaps annotations as passable known gaps")
+	fs.BoolVar(&opts.Compare.FailStaleExpectedGaps, "fail-stale-expected-gaps", false, "fail when an expected_gaps entry matches no current diff")
 	fs.IntVar(&opts.Compare.MaxDiffs, "max-diffs", 50, "maximum diffs to print per request")
 
 	if err := fs.Parse(args); err != nil {
@@ -238,6 +299,161 @@ func parseBatchCompareOptions(args []string, output io.Writer) (batchCompareOpti
 	return opts, nil
 }
 
+func newBatchCompareSummary(requests int) *batchCompareSummary {
+	return &batchCompareSummary{
+		Requests:            requests,
+		ExpectedKinds:       make(map[string]int),
+		UnexpectedKinds:     make(map[string]int),
+		UnexpectedSizeKeys:  make(map[string]int),
+		UnexpectedLoadFlags: make(map[string]int),
+		RenderDetails:       make(map[string]int),
+		MetricDetails:       make(map[string]metricDeltaStats),
+		OutlinePointTags:    newOutlinePointTagSummary(),
+		StaleKinds:          make(map[string]int),
+	}
+}
+
+func addBatchDiffSummary(summary *batchCompareSummary, diffs, expected, unexpected []comparisonDiff) {
+	summary.Diffs += len(diffs)
+	summary.ExpectedDiffs += len(expected)
+	summary.UnexpectedDiffs += len(unexpected)
+	addDiffKindCounts(summary.ExpectedKinds, expected)
+	addDiffKindCounts(summary.UnexpectedKinds, unexpected)
+	addDiffSizeKeyCounts(summary.UnexpectedSizeKeys, unexpected)
+	addDiffLoadFlagCounts(summary.UnexpectedLoadFlags, unexpected)
+	for _, diff := range diffs {
+		detail := renderMismatchDetail(diff.Path)
+		if detail != "" && diff.Kind != "" {
+			summary.RenderDetails[detail]++
+		}
+	}
+	addMetricDeltaStats(summary.MetricDetails, diffs)
+	addOutlinePointTagStats(&summary.OutlinePointTags, diffs)
+}
+
+func addDiffKindCounts(counts map[string]int, diffs []comparisonDiff) {
+	for _, diff := range diffs {
+		kind := diff.Kind
+		if kind == "" {
+			kind = "unclassified"
+		}
+		counts[kind]++
+	}
+}
+
+func addDiffSizeKeyCounts(counts map[string]int, diffs []comparisonDiff) {
+	for _, diff := range diffs {
+		key := diffSizeKey(diff.Path)
+		if key == "" {
+			continue
+		}
+		counts[key]++
+	}
+}
+
+func addDiffLoadFlagCounts(counts map[string]int, diffs []comparisonDiff) {
+	for _, diff := range diffs {
+		loadFlags := diffLoadFlags(diff.Path)
+		if loadFlags == "" {
+			continue
+		}
+		counts[loadFlags]++
+	}
+}
+
+func addBatchStaleKinds(summary *batchCompareSummary, gaps []ExpectedGap) {
+	for _, gap := range gaps {
+		kind := strings.TrimSpace(gap.Kind)
+		if kind == "" {
+			kind = "path-only expected gap"
+		}
+		summary.StaleKinds[kind]++
+	}
+}
+
+func printBatchCompareSummary(w io.Writer, summary *batchCompareSummary) {
+	fmt.Fprintf(w, "conformance batch summary: %d requests, %d clean, %d expected-gap, %d mismatched, %d read errors, %d diffs (%d expected, %d unexpected), %d stale expected gaps\n",
+		summary.Requests,
+		summary.Clean,
+		summary.ExpectedGap,
+		summary.Mismatched,
+		summary.ReadErrors,
+		summary.Diffs,
+		summary.ExpectedDiffs,
+		summary.UnexpectedDiffs,
+		summary.StaleExpectedGaps,
+	)
+	printCountMap(w, "  expected gap diff kinds", summary.ExpectedKinds)
+	printCountMap(w, "  unexpected diff kinds", summary.UnexpectedKinds)
+	printCountMapByCount(w, "  unexpected diff size/load/render keys", summary.UnexpectedSizeKeys)
+	printCountMapByCount(w, "  unexpected diff load flags", summary.UnexpectedLoadFlags)
+	printCountMap(w, "  render mismatch details", summary.RenderDetails)
+	printMetricDeltaStats(w, "metric delta details", summary.MetricDetails, "  ")
+	printOutlinePointTagStats(w, "outline point/tag details", summary.OutlinePointTags, "  ")
+	printCountMap(w, "  stale expected gap kinds", summary.StaleKinds)
+}
+
+func printCountMap(w io.Writer, label string, counts map[string]int) {
+	if len(counts) == 0 {
+		return
+	}
+	fmt.Fprintf(w, "%s:\n", label)
+	keys := make([]string, 0, len(counts))
+	for key := range counts {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		fmt.Fprintf(w, "  - %s: %d\n", key, counts[key])
+	}
+}
+
+func printCountMapByCount(w io.Writer, label string, counts map[string]int) {
+	if len(counts) == 0 {
+		return
+	}
+	fmt.Fprintf(w, "%s:\n", label)
+	keys := make([]string, 0, len(counts))
+	for key := range counts {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if counts[keys[i]] == counts[keys[j]] {
+			return keys[i] < keys[j]
+		}
+		return counts[keys[i]] > counts[keys[j]]
+	})
+	for _, key := range keys {
+		fmt.Fprintf(w, "  - %s: %d\n", key, counts[key])
+	}
+}
+
+func diffSizeKey(path string) string {
+	const prefix = "sizes["
+	start := strings.Index(path, prefix)
+	if start < 0 {
+		return ""
+	}
+	start += len(prefix)
+	end := strings.IndexByte(path[start:], ']')
+	if end < 0 {
+		return ""
+	}
+	return path[start : start+end]
+}
+
+func diffLoadFlags(path string) string {
+	key := diffSizeKey(path)
+	if key == "" {
+		return ""
+	}
+	parts := strings.Split(key, "/")
+	if len(parts) < 2 {
+		return ""
+	}
+	return parts[1]
+}
+
 func buildBatchDump(opts batchOptions, requestPath, outputPath string, output io.Writer) (*Dump, error) {
 	dumpArgs := []string{"-request", requestPath, "-out", outputPath}
 	dumpArgs = appendBatchDumpOverride(dumpArgs, opts, "font", opts.FontPath)
@@ -250,6 +466,9 @@ func buildBatchDump(opts batchOptions, requestPath, outputPath string, output io
 	dumpArgs = appendBatchDumpOverride(dumpArgs, opts, "chars", opts.CharList)
 	dumpArgs = appendBatchDumpOverride(dumpArgs, opts, "load-flags", opts.LoadFlagList)
 	dumpArgs = appendBatchDumpOverride(dumpArgs, opts, "render-mode", opts.RenderModeList)
+	if opts.visited["include-bitmap-buffer"] {
+		dumpArgs = append(dumpArgs, fmt.Sprintf("-include-bitmap-buffer=%t", opts.IncludeBitmapBuffer))
+	}
 
 	parsed, err := parseDumpOptions(opts.Engine, dumpArgs, output)
 	if err != nil {

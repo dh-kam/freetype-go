@@ -9,6 +9,7 @@ import (
 
 	"github.com/dh-kam/freetype-go/api"
 	"github.com/dh-kam/freetype-go/core"
+	ftvar "github.com/dh-kam/freetype-go/var"
 )
 
 func TestLoadFace(t *testing.T) {
@@ -267,6 +268,159 @@ func TestSetPixelSizesScalesCVTAndRunsPrep(t *testing.T) {
 	}
 }
 
+func TestSetPixelSizesAppliesCvarBeforeScaling(t *testing.T) {
+	cvar, err := ftvar.ParseCvar(&mockStream{data: buildCvarOneAxisDeltaTable(50)}, 1)
+	if err != nil {
+		t.Fatalf("ParseCvar failed: %v", err)
+	}
+	ve := ftvar.NewVariationEngine(&ftvar.FvarTable{
+		Axes: []ftvar.AxisRecord{{Tag: stringToTag("wght"), MinValue: -1 << 16, MaxValue: 1 << 16}},
+	}, nil, nil, nil)
+	ve.SetCvar(cvar)
+	ve.SetNormalizedCoordinates([]float32{1})
+
+	f := &Face{
+		head:      HeadTable{UnitsPerEm: 1000},
+		maxp:      MaxpTable{MaxStackElements: 8, MaxStorage: 1},
+		cvt:       []int32{100},
+		funcs:     make(map[int32][]byte),
+		instrs:    make(map[int32][]byte),
+		varEngine: ve,
+	}
+
+	if err := f.SetPixelSizes(20, 20); err != nil {
+		t.Fatalf("SetPixelSizes failed: %v", err)
+	}
+	if got, want := f.scaledCVT[0], int32(192); got != want {
+		t.Fatalf("cvar-adjusted scaled CVT[0] = %d, want %d", got, want)
+	}
+
+	if err := f.SetVariationNormalizedCoordinates([]float32{0}); err != nil {
+		t.Fatalf("reset variation coordinates failed: %v", err)
+	}
+	if got, want := f.scaledCVT[0], int32(128); got != want {
+		t.Fatalf("reset scaled CVT[0] = %d, want %d", got, want)
+	}
+}
+
+func TestLoadFaceParsesGDEFAndLinksLayoutTables(t *testing.T) {
+	head := make([]byte, 54)
+	binary.BigEndian.PutUint16(head[18:20], 1000)
+
+	maxp := make([]byte, 6)
+	binary.BigEndian.PutUint16(maxp[4:6], 1)
+
+	gdef := make([]byte, 12)
+	binary.BigEndian.PutUint16(gdef[0:2], 1)
+
+	loaded, err := NewLoader(&mockSystem{}).LoadFace(&mockStream{data: buildSFNTTestData(t, []sfntTestTable{
+		{tag: "head", data: head},
+		{tag: "maxp", data: maxp},
+		{tag: "GDEF", data: gdef},
+		{tag: "GSUB", data: buildMinimalOpenTypeLayoutTable(1)},
+		{tag: "GPOS", data: buildMinimalOpenTypeLayoutTable(2)},
+	})})
+	if err != nil {
+		t.Fatalf("LoadFace failed: %v", err)
+	}
+
+	face := loaded.(*Face)
+	if face.gdef == nil {
+		t.Fatalf("GDEF was not parsed")
+	}
+	if face.gsub == nil {
+		t.Fatalf("GSUB was not parsed")
+	}
+	if face.gsub.GDEF != face.gdef {
+		t.Fatalf("GSUB GDEF link = %p, want %p", face.gsub.GDEF, face.gdef)
+	}
+	if face.gpos == nil {
+		t.Fatalf("GPOS was not parsed")
+	}
+	if face.gpos.GDEF != face.gdef {
+		t.Fatalf("GPOS GDEF link = %p, want %p", face.gpos.GDEF, face.gdef)
+	}
+}
+
+func buildMinimalOpenTypeLayoutTable(lookupType uint16) []byte {
+	data := make([]byte, 24)
+	binary.BigEndian.PutUint16(data[0:2], 1)
+	binary.BigEndian.PutUint16(data[4:6], 10)
+	binary.BigEndian.PutUint16(data[6:8], 12)
+	binary.BigEndian.PutUint16(data[8:10], 14)
+	binary.BigEndian.PutUint16(data[14:16], 1)
+	binary.BigEndian.PutUint16(data[16:18], 4)
+	binary.BigEndian.PutUint16(data[18:20], lookupType)
+	return data
+}
+
+func TestCFF2LoadGlyphUsesSFNTVariationCoordinates(t *testing.T) {
+	head := make([]byte, 54)
+	binary.BigEndian.PutUint16(head[18:20], 1000)
+
+	maxp := make([]byte, 6)
+	binary.BigEndian.PutUint32(maxp[0:4], 0x00005000)
+	binary.BigEndian.PutUint16(maxp[4:6], 2)
+
+	loaded, err := NewLoader(&mockSystem{}).LoadFace(&mockStream{data: buildSFNTTestData(t, []sfntTestTable{
+		{tag: "head", data: head},
+		{tag: "maxp", data: maxp},
+		{tag: "fvar", data: buildFvarOneAxisTable()},
+		{tag: "CFF2", data: buildCFF2VariationTestTable()},
+	})})
+	if err != nil {
+		t.Fatalf("LoadFace failed: %v", err)
+	}
+	face := loaded.(*Face)
+	if face.cff == nil || face.cff.Major != 2 {
+		t.Fatalf("CFF2 table was not parsed")
+	}
+
+	slot, err := face.LoadGlyph(1, api.LoadNoScale)
+	if err != nil {
+		t.Fatalf("LoadGlyph default coordinates failed: %v", err)
+	}
+	assertSlotPoint(t, slot, 0, 10<<6, 20<<6)
+
+	if err := face.SetVariationNormalizedCoordinates([]float32{1}); err != nil {
+		t.Fatalf("SetVariationNormalizedCoordinates failed: %v", err)
+	}
+	slot, err = face.LoadGlyph(1, api.LoadNoScale)
+	if err != nil {
+		t.Fatalf("LoadGlyph varied coordinates failed: %v", err)
+	}
+	assertSlotPoint(t, slot, 0, 15<<6, 17<<6)
+}
+
+func assertSlotPoint(t *testing.T, slot api.GlyphSlot, index int, x, y int32) {
+	t.Helper()
+	points := slot.GetOutline().GetPoints()
+	if index >= len(points) {
+		t.Fatalf("point %d missing; outline has %d points", index, len(points))
+	}
+	if points[index].X != x || points[index].Y != y {
+		t.Fatalf("point %d = (%d,%d), want (%d,%d)", index, points[index].X, points[index].Y, x, y)
+	}
+}
+
+func TestSetPixelSizesPassesUnitsPerEmToPrepVM(t *testing.T) {
+	f := &Face{
+		head:   HeadTable{UnitsPerEm: 1000},
+		maxp:   MaxpTable{MaxStackElements: 8, MaxStorage: 1},
+		cvt:    []int32{0},
+		prep:   []byte{0xB0, 0, 0xB0, 100, 0x70}, // PUSHB 0; PUSHB 100; WCVTF
+		funcs:  make(map[int32][]byte),
+		instrs: make(map[int32][]byte),
+	}
+
+	if err := f.SetPixelSizes(20, 20); err != nil {
+		t.Fatalf("SetPixelSizes failed: %v", err)
+	}
+	if got, want := f.scaledCVT[0], int32(128); got != want {
+		t.Fatalf("prep WCVTF CVT[0] = %d, want %d", got, want)
+	}
+}
+
 func TestSizeScalesMetricsAndOutline(t *testing.T) {
 	f := &Face{
 		head: HeadTable{UnitsPerEm: 1000},
@@ -303,6 +457,117 @@ func TestSizeScalesMetricsAndOutline(t *testing.T) {
 	}
 	if got, want := outline.Points[1], (api.Vector{X: 2 << 6, Y: 1 << 6}); got != want {
 		t.Fatalf("point 1: got %+v, want %+v", got, want)
+	}
+}
+
+func TestLoadedFaceSetPixelSizesRescalesGlyphMetricsAndOutline(t *testing.T) {
+	glyph := simpleRectGlyphData(50, -100, 550, 700)
+	face := loadGlyphMetricsTestFace(t, []uint32{0, uint32(len(glyph))}, glyph, []metricsGlyph{
+		{advance: 800, lsb: 50},
+	})
+
+	if err := face.SetPixelSizes(20, 40); err != nil {
+		t.Fatalf("SetPixelSizes 20x40 failed: %v", err)
+	}
+	slot, err := face.LoadGlyph(0, api.LoadNoHinting)
+	if err != nil {
+		t.Fatalf("LoadGlyph at 20x40 failed: %v", err)
+	}
+	assertSlotPoint(t, slot, 0, 64, -256)
+	assertSlotPoint(t, slot, 2, 704, 1792)
+
+	advance, lsb, err := face.GetGlyphMetrics(0)
+	if err != nil {
+		t.Fatalf("GetGlyphMetrics at 20x40 failed: %v", err)
+	}
+	if advance != 1024 || lsb != 64 {
+		t.Fatalf("20x40 metrics got advance=%d lsb=%d, want 1024 64", advance, lsb)
+	}
+
+	if err := face.SetPixelSizes(10, 20); err != nil {
+		t.Fatalf("SetPixelSizes 10x20 failed: %v", err)
+	}
+	advance, lsb, err = face.GetGlyphMetrics(0)
+	if err != nil {
+		t.Fatalf("GetGlyphMetrics after resize failed: %v", err)
+	}
+	if advance != 512 || lsb != 32 {
+		t.Fatalf("resized metrics got advance=%d lsb=%d, want 512 32", advance, lsb)
+	}
+
+	slot, err = face.LoadGlyph(0, api.LoadNoHinting)
+	if err != nil {
+		t.Fatalf("LoadGlyph at 10x20 failed: %v", err)
+	}
+	assertSlotPoint(t, slot, 0, 32, -128)
+	assertSlotPoint(t, slot, 2, 352, 896)
+}
+
+func TestLoadGlyphSlotMetricsUseNonSquarePixelScales(t *testing.T) {
+	glyph := simpleRectGlyphData(50, -100, 550, 700)
+	face := loadGlyphMetricsTestFace(t, []uint32{0, uint32(len(glyph))}, glyph, []metricsGlyph{
+		{advance: 800, lsb: 50},
+	})
+	face.vhea.NumOfLongVerMetrics = 1
+	face.vmtx = VmtxTable{VMetrics: []VMetric{{AdvanceHeight: 900, TopSideBearing: 100}}}
+
+	if err := face.SetPixelSizes(20, 40); err != nil {
+		t.Fatalf("SetPixelSizes failed: %v", err)
+	}
+	slot, err := face.LoadGlyph(0, api.LoadNoHinting)
+	if err != nil {
+		t.Fatalf("LoadGlyph failed: %v", err)
+	}
+	metrics, ok := api.GetGlyphSlotMetrics(slot)
+	if !ok {
+		t.Fatal("glyph slot metrics unavailable")
+	}
+
+	want := api.GlyphMetrics{
+		Width:        640,
+		Height:       2048,
+		HoriBearingX: 64,
+		HoriBearingY: 1792,
+		HoriAdvance:  1024,
+		VertBearingX: -448,
+		VertBearingY: 256,
+		VertAdvance:  2304,
+	}
+	if metrics != want {
+		t.Fatalf("non-square slot metrics got %+v, want %+v", metrics, want)
+	}
+}
+
+func TestLoadedFaceSetPixelSizesRerunsPrepBeforeHinting(t *testing.T) {
+	glyph := simpleOnePointGlyphData(50, 20, []byte{
+		0xB0, 0, // PUSHB point 0
+		0xB0, 0, // PUSHB CVT index 0
+		0x3E, // MIAP[0]
+	})
+	prep := []byte{
+		0x00,    // SVTCA[y]
+		0xB0, 0, // PUSHB CVT index 0
+		0xB0, 100, // PUSHB 100 FUnits
+		0x70, // WCVTF
+	}
+	face := loadSingleGlyphProgramFaceWithPrograms(t, glyph, prep, make([]byte, 2))
+
+	for _, tc := range []struct {
+		width int
+		wantX int32
+		wantY int32
+	}{
+		{width: 20, wantX: 64, wantY: 128},
+		{width: 10, wantX: 32, wantY: 64},
+	} {
+		if err := face.SetPixelSizes(tc.width, tc.width); err != nil {
+			t.Fatalf("SetPixelSizes %d failed: %v", tc.width, err)
+		}
+		slot, err := face.LoadGlyph(0, api.LoadTargetMono)
+		if err != nil {
+			t.Fatalf("LoadGlyph at %d ppem failed: %v", tc.width, err)
+		}
+		assertSlotPoint(t, slot, 0, tc.wantX, tc.wantY)
 	}
 }
 
@@ -503,6 +768,144 @@ func loadGlyphMetricsTestFace(t *testing.T, offsets []uint32, glyf []byte, metri
 	return face
 }
 
+func loadCFFSlotMetricsTestFace(t *testing.T) *Face {
+	t.Helper()
+	tables := []sfntTestTable{
+		{tag: "head", data: buildMetricsTestHeadTable()},
+		{tag: "maxp", data: buildMetricsTestMaxpTable(2)},
+		{tag: "hhea", data: buildMetricsTestHheaTable(2)},
+		{tag: "hmtx", data: buildMetricsTestHmtxTable([]metricsGlyph{
+			{advance: 500, lsb: 0},
+			{advance: 300, lsb: 20},
+		})},
+		{tag: "vhea", data: buildMetricsTestVheaTable(2)},
+		{tag: "vmtx", data: buildMetricsTestVmtxTable([]VMetric{
+			{AdvanceHeight: 600, TopSideBearing: 10},
+			{AdvanceHeight: 700, TopSideBearing: 30},
+		})},
+		{tag: "VORG", data: buildMetricsTestVORGTable(880, []VertOriginYMetric{
+			{GlyphIndex: 1, VertOriginY: 900},
+		})},
+		{tag: "CFF2", data: buildCFF2VariationTestTable()},
+	}
+	loaded, err := NewLoader(&mockSystem{}).LoadFace(&mockStream{data: buildSFNTTestData(t, tables)})
+	if err != nil {
+		t.Fatalf("LoadFace failed: %v", err)
+	}
+	return loaded.(*Face)
+}
+
+func buildMetricsTestHeadTable() []byte {
+	data := make([]byte, 54)
+	binary.BigEndian.PutUint32(data[0:4], 0x00010000)
+	binary.BigEndian.PutUint32(data[12:16], 0x5F0F3CF5)
+	binary.BigEndian.PutUint16(data[18:20], 1000)
+	binary.BigEndian.PutUint16(data[50:52], 1)
+	return data
+}
+
+func buildMetricsTestMaxpTable(numGlyphs int) []byte {
+	data := make([]byte, 32)
+	binary.BigEndian.PutUint32(data[0:4], 0x00010000)
+	binary.BigEndian.PutUint16(data[4:6], uint16(numGlyphs))
+	return data
+}
+
+func buildMetricsTestHheaTable(numHMetrics int) []byte {
+	data := make([]byte, 36)
+	binary.BigEndian.PutUint32(data[0:4], 0x00010000)
+	binary.BigEndian.PutUint16(data[34:36], uint16(numHMetrics))
+	return data
+}
+
+func buildMetricsTestHmtxTable(metrics []metricsGlyph) []byte {
+	data := make([]byte, len(metrics)*4)
+	for i, metric := range metrics {
+		binary.BigEndian.PutUint16(data[i*4:i*4+2], metric.advance)
+		binary.BigEndian.PutUint16(data[i*4+2:i*4+4], uint16(metric.lsb))
+	}
+	return data
+}
+
+func buildMetricsTestVheaTable(numVMetrics int) []byte {
+	data := make([]byte, 36)
+	binary.BigEndian.PutUint32(data[0:4], 0x00011000)
+	binary.BigEndian.PutUint16(data[34:36], uint16(numVMetrics))
+	return data
+}
+
+func buildMetricsTestVmtxTable(metrics []VMetric) []byte {
+	data := make([]byte, len(metrics)*4)
+	for i, metric := range metrics {
+		binary.BigEndian.PutUint16(data[i*4:i*4+2], metric.AdvanceHeight)
+		binary.BigEndian.PutUint16(data[i*4+2:i*4+4], uint16(metric.TopSideBearing))
+	}
+	return data
+}
+
+func buildMetricsTestVORGTable(defaultOrigin int16, metrics []VertOriginYMetric) []byte {
+	data := make([]byte, 8+len(metrics)*4)
+	binary.BigEndian.PutUint16(data[0:2], 1)
+	binary.BigEndian.PutUint16(data[2:4], 0)
+	binary.BigEndian.PutUint16(data[4:6], uint16(defaultOrigin))
+	binary.BigEndian.PutUint16(data[6:8], uint16(len(metrics)))
+	for i, metric := range metrics {
+		offset := 8 + i*4
+		binary.BigEndian.PutUint16(data[offset:offset+2], metric.GlyphIndex)
+		binary.BigEndian.PutUint16(data[offset+2:offset+4], uint16(metric.VertOriginY))
+	}
+	return data
+}
+
+func loadSingleGlyphProgramFace(t *testing.T, glyph []byte) *Face {
+	return loadSingleGlyphProgramFaceWithPrograms(t, glyph, nil, make([]byte, 2))
+}
+
+func loadSingleGlyphProgramFaceWithPrograms(t *testing.T, glyph []byte, prep []byte, cvt []byte) *Face {
+	t.Helper()
+
+	head := make([]byte, 54)
+	binary.BigEndian.PutUint16(head[18:20], 1000)
+	binary.BigEndian.PutUint16(head[50:52], 1)
+
+	hhea := make([]byte, 36)
+	binary.BigEndian.PutUint16(hhea[34:36], 1)
+
+	hmtx := make([]byte, 4)
+	binary.BigEndian.PutUint16(hmtx[0:2], 300)
+	binary.BigEndian.PutUint16(hmtx[2:4], 20)
+
+	loca := make([]byte, 8)
+	binary.BigEndian.PutUint32(loca[4:8], uint32(len(glyph)))
+
+	maxp := make([]byte, 32)
+	binary.BigEndian.PutUint32(maxp[0:4], 0x00010000)
+	binary.BigEndian.PutUint16(maxp[4:6], 1)
+
+	tables := []sfntTestTable{
+		{tag: "glyf", data: glyph},
+		{tag: "head", data: head},
+		{tag: "hhea", data: hhea},
+		{tag: "hmtx", data: hmtx},
+		{tag: "loca", data: loca},
+		{tag: "maxp", data: maxp},
+		{tag: "cvt ", data: cvt},
+	}
+	if prep != nil {
+		tables = append(tables, sfntTestTable{tag: "prep", data: prep})
+	}
+
+	loaded, err := NewLoader(&mockSystem{}).LoadFace(&mockStream{data: buildSFNTTestData(t, tables)})
+	if err != nil {
+		t.Fatalf("LoadFace failed: %v", err)
+	}
+	face := loaded.(*Face)
+	if err := face.SetPixelSizes(1000, 1000); err != nil {
+		t.Fatalf("SetPixelSizes failed: %v", err)
+	}
+	return face
+}
+
 func simpleOnePointGlyphData(x, y int16, instructions []byte) []byte {
 	data := make([]byte, 19+len(instructions))
 	binary.BigEndian.PutUint16(data[0:2], 1)
@@ -645,6 +1048,10 @@ func hasNonZeroByte(buf []byte) bool {
 	return false
 }
 
+func testF2Dot14Bits(v float32) uint16 {
+	return uint16(int16(v * 16384))
+}
+
 func buildFvarOneAxisTable() []byte {
 	data := make([]byte, 36)
 	binary.BigEndian.PutUint16(data[0:2], 1)
@@ -658,6 +1065,226 @@ func buildFvarOneAxisTable() []byte {
 	binary.BigEndian.PutUint32(data[20:24], uint32(minValue))
 	binary.BigEndian.PutUint32(data[24:28], 0)
 	binary.BigEndian.PutUint32(data[28:32], uint32(int32(1<<16)))
+	return data
+}
+
+func buildAvarOneAxisHalfToOneTable() []byte {
+	data := make([]byte, 26)
+	binary.BigEndian.PutUint16(data[0:2], 1)
+	binary.BigEndian.PutUint16(data[6:8], 1)
+	binary.BigEndian.PutUint16(data[8:10], 4)
+	offset := 10
+	for _, pair := range [][2]float32{
+		{-1, -1},
+		{0, 0},
+		{0.5, 1},
+		{1, 1},
+	} {
+		binary.BigEndian.PutUint16(data[offset:offset+2], testF2Dot14Bits(pair[0]))
+		binary.BigEndian.PutUint16(data[offset+2:offset+4], testF2Dot14Bits(pair[1]))
+		offset += 4
+	}
+	return data
+}
+
+const (
+	testCFFOpCharStrings    = 17
+	testCFFOpPrivate        = 18
+	testCFFOpVariationStore = 24
+	testCFFOpFDArray        = 12<<8 | 36
+	testCFFOpFDSelect       = 12<<8 | 37
+	testCFFOpPrivateVSIndex = 22
+)
+
+func buildCFF2VariationTestTable() []byte {
+	n := testCFF2CharStringNumber
+	globalSubrs := testCFF2Index32Bytes()
+	charStrings := testCFF2Index32Bytes(
+		[]byte{n(0), n(0), 21, 14},
+		[]byte{n(10), n(20), n(5), n(7), n(-3), n(11), n(2), 16, 21, 14},
+	)
+	fdSelect := []byte{0, 0, 1}
+	private1 := append(testCFF2DictInt32(1), byte(testCFFOpPrivateVSIndex))
+	vstore := testCFF2VariationStoreBytes()
+
+	const topDictSize = 26
+	charStringsOffset := 5 + topDictSize + len(globalSubrs)
+	fdSelectOffset := charStringsOffset + len(charStrings)
+	fdArrayOffset := fdSelectOffset + len(fdSelect)
+
+	fd0 := testCFF2DictEntry(testCFFOpPrivate, 0, 0)
+	fd1Placeholder := testCFF2DictEntry(testCFFOpPrivate, len(private1), 0)
+	fdArrayLen := len(testCFF2Index32Bytes(fd0, fd1Placeholder))
+	private1Offset := fdArrayOffset + fdArrayLen
+	fd1 := testCFF2DictEntry(testCFFOpPrivate, len(private1), private1Offset)
+	fdArray := testCFF2Index32Bytes(fd0, fd1)
+	vstoreOffset := private1Offset + len(private1)
+
+	topDict := make([]byte, 0, topDictSize)
+	topDict = append(topDict, testCFF2DictEntry(testCFFOpCharStrings, charStringsOffset)...)
+	topDict = append(topDict, testCFF2DictEntry(testCFFOpVariationStore, vstoreOffset)...)
+	topDict = append(topDict, testCFF2DictEntry(testCFFOpFDArray, fdArrayOffset)...)
+	topDict = append(topDict, testCFF2DictEntry(testCFFOpFDSelect, fdSelectOffset)...)
+
+	header := []byte{2, 0, 5, 0, topDictSize}
+	data := append([]byte{}, header...)
+	data = append(data, topDict...)
+	data = append(data, globalSubrs...)
+	data = append(data, charStrings...)
+	data = append(data, fdSelect...)
+	data = append(data, fdArray...)
+	data = append(data, private1...)
+	data = append(data, vstore...)
+	return data
+}
+
+func testCFF2CharStringNumber(v int) byte {
+	if v < -107 || v > 107 {
+		panic("test charstring number out of single-byte range")
+	}
+	return byte(v + 139)
+}
+
+func testCFF2Index32Bytes(objects ...[]byte) []byte {
+	total := 0
+	for _, obj := range objects {
+		total += len(obj)
+	}
+	if total > 254 {
+		panic("test INDEX data too large for offSize 1")
+	}
+
+	data := make([]byte, 4, 4+1+len(objects)+1+total)
+	binary.BigEndian.PutUint32(data, uint32(len(objects)))
+	if len(objects) == 0 {
+		return data
+	}
+	data = append(data, 1)
+	next := 1
+	data = append(data, byte(next))
+	for _, obj := range objects {
+		next += len(obj)
+		data = append(data, byte(next))
+	}
+	for _, obj := range objects {
+		data = append(data, obj...)
+	}
+	return data
+}
+
+func testCFF2DictInt32(v int) []byte {
+	return []byte{
+		29,
+		byte(v >> 24),
+		byte(v >> 16),
+		byte(v >> 8),
+		byte(v),
+	}
+}
+
+func testCFF2DictOperator(op int) []byte {
+	if op >= 12<<8 {
+		return []byte{12, byte(op - (12 << 8))}
+	}
+	return []byte{byte(op)}
+}
+
+func testCFF2DictEntry(op int, values ...int) []byte {
+	data := make([]byte, 0, len(values)*5+2)
+	for _, v := range values {
+		data = append(data, testCFF2DictInt32(v)...)
+	}
+	return append(data, testCFF2DictOperator(op)...)
+}
+
+func testCFF2VariationStoreBytes() []byte {
+	itemStore := make([]byte, 0, 50)
+	itemStore = append(itemStore, 0, 1)
+	itemStore = append(itemStore, 0, 0, 0, 16)
+	itemStore = append(itemStore, 0, 2)
+	itemStore = append(itemStore, 0, 0, 0, 32)
+	itemStore = append(itemStore, 0, 0, 0, 40)
+
+	itemStore = append(itemStore, 0, 1)
+	itemStore = append(itemStore, 0, 2)
+	itemStore = appendCFF2F2Dot14(itemStore, 0, 1, 1)
+	itemStore = appendCFF2F2Dot14(itemStore, 0, 0.5, 1)
+
+	itemStore = append(itemStore, 0, 0)
+	itemStore = append(itemStore, 0, 0)
+	itemStore = append(itemStore, 0, 1)
+	itemStore = append(itemStore, 0, 0)
+
+	itemStore = append(itemStore, 0, 0)
+	itemStore = append(itemStore, 0, 0)
+	itemStore = append(itemStore, 0, 2)
+	itemStore = append(itemStore, 0, 0)
+	itemStore = append(itemStore, 0, 1)
+
+	data := make([]byte, 2, 2+len(itemStore))
+	binary.BigEndian.PutUint16(data, uint16(len(itemStore)))
+	return append(data, itemStore...)
+}
+
+func appendCFF2F2Dot14(data []byte, values ...float64) []byte {
+	for _, v := range values {
+		raw := int16(v * 16384)
+		data = append(data, byte(raw>>8), byte(raw))
+	}
+	return data
+}
+
+func buildCvarOneAxisDeltaTable(delta int8) []byte {
+	data := make([]byte, 16)
+	binary.BigEndian.PutUint16(data[0:2], 1)
+	binary.BigEndian.PutUint16(data[4:6], 1)
+	binary.BigEndian.PutUint16(data[6:8], 14)
+	binary.BigEndian.PutUint16(data[8:10], 2)
+	binary.BigEndian.PutUint16(data[10:12], 0x8000)
+	binary.BigEndian.PutUint16(data[12:14], testF2Dot14Bits(1))
+	data[14] = 0
+	data[15] = byte(delta)
+	return data
+}
+
+type mvarTestRecord struct {
+	tag   string
+	delta int16
+}
+
+func buildMvarOneAxisTable(records []mvarTestRecord) []byte {
+	headerLen := 12 + len(records)*8
+	data := make([]byte, headerLen+26+8+len(records)*2)
+	binary.BigEndian.PutUint16(data[0:2], 1)
+	binary.BigEndian.PutUint16(data[6:8], 8)
+	binary.BigEndian.PutUint16(data[8:10], uint16(len(records)))
+	binary.BigEndian.PutUint16(data[10:12], uint16(headerLen))
+	for i, record := range records {
+		off := 12 + i*8
+		copy(data[off:off+4], record.tag)
+		binary.BigEndian.PutUint16(data[off+6:off+8], uint16(i))
+	}
+
+	ivs := headerLen
+	binary.BigEndian.PutUint16(data[ivs:ivs+2], 1)
+	binary.BigEndian.PutUint32(data[ivs+2:ivs+6], 16)
+	binary.BigEndian.PutUint16(data[ivs+6:ivs+8], 1)
+	binary.BigEndian.PutUint32(data[ivs+8:ivs+12], 26)
+
+	regionList := ivs + 16
+	binary.BigEndian.PutUint16(data[regionList:regionList+2], 1)
+	binary.BigEndian.PutUint16(data[regionList+2:regionList+4], 1)
+	binary.BigEndian.PutUint16(data[regionList+6:regionList+8], testF2Dot14Bits(1))
+	binary.BigEndian.PutUint16(data[regionList+8:regionList+10], testF2Dot14Bits(1))
+
+	variationData := ivs + 26
+	binary.BigEndian.PutUint16(data[variationData:variationData+2], uint16(len(records)))
+	binary.BigEndian.PutUint16(data[variationData+2:variationData+4], 1)
+	binary.BigEndian.PutUint16(data[variationData+4:variationData+6], 1)
+	deltaOffset := variationData + 8
+	for i, record := range records {
+		binary.BigEndian.PutUint16(data[deltaOffset+i*2:deltaOffset+i*2+2], uint16(record.delta))
+	}
 	return data
 }
 
@@ -736,6 +1363,10 @@ func buildHvarAdvanceDeltaTable(delta int16) []byte {
 }
 
 func loadVariableGlyphTestFace(t *testing.T, gvar []byte, hvar []byte) *Face {
+	return loadVariableGlyphTestFaceWithTables(t, gvar, hvar)
+}
+
+func loadVariableGlyphTestFaceWithTables(t *testing.T, gvar []byte, hvar []byte, extraTables ...sfntTestTable) *Face {
 	t.Helper()
 	glyph := simpleOnePointGlyphData(50, 0, nil)
 
@@ -772,6 +1403,7 @@ func loadVariableGlyphTestFace(t *testing.T, gvar []byte, hvar []byte) *Face {
 	if hvar != nil {
 		tables = append(tables, sfntTestTable{tag: "HVAR", data: hvar})
 	}
+	tables = append(tables, extraTables...)
 
 	loaded, err := NewLoader(&mockSystem{}).LoadFace(&mockStream{data: buildSFNTTestData(t, tables)})
 	if err != nil {
@@ -846,6 +1478,86 @@ func TestVariationCoordinatesApplyHVARAdvanceAndClearMetricsCache(t *testing.T) 
 	}
 	if advance != 300<<6 || lsb != 20<<6 {
 		t.Fatalf("reset metrics got advance=%d lsb=%d, want %d %d", advance, lsb, 300<<6, 20<<6)
+	}
+}
+
+func TestVariationDesignCoordinatesUseLoadedAvarMapping(t *testing.T) {
+	face := loadVariableGlyphTestFaceWithTables(
+		t,
+		nil,
+		buildHvarAdvanceDeltaTable(40),
+		sfntTestTable{tag: "avar", data: buildAvarOneAxisHalfToOneTable()},
+	)
+	if err := face.SetVariationDesignCoordinates([]ftvar.Fixed{ftvar.FloatToFixed(0.5)}); err != nil {
+		t.Fatalf("SetVariationDesignCoordinates failed: %v", err)
+	}
+
+	advance, lsb, err := face.GetGlyphMetrics(0)
+	if err != nil {
+		t.Fatalf("GetGlyphMetrics failed: %v", err)
+	}
+	if advance != 340<<6 || lsb != 20<<6 {
+		t.Fatalf("avar-adjusted HVAR metrics got advance=%d lsb=%d, want %d %d", advance, lsb, 340<<6, 20<<6)
+	}
+}
+
+func TestMVARMetricDeltasRefreshWithVariationCoordinates(t *testing.T) {
+	mvar, err := ftvar.ParseMVAR(&mockStream{data: buildMvarOneAxisTable([]mvarTestRecord{
+		{tag: "cpht", delta: 4},
+		{tag: "hasc", delta: 20},
+		{tag: "hcof", delta: 2},
+		{tag: "unds", delta: 3},
+		{tag: "vasc", delta: 10},
+	})})
+	if err != nil {
+		t.Fatalf("ParseMVAR failed: %v", err)
+	}
+	ve := ftvar.NewVariationEngine(&ftvar.FvarTable{
+		Axes: []ftvar.AxisRecord{{Tag: stringToTag("wght"), MinValue: -1 << 16, MaxValue: 1 << 16}},
+	}, nil, nil, nil)
+	ve.SetMVAR(mvar)
+
+	baseHhea := HheaTable{CaretOffset: 5}
+	baseVhea := VheaTable{Ascent: 700}
+	baseOS2 := OS2Table{STypoAscender: 800, SCapHeight: 600}
+	basePost := PostTable{UnderlineThickness: 50}
+	face := &Face{
+		varEngine:   ve,
+		hhea:        baseHhea,
+		baseHhea:    baseHhea,
+		hasBaseHhea: true,
+		vhea:        baseVhea,
+		baseVhea:    baseVhea,
+		hasBaseVhea: true,
+		os2:         baseOS2,
+		baseOS2:     baseOS2,
+		hasBaseOS2:  true,
+		post:        basePost,
+		basePost:    basePost,
+		hasBasePost: true,
+	}
+
+	if err := face.SetVariationNormalizedCoordinates([]float32{1}); err != nil {
+		t.Fatalf("SetVariationNormalizedCoordinates failed: %v", err)
+	}
+	if face.os2.STypoAscender != 820 || face.os2.SCapHeight != 604 {
+		t.Fatalf("OS/2 MVAR metrics = ascender %d capHeight %d, want 820 604", face.os2.STypoAscender, face.os2.SCapHeight)
+	}
+	if face.vhea.Ascent != 710 {
+		t.Fatalf("vhea ascent = %d, want 710", face.vhea.Ascent)
+	}
+	if face.hhea.CaretOffset != 7 {
+		t.Fatalf("hhea caret offset = %d, want 7", face.hhea.CaretOffset)
+	}
+	if face.post.UnderlineThickness != 53 {
+		t.Fatalf("post underline thickness = %d, want 53", face.post.UnderlineThickness)
+	}
+
+	if err := face.SetVariationNormalizedCoordinates([]float32{0}); err != nil {
+		t.Fatalf("reset variation coordinates failed: %v", err)
+	}
+	if face.os2.STypoAscender != 800 || face.vhea.Ascent != 700 || face.hhea.CaretOffset != 5 || face.post.UnderlineThickness != 50 {
+		t.Fatalf("MVAR reset did not restore base metrics: os2=%+v vhea=%+v hhea=%+v post=%+v", face.os2, face.vhea, face.hhea, face.post)
 	}
 }
 
@@ -965,12 +1677,12 @@ func TestLoadGlyphHintedPhantomAdvanceUpdatesMetrics(t *testing.T) {
 		0xB1, 2, 64, // PUSHB[2] point 2, 1px distance
 		0x38, // SHPIX
 	}
-	glyph := simpleOnePointGlyphData(50, 0, instructions)
+	glyph := simpleOnePointGlyphData(20, 0, instructions)
 	face := loadGlyphMetricsTestFace(t, []uint32{0, uint32(len(glyph))}, glyph, []metricsGlyph{
 		{advance: 300, lsb: 20},
 	})
 
-	slot, err := face.LoadGlyph(0, api.LoadDefault)
+	slot, err := face.LoadGlyph(0, api.LoadTargetMono)
 	if err != nil {
 		t.Fatalf("LoadGlyph failed: %v", err)
 	}
@@ -988,6 +1700,51 @@ func TestLoadGlyphHintedPhantomAdvanceUpdatesMetrics(t *testing.T) {
 	}
 	if concrete, ok := slot.(*GlyphSlot); !ok || !concrete.hasMetrics || concrete.metrics.advance != 301<<6 {
 		t.Fatalf("slot metrics were not updated from hinted phantoms: %#v", slot)
+	}
+}
+
+func TestLoadGlyphHintedMetricsArePixelFitted(t *testing.T) {
+	glyph := simpleRectGlyphData(50, -150, 550, 700)
+	face := loadGlyphMetricsTestFace(t, []uint32{0, uint32(len(glyph))}, glyph, []metricsGlyph{
+		{advance: 755, lsb: 50},
+	})
+	if err := face.SetPixelSizes(12, 12); err != nil {
+		t.Fatalf("SetPixelSizes failed: %v", err)
+	}
+
+	slot, err := face.LoadGlyph(0, api.LoadDefault)
+	if err != nil {
+		t.Fatalf("LoadGlyph failed: %v", err)
+	}
+	metrics, ok := api.GetGlyphSlotMetrics(slot)
+	if !ok {
+		t.Fatal("glyph slot metrics unavailable")
+	}
+
+	scaledMinX := face.scaleFUnitsX(50)
+	scaledMinY := face.scaleFUnitsY(-150)
+	scaledMaxX := face.scaleFUnitsX(550)
+	scaledMaxY := face.scaleFUnitsY(700)
+	wantBearingX := floorToPixel26Dot6(scaledMinX)
+	wantBearingY := ceilToPixel26Dot6(scaledMaxY)
+	wantWidth := ceilToPixel26Dot6(scaledMaxX) - wantBearingX
+	wantHeight := wantBearingY - floorToPixel26Dot6(scaledMinY)
+	wantAdvance := roundToPixel26Dot6(face.scaleFUnitsX(755))
+
+	if metrics.Width != wantWidth || metrics.Height != wantHeight {
+		t.Fatalf("pixel-fitted bounds got width=%d height=%d, want %d %d", metrics.Width, metrics.Height, wantWidth, wantHeight)
+	}
+	if metrics.HoriBearingX != wantBearingX || metrics.HoriBearingY != wantBearingY || metrics.HoriAdvance != wantAdvance {
+		t.Fatalf("pixel-fitted horizontal metrics mismatch: %+v, want bearingX=%d bearingY=%d advance=%d",
+			metrics, wantBearingX, wantBearingY, wantAdvance)
+	}
+
+	advance, lsb, err := face.GetGlyphMetrics(0)
+	if err != nil {
+		t.Fatalf("GetGlyphMetrics failed: %v", err)
+	}
+	if advance != wantAdvance || lsb != wantBearingX {
+		t.Fatalf("loaded hinted metrics got advance=%d lsb=%d, want %d %d", advance, lsb, wantAdvance, wantBearingX)
 	}
 }
 
@@ -1014,6 +1771,106 @@ func TestGlyphSlotMetricsProviderUsesLoadedPhantoms(t *testing.T) {
 	}
 	if metrics.VertAdvance != 1000<<6 {
 		t.Fatalf("vertical advance = %d, want %d", metrics.VertAdvance, 1000<<6)
+	}
+	if metrics.VertBearingX != (20<<6)-(300<<6)/2 {
+		t.Fatalf("synthetic vertical bearing X = %d", metrics.VertBearingX)
+	}
+	if metrics.VertBearingY != ((1000<<6)-(50<<6))/2 {
+		t.Fatalf("synthetic vertical bearing Y = %d", metrics.VertBearingY)
+	}
+}
+
+func TestGlyphSlotMetricsUseExplicitVerticalMetrics(t *testing.T) {
+	glyph := simpleRectGlyphData(50, -10, 90, 40)
+	face := loadGlyphMetricsTestFace(t, []uint32{0, uint32(len(glyph))}, glyph, []metricsGlyph{
+		{advance: 300, lsb: 20},
+	})
+	face.vhea.NumOfLongVerMetrics = 1
+	face.vmtx = VmtxTable{VMetrics: []VMetric{{AdvanceHeight: 700, TopSideBearing: 30}}}
+
+	slot, err := face.LoadGlyph(0, api.LoadNoHinting|api.LoadVerticalLayout)
+	if err != nil {
+		t.Fatalf("LoadGlyph failed: %v", err)
+	}
+	metrics, ok := api.GetGlyphSlotMetrics(slot)
+	if !ok {
+		t.Fatal("glyph slot metrics unavailable")
+	}
+	if metrics.VertAdvance != 700<<6 {
+		t.Fatalf("vertical advance = %d, want %d", metrics.VertAdvance, 700<<6)
+	}
+	if metrics.VertBearingX != (20<<6)-(300<<6)/2 {
+		t.Fatalf("vertical bearing X = %d, want %d", metrics.VertBearingX, (20<<6)-(300<<6)/2)
+	}
+	if metrics.VertBearingY != 30<<6 {
+		t.Fatalf("vertical bearing Y = %d, want %d", metrics.VertBearingY, 30<<6)
+	}
+}
+
+func TestGlyphSlotMetricsExplicitVerticalNoScaleStaysUnscaled(t *testing.T) {
+	glyph := simpleRectGlyphData(50, -10, 90, 40)
+	face := loadGlyphMetricsTestFace(t, []uint32{0, uint32(len(glyph))}, glyph, []metricsGlyph{
+		{advance: 300, lsb: 20},
+	})
+	face.vhea.NumOfLongVerMetrics = 1
+	face.vmtx = VmtxTable{VMetrics: []VMetric{{AdvanceHeight: 701, TopSideBearing: 31}}}
+	if err := face.SetPixelSizes(333, 333); err != nil {
+		t.Fatalf("SetPixelSizes failed: %v", err)
+	}
+
+	scaledSlot, err := face.LoadGlyph(0, api.LoadNoHinting)
+	if err != nil {
+		t.Fatalf("LoadGlyph scaled failed: %v", err)
+	}
+	scaledMetrics, ok := api.GetGlyphSlotMetrics(scaledSlot)
+	if !ok {
+		t.Fatal("scaled glyph slot metrics unavailable")
+	}
+	if scaledMetrics.VertAdvance != face.scaleFUnitsY(701) || scaledMetrics.VertBearingY != face.scaleFUnitsY(31) {
+		t.Fatalf("scaled vertical metrics mismatch: %+v", scaledMetrics)
+	}
+
+	noScaleSlot, err := face.LoadGlyph(0, api.LoadNoScale|api.LoadVerticalLayout)
+	if err != nil {
+		t.Fatalf("LoadGlyph no-scale failed: %v", err)
+	}
+	noScaleMetrics, ok := api.GetGlyphSlotMetrics(noScaleSlot)
+	if !ok {
+		t.Fatal("no-scale glyph slot metrics unavailable")
+	}
+	if noScaleMetrics.VertAdvance != 701<<6 || noScaleMetrics.VertBearingY != 31<<6 {
+		t.Fatalf("no-scale vertical metrics mismatch: %+v", noScaleMetrics)
+	}
+	if noScaleMetrics.VertBearingX != (20<<6)-(300<<6)/2 {
+		t.Fatalf("no-scale vertical bearing X = %d, want %d", noScaleMetrics.VertBearingX, (20<<6)-(300<<6)/2)
+	}
+}
+
+func TestCFFSlotMetricsUseVORGVerticalOrigin(t *testing.T) {
+	face := loadCFFSlotMetricsTestFace(t)
+	if err := face.SetPixelSizes(500, 500); err != nil {
+		t.Fatalf("SetPixelSizes failed: %v", err)
+	}
+
+	slot, err := face.LoadGlyph(1, api.LoadNoScale|api.LoadVerticalLayout)
+	if err != nil {
+		t.Fatalf("LoadGlyph failed: %v", err)
+	}
+	metrics, ok := api.GetGlyphSlotMetrics(slot)
+	if !ok {
+		t.Fatal("glyph slot metrics unavailable")
+	}
+	if metrics.HoriBearingX != 20<<6 || metrics.HoriAdvance != 300<<6 {
+		t.Fatalf("horizontal CFF slot metrics mismatch: %+v", metrics)
+	}
+	if metrics.VertAdvance != 700<<6 {
+		t.Fatalf("CFF vertical advance = %d, want %d", metrics.VertAdvance, 700<<6)
+	}
+	if metrics.VertBearingX != (20<<6)-(300<<6)/2 {
+		t.Fatalf("CFF vertical bearing X = %d, want %d", metrics.VertBearingX, (20<<6)-(300<<6)/2)
+	}
+	if metrics.VertBearingY != (900<<6)-metrics.HoriBearingY {
+		t.Fatalf("CFF VORG vertical bearing Y = %d, want %d", metrics.VertBearingY, (900<<6)-metrics.HoriBearingY)
 	}
 }
 
@@ -1069,11 +1926,160 @@ func TestLoadGlyphRenderStoresBitmap(t *testing.T) {
 	if bitmap.GetPixelMode() != api.MODE_MONO {
 		t.Fatalf("bitmap pixel mode = %d, want MODE_MONO", bitmap.GetPixelMode())
 	}
-	if bitmap.GetWidth() != 10 || bitmap.GetRows() != 10 || bitmap.GetPitch() != 10 {
+	if bitmap.GetWidth() != 10 || bitmap.GetRows() != 10 || bitmap.GetPitch() != 2 {
 		t.Fatalf("bitmap geometry got width=%d rows=%d pitch=%d", bitmap.GetWidth(), bitmap.GetRows(), bitmap.GetPitch())
+	}
+	if left, top, ok := api.GetBitmapPlacement(bitmap); !ok || left != 0 || top != 10 {
+		t.Fatalf("bitmap placement got left=%d top=%d ok=%v, want 0 10 true", left, top, ok)
 	}
 	if !hasNonZeroByte(bitmap.GetBuffer()) {
 		t.Fatal("rendered bitmap buffer is empty")
+	}
+}
+
+func TestLoadGlyphRenderModesUseFreeTypeBitmapSurfaces(t *testing.T) {
+	glyph := simpleRectGlyphData(-4, -2, 6, 8)
+	tests := []struct {
+		name      string
+		flags     int
+		width     int
+		rows      int
+		pitch     int
+		pixelMode uint8
+		left      int
+		top       int
+	}{
+		{name: "normal", flags: api.LoadRender | api.LoadNoHinting, width: 10, rows: 10, pitch: 10, pixelMode: api.MODE_GRAY, left: -4, top: 8},
+		{name: "lcd", flags: api.LoadRender | api.LoadNoHinting | api.LoadTargetLCD, width: 36, rows: 10, pitch: 36, pixelMode: api.MODE_LCD, left: -5, top: 8},
+		{name: "lcd-v", flags: api.LoadRender | api.LoadNoHinting | api.LoadTargetLCDV, width: 10, rows: 36, pitch: 10, pixelMode: core.PixelModeLCDV, left: -4, top: 9},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			face := loadGlyphMetricsTestFace(t, []uint32{0, uint32(len(glyph))}, glyph, []metricsGlyph{
+				{advance: 12, lsb: -4},
+			})
+			slot, err := face.LoadGlyph(0, tc.flags)
+			if err != nil {
+				t.Fatalf("LoadGlyph failed: %v", err)
+			}
+			bitmap := slot.GetBitmap()
+			if bitmap == nil {
+				t.Fatal("rendered bitmap is nil")
+			}
+			if bitmap.GetWidth() != tc.width || bitmap.GetRows() != tc.rows || bitmap.GetPitch() != tc.pitch || bitmap.GetPixelMode() != tc.pixelMode {
+				t.Fatalf("bitmap got width=%d rows=%d pitch=%d mode=%d, want %d %d %d %d",
+					bitmap.GetWidth(), bitmap.GetRows(), bitmap.GetPitch(), bitmap.GetPixelMode(), tc.width, tc.rows, tc.pitch, tc.pixelMode)
+			}
+			if left, top, ok := api.GetBitmapPlacement(bitmap); !ok || left != tc.left || top != tc.top {
+				t.Fatalf("bitmap placement got left=%d top=%d ok=%v, want %d %d true", left, top, ok, tc.left, tc.top)
+			}
+		})
+	}
+}
+
+func TestLoadGlyphPassesTagsToVM(t *testing.T) {
+	glyph := simpleOnePointGlyphData(50, 0, []byte{
+		0xB0, 0, // PUSHB point 0
+		0x80, // FLIPPT
+	})
+	face := loadSingleGlyphProgramFace(t, glyph)
+
+	slot, err := face.LoadGlyph(0, api.LoadTargetMono)
+	if err != nil {
+		t.Fatalf("LoadGlyph failed: %v", err)
+	}
+	tags := slot.GetOutline().GetTags()
+	if len(tags) != 1 {
+		t.Fatalf("tag count = %d, want 1", len(tags))
+	}
+	if tags[0]&0x01 != 0 {
+		t.Fatalf("FLIPPT did not update glyph tag: %#x", tags[0])
+	}
+}
+
+func TestLoadGlyphPropagatesScanModeTagFromVM(t *testing.T) {
+	glyph := simpleOnePointGlyphData(50, 0, []byte{
+		0xB0, 0x02, // PUSHB scan type 2
+		0x8D,       // SCANTYPE
+		0xB0, 0xFF, // PUSHB always enable scan conversion control
+		0x85, // SCANCTRL
+	})
+	face := loadSingleGlyphProgramFace(t, glyph)
+
+	slot, err := face.LoadGlyph(0, api.LoadTargetMono)
+	if err != nil {
+		t.Fatalf("LoadGlyph failed: %v", err)
+	}
+	tags := slot.GetOutline().GetTags()
+	if len(tags) != 1 {
+		t.Fatalf("tag count = %d, want 1", len(tags))
+	}
+	if got, want := tags[0], byte(0x45); got != want {
+		t.Fatalf("scan mode tag = %#x, want %#x", got, want)
+	}
+}
+
+func TestLoadGlyphDoesNotSetScanModeTagWhenScanControlDisabled(t *testing.T) {
+	glyph := simpleOnePointGlyphData(50, 0, []byte{
+		0xB0, 0x02, // PUSHB scan type 2
+		0x8D, // SCANTYPE
+	})
+	face := loadSingleGlyphProgramFace(t, glyph)
+
+	slot, err := face.LoadGlyph(0, api.LoadTargetMono)
+	if err != nil {
+		t.Fatalf("LoadGlyph failed: %v", err)
+	}
+	tags := slot.GetOutline().GetTags()
+	if len(tags) != 1 {
+		t.Fatalf("tag count = %d, want 1", len(tags))
+	}
+	if got, want := tags[0], byte(0x01); got != want {
+		t.Fatalf("scan mode tag = %#x, want %#x", got, want)
+	}
+}
+
+func TestLoadGlyphPassesRenderTargetToVM(t *testing.T) {
+	glyph := simpleOnePointGlyphData(50, 0, []byte{
+		0xB0, 0, // PUSHB CVT index
+		0xB0, 0x20, // PUSHB GETINFO grayscale selector
+		0x88, // GETINFO
+		0x44, // WCVTP
+	})
+	face := loadSingleGlyphProgramFace(t, glyph)
+
+	if _, err := face.LoadGlyph(0, api.LoadTargetLCD); err != nil {
+		t.Fatalf("LoadGlyph failed: %v", err)
+	}
+	if got, want := face.scaledCVT[0], int32(1<<12); got != want {
+		t.Fatalf("GETINFO grayscale CVT[0] = %d, want %d", got, want)
+	}
+}
+
+func TestLoadGlyphUsesPrepGraphicsState(t *testing.T) {
+	glyph := simpleOnePointGlyphData(50, 20, []byte{
+		0xB0, 0, // PUSHB point 0
+		0xB0, 0, // PUSHB CVT index 0
+		0x3E, // MIAP[0], using the projection vector inherited from prep
+	})
+	cvt := make([]byte, 2)
+	binary.BigEndian.PutUint16(cvt, 100)
+	face := loadSingleGlyphProgramFaceWithPrograms(t, glyph, []byte{0x00}, cvt) // prep: SVTCA[y]
+
+	slot, err := face.LoadGlyph(0, api.LoadTargetMono)
+	if err != nil {
+		t.Fatalf("LoadGlyph failed: %v", err)
+	}
+	points := slot.GetOutline().GetPoints()
+	if len(points) != 1 {
+		t.Fatalf("outline point count = %d, want 1", len(points))
+	}
+	if got, want := points[0].X, int32(50<<6); got != want {
+		t.Fatalf("prep-inherited X = %d, want %d", got, want)
+	}
+	if got, want := points[0].Y, int32(100<<6); got != want {
+		t.Fatalf("prep-inherited Y = %d, want %d", got, want)
 	}
 }
 
@@ -1101,7 +2107,7 @@ func TestLoadGlyphNoBitmapSkipsEmbeddedImages(t *testing.T) {
 func TestCompositeUseMyMetricsUsesComponentPhantoms(t *testing.T) {
 	composite := compositeGlyphWithMetricComponents([]compositeMetricComponent{
 		{glyph: 1},
-		{glyph: 2, flags: USE_MY_METRICS},
+		{glyph: 2, flags: USE_MY_METRICS, dx: 8},
 	})
 	component1 := simpleOnePointGlyphData(30, 0, nil)
 	component2 := simpleOnePointGlyphData(90, 0, nil)
@@ -1134,8 +2140,18 @@ func TestCompositeUseMyMetricsUsesComponentPhantoms(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetGlyphMetrics after LoadGlyph failed: %v", err)
 	}
-	if advance != 700<<6 || lsb != 70<<6 {
-		t.Fatalf("USE_MY_METRICS got advance=%d lsb=%d, want %d %d", advance, lsb, 700<<6, 70<<6)
+	if advance != 700<<6 || lsb != 10<<6 {
+		t.Fatalf("USE_MY_METRICS got advance=%d lsb=%d, want %d %d", advance, lsb, 700<<6, 10<<6)
+	}
+	metrics, ok := api.GetGlyphSlotMetrics(slot)
+	if !ok {
+		t.Fatal("glyph slot metrics unavailable")
+	}
+	if metrics.HoriAdvance != 700<<6 || metrics.HoriBearingX != 10<<6 {
+		t.Fatalf("USE_MY_METRICS slot metrics mismatch: %+v", metrics)
+	}
+	if metrics.VertBearingX != (10<<6)-(700<<6)/2 {
+		t.Fatalf("USE_MY_METRICS vertical bearing X = %d, want %d", metrics.VertBearingX, (10<<6)-(700<<6)/2)
 	}
 }
 

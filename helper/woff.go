@@ -725,7 +725,7 @@ func DecodeWOFF2(in api.Stream) (api.Stream, error) {
 	}
 
 	br := brotli.NewReader(bytes.NewReader(compData))
-	uncompressedData, err := readAllLimited(br, maxDecodedFontSize)
+	uncompressedData, err := readAllLimited(br, int64(expectedUncompressedSize))
 	if err != nil {
 		return nil, err
 	}
@@ -803,6 +803,10 @@ func DecodeWOFF2(in api.Stream) (api.Stream, error) {
 		reconstructed[i] = hmtxData
 	}
 
+	if err := validateWOFF2ReconstructedOutlines(tables, reconstructed, collection); err != nil {
+		return nil, err
+	}
+
 	if collection != nil {
 		outData, err := buildTTC(collection, tables, reconstructed, int(totalSfntSize))
 		if err != nil {
@@ -863,7 +867,8 @@ func findWOFF2TransformedLoca(tables []woff2TableEntry, glyfIndex int, requireNe
 	}
 
 	locaIndex := -1
-	for i, t := range tables {
+	for i := glyfIndex + 1; i < len(tables); i++ {
+		t := tables[i]
 		if t.tag != tagLoca {
 			continue
 		}
@@ -937,6 +942,65 @@ func isWOFF2TransformedGlyf(t woff2TableEntry) bool {
 
 func isWOFF2TransformedLoca(t woff2TableEntry) bool {
 	return t.tag == tagLoca && t.flags>>6 == woff2TransformGlyfLoca
+}
+
+func validateWOFF2ReconstructedOutlines(tables []woff2TableEntry, reconstructed [][]byte, collection *woff2Collection) error {
+	if collection == nil {
+		return validateWOFF2FontOutlines(tables, reconstructed)
+	}
+	for _, font := range collection.fonts {
+		fontTables, fontReconstructed, err := collectionFontTableSlices(font, tables, reconstructed, -1)
+		if err != nil {
+			return err
+		}
+		if err := validateWOFF2FontOutlines(fontTables, fontReconstructed); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateWOFF2FontOutlines(tables []woff2TableEntry, reconstructed [][]byte) error {
+	glyfIndex := findWOFF2Table(tables, tagGlyf)
+	locaIndex := findWOFF2Table(tables, tagLoca)
+	if glyfIndex < 0 && locaIndex < 0 {
+		return nil
+	}
+	if glyfIndex < 0 || locaIndex < 0 || glyfIndex >= len(reconstructed) || locaIndex >= len(reconstructed) ||
+		reconstructed[glyfIndex] == nil || reconstructed[locaIndex] == nil {
+		return errors.New("WOFF2 font has incomplete glyf/loca tables")
+	}
+
+	headIndex := findWOFF2Table(tables, tagHead)
+	maxpIndex := findWOFF2Table(tables, tagMaxp)
+	if headIndex < 0 || maxpIndex < 0 {
+		return nil
+	}
+	if headIndex >= len(reconstructed) || maxpIndex >= len(reconstructed) ||
+		reconstructed[headIndex] == nil || reconstructed[maxpIndex] == nil {
+		return nil
+	}
+
+	head := reconstructed[headIndex]
+	maxp := reconstructed[maxpIndex]
+	if len(head) < 54 || len(maxp) < 6 {
+		return errors.New("WOFF2 glyf/loca metadata is incomplete")
+	}
+	indexFormat := int16(binary.BigEndian.Uint16(head[50:52]))
+	if indexFormat != 0 && indexFormat != 1 {
+		return errors.New("invalid WOFF2 glyf/loca index format")
+	}
+	numGlyphs := int(binary.BigEndian.Uint16(maxp[4:6]))
+	expectedLocaLength := (numGlyphs + 1) * (2 + 2*int(indexFormat))
+	if len(reconstructed[locaIndex]) != expectedLocaLength {
+		return errors.New("WOFF2 glyf/loca metadata mismatch")
+	}
+	glyf := reconstructed[glyfIndex]
+	loca := reconstructed[locaIndex]
+	if err := validateWOFF2LocaOffsets(glyf, loca, uint16(indexFormat), numGlyphs); err != nil {
+		return err
+	}
+	return validateWOFF2GlyfCompositeReferences(glyf, loca, uint16(indexFormat), numGlyphs)
 }
 
 func tagString(tag uint32) string {
@@ -1351,7 +1415,7 @@ func reconstructWOFF2GlyfLoca(data []byte, locaOrigLength uint32) ([]byte, []byt
 			if !hasBBox {
 				return nil, nil, errors.New("WOFF2 composite glyph missing bbox")
 			}
-			glyphData, err := reconstructWOFF2CompositeGlyph(compositeStream, glyphStream, instructionStream)
+			glyphData, err := reconstructWOFF2CompositeGlyph(compositeStream, glyphStream, instructionStream, int(numGlyphs))
 			if err != nil {
 				return nil, nil, err
 			}
@@ -1359,6 +1423,9 @@ func reconstructWOFF2GlyfLoca(data []byte, locaOrigLength uint32) ([]byte, []byt
 				return nil, nil, err
 			}
 			glyf.Write(glyphData)
+
+		case nContoursRaw&0x8000 != 0:
+			return nil, nil, errors.New("invalid WOFF2 glyph contour count")
 
 		default:
 			glyphData, err := reconstructWOFF2SimpleGlyph(int(nContoursRaw), nPointsStream, flagStream, glyphStream, instructionStream, hasOverlap)
@@ -1425,6 +1492,9 @@ func reconstructWOFF2SimpleGlyph(nContours int, nPointsStream, flagStream, glyph
 	if err != nil {
 		return nil, err
 	}
+	if int(instructionLength) > instructionStream.remaining() {
+		return nil, errors.New("invalid WOFF2 simple glyph instructions")
+	}
 	instructions, err := instructionStream.readBytes(int(instructionLength))
 	if err != nil {
 		return nil, err
@@ -1444,7 +1514,7 @@ func reconstructWOFF2SimpleGlyph(nContours int, nPointsStream, flagStream, glyph
 	return glyph.Bytes(), nil
 }
 
-func reconstructWOFF2CompositeGlyph(compositeStream, glyphStream, instructionStream *woff2ByteReader) ([]byte, error) {
+func reconstructWOFF2CompositeGlyph(compositeStream, glyphStream, instructionStream *woff2ByteReader, numGlyphs int) ([]byte, error) {
 	const (
 		flagArgWords                = 1 << 0
 		flagMoreComponents          = 1 << 5
@@ -1493,11 +1563,18 @@ func reconstructWOFF2CompositeGlyph(compositeStream, glyphStream, instructionStr
 			return nil, errors.New("invalid WOFF2 composite transform flags")
 		}
 
-		argSize := 2 // glyphIndex
+		componentGlyphIndex, err := compositeStream.readU16()
+		if err != nil {
+			return nil, err
+		}
+		if numGlyphs < 0 || int(componentGlyphIndex) >= numGlyphs {
+			return nil, errors.New("invalid WOFF2 composite glyph index")
+		}
+		appendUint16(glyph, componentGlyphIndex)
+
+		argSize := 2
 		if flags&flagArgWords != 0 {
-			argSize += 4
-		} else {
-			argSize += 2
+			argSize = 4
 		}
 		if flags&flagHaveScale != 0 {
 			argSize += 2
@@ -1561,9 +1638,9 @@ func decodeWOFF2Triplets(flags []byte, glyphStream *woff2ByteReader) ([]woff2Poi
 		dx, dy := 0, 0
 		switch {
 		case flag < 10:
-			dy = withWOFF2Sign(int(flag), int((flag&14)<<7)+int(data[0]))
+			dy = withWOFF2Sign(int(flag), (int(flag&14)<<7)+int(data[0]))
 		case flag < 20:
-			dx = withWOFF2Sign(int(flag), int(((flag-10)&14)<<7)+int(data[0]))
+			dx = withWOFF2Sign(int(flag), (int((flag-10)&14)<<7)+int(data[0]))
 		case flag < 84:
 			b0 := int(flag - 20)
 			b1 := int(data[0])
@@ -1623,6 +1700,9 @@ func appendTrueTypePointData(buf *bytes.Buffer, points []woff2Point, overlap boo
 		}
 		dx := p.x - lastX
 		dy := p.y - lastY
+		if dx < -32768 || dx > 32767 || dy < -32768 || dy > 32767 {
+			return errors.New("WOFF2 glyph coordinate delta out of range")
+		}
 		if dx == 0 {
 			flag |= flagThisXIsSame
 		} else if dx > -256 && dx < 256 {
@@ -1684,7 +1764,24 @@ func applyWOFF2ExplicitBBox(glyphData []byte, bboxStream *woff2ByteReader) error
 	if err != nil {
 		return err
 	}
+	if err := validateWOFF2BBox(bbox); err != nil {
+		return err
+	}
 	copy(glyphData[2:10], bbox)
+	return nil
+}
+
+func validateWOFF2BBox(bbox []byte) error {
+	if len(bbox) < 8 {
+		return errors.New("invalid WOFF2 glyph bbox")
+	}
+	xMin := int16(binary.BigEndian.Uint16(bbox[0:2]))
+	yMin := int16(binary.BigEndian.Uint16(bbox[2:4]))
+	xMax := int16(binary.BigEndian.Uint16(bbox[4:6]))
+	yMax := int16(binary.BigEndian.Uint16(bbox[6:8]))
+	if xMin > xMax || yMin > yMax {
+		return errors.New("invalid WOFF2 glyph bbox")
+	}
 	return nil
 }
 
@@ -1742,6 +1839,9 @@ func reconstructWOFF2Hmtx(data []byte, origLength uint32, tables []woff2TableEnt
 	}
 	if len(head) < 54 || len(hhea) < 36 || len(maxp) < 6 {
 		return nil, errors.New("WOFF2 hmtx transform missing required metrics metadata")
+	}
+	if err := validateWOFF2FontOutlines(tables, reconstructed); err != nil {
+		return nil, err
 	}
 
 	indexFormat := int16(binary.BigEndian.Uint16(head[50:52]))
@@ -1888,6 +1988,54 @@ func requiredWOFF2Table(tables []woff2TableEntry, reconstructed [][]byte, tag ui
 	return reconstructed[index], nil
 }
 
+func validateWOFF2LocaOffsets(glyf, loca []byte, indexFormat uint16, numGlyphs int) error {
+	var prev uint32
+	for i := 0; i <= numGlyphs; i++ {
+		offset, err := woff2LocaOffset(loca, indexFormat, i)
+		if err != nil {
+			return err
+		}
+		if offset < prev {
+			return errors.New("invalid WOFF2 loca offsets")
+		}
+		if offset > uint32(len(glyf)) {
+			return errors.New("invalid WOFF2 glyf bounds")
+		}
+		if i > 0 {
+			length := offset - prev
+			if length > 0 && length < 10 {
+				return errors.New("invalid WOFF2 glyf bounds")
+			}
+		}
+		prev = offset
+	}
+	if prev != uint32(len(glyf)) {
+		return errors.New("WOFF2 loca/glyf length mismatch")
+	}
+	return nil
+}
+
+func woff2LocaOffset(loca []byte, indexFormat uint16, glyphIndex int) (uint32, error) {
+	if glyphIndex < 0 {
+		return 0, errors.New("invalid WOFF2 glyph index")
+	}
+	if indexFormat == 0 {
+		offset := glyphIndex * 2
+		if offset+2 > len(loca) {
+			return 0, errors.New("invalid WOFF2 loca bounds")
+		}
+		return uint32(binary.BigEndian.Uint16(loca[offset:offset+2])) * 2, nil
+	}
+	if indexFormat == 1 {
+		offset := glyphIndex * 4
+		if offset+4 > len(loca) {
+			return 0, errors.New("invalid WOFF2 loca bounds")
+		}
+		return binary.BigEndian.Uint32(loca[offset : offset+4]), nil
+	}
+	return 0, errors.New("invalid WOFF2 loca index format")
+}
+
 func woff2GlyphXMin(glyf, loca []byte, indexFormat uint16, glyphIndex int) (int16, error) {
 	start, end, err := woff2GlyphBounds(loca, indexFormat, glyphIndex)
 	if err != nil {
@@ -1925,6 +2073,218 @@ func woff2GlyphBounds(loca []byte, indexFormat uint16, glyphIndex int) (uint32, 
 		return start, end, nil
 	}
 	return 0, 0, errors.New("invalid WOFF2 loca index format")
+}
+
+func validateWOFF2GlyfCompositeReferences(glyf, loca []byte, indexFormat uint16, numGlyphs int) error {
+	for glyphIndex := 0; glyphIndex < numGlyphs; glyphIndex++ {
+		start, end, err := woff2GlyphBounds(loca, indexFormat, glyphIndex)
+		if err != nil {
+			return err
+		}
+		if start == end {
+			continue
+		}
+		if end < start || end > uint32(len(glyf)) || end-start < 10 {
+			return errors.New("invalid WOFF2 glyf bounds")
+		}
+
+		glyph := glyf[start:end]
+		if err := validateWOFF2BBox(glyph[2:10]); err != nil {
+			return err
+		}
+		numberOfContours := int16(binary.BigEndian.Uint16(glyph[0:2]))
+		switch {
+		case numberOfContours >= 0:
+			if err := validateWOFF2SimpleGlyph(glyph, int(numberOfContours)); err != nil {
+				return err
+			}
+		case numberOfContours == -1:
+			if err := validateWOFF2CompositeGlyphReferences(glyph, numGlyphs); err != nil {
+				return err
+			}
+		default:
+			return errors.New("invalid WOFF2 glyph contour count")
+		}
+	}
+	return nil
+}
+
+func validateWOFF2SimpleGlyph(glyph []byte, nContours int) error {
+	const (
+		simpleGlyphHeader = 10
+		flagXShort        = 1 << 1
+		flagYShort        = 1 << 2
+		flagRepeat        = 1 << 3
+		flagThisXIsSame   = 1 << 4
+		flagThisYIsSame   = 1 << 5
+	)
+
+	offset := simpleGlyphHeader
+	if nContours < 0 || offset+2*nContours+2 > len(glyph) {
+		return errors.New("invalid WOFF2 simple glyph")
+	}
+
+	totalPoints := 0
+	prevEndPt := -1
+	for i := 0; i < nContours; i++ {
+		endPt := int(binary.BigEndian.Uint16(glyph[offset : offset+2]))
+		offset += 2
+		if endPt <= prevEndPt {
+			return errors.New("invalid WOFF2 simple glyph contour endpoints")
+		}
+		prevEndPt = endPt
+	}
+	if nContours > 0 {
+		totalPoints = prevEndPt + 1
+	}
+
+	instructionLength := int(binary.BigEndian.Uint16(glyph[offset : offset+2]))
+	offset += 2
+	if instructionLength > len(glyph)-offset {
+		return errors.New("invalid WOFF2 simple glyph instructions")
+	}
+	offset += instructionLength
+
+	flags := make([]byte, 0, totalPoints)
+	for len(flags) < totalPoints {
+		if offset >= len(glyph) {
+			return errors.New("invalid WOFF2 simple glyph point data")
+		}
+		flag := glyph[offset]
+		offset++
+		repeat := 1
+		if flag&flagRepeat != 0 {
+			if offset >= len(glyph) {
+				return errors.New("invalid WOFF2 simple glyph point data")
+			}
+			repeat += int(glyph[offset])
+			offset++
+		}
+		if len(flags)+repeat > totalPoints {
+			return errors.New("invalid WOFF2 simple glyph point data")
+		}
+		for i := 0; i < repeat; i++ {
+			flags = append(flags, flag)
+		}
+	}
+
+	coordinateLength := 0
+	for _, flag := range flags {
+		if flag&flagXShort != 0 {
+			coordinateLength++
+		} else if flag&flagThisXIsSame == 0 {
+			coordinateLength += 2
+		}
+		if flag&flagYShort != 0 {
+			coordinateLength++
+		} else if flag&flagThisYIsSame == 0 {
+			coordinateLength += 2
+		}
+	}
+	if coordinateLength > len(glyph)-offset {
+		return errors.New("invalid WOFF2 simple glyph point data")
+	}
+	offset += coordinateLength
+	return validateWOFF2GlyphPadding(glyph[offset:])
+}
+
+func validateWOFF2CompositeGlyphReferences(glyph []byte, numGlyphs int) error {
+	const (
+		flagArgWords                = 1 << 0
+		flagMoreComponents          = 1 << 5
+		flagHaveScale               = 1 << 3
+		flagHaveXYScale             = 1 << 6
+		flagHaveTwoByTwo            = 1 << 7
+		flagHaveInstructions        = 1 << 8
+		flagScaledComponentOffset   = 1 << 11
+		flagUnscaledComponentOffset = 1 << 12
+		flagReservedComposite       = 0xe010
+		compositeGlyphHeader        = 10
+	)
+
+	offset := compositeGlyphHeader
+	haveInstructions := false
+	for {
+		if offset+4 > len(glyph) {
+			return errors.New("invalid WOFF2 composite glyph")
+		}
+		flags := binary.BigEndian.Uint16(glyph[offset : offset+2])
+		componentGlyphIndex := binary.BigEndian.Uint16(glyph[offset+2 : offset+4])
+		offset += 4
+
+		haveInstructions = haveInstructions || flags&flagHaveInstructions != 0
+		if int(componentGlyphIndex) >= numGlyphs {
+			return errors.New("invalid WOFF2 composite glyph index")
+		}
+		if flags&flagReservedComposite != 0 {
+			return errors.New("invalid WOFF2 composite flags")
+		}
+		if flags&flagScaledComponentOffset != 0 && flags&flagUnscaledComponentOffset != 0 {
+			return errors.New("invalid WOFF2 composite offset flags")
+		}
+
+		transformCount := 0
+		if flags&flagHaveScale != 0 {
+			transformCount++
+		}
+		if flags&flagHaveXYScale != 0 {
+			transformCount++
+		}
+		if flags&flagHaveTwoByTwo != 0 {
+			transformCount++
+		}
+		if transformCount > 1 {
+			return errors.New("invalid WOFF2 composite transform flags")
+		}
+
+		componentLength := 2
+		if flags&flagArgWords != 0 {
+			componentLength = 4
+		}
+		if flags&flagHaveScale != 0 {
+			componentLength += 2
+		} else if flags&flagHaveXYScale != 0 {
+			componentLength += 4
+		} else if flags&flagHaveTwoByTwo != 0 {
+			componentLength += 8
+		}
+		if offset+componentLength > len(glyph) {
+			return errors.New("invalid WOFF2 composite glyph")
+		}
+		offset += componentLength
+
+		if flags&flagMoreComponents == 0 {
+			break
+		}
+	}
+
+	if haveInstructions {
+		if offset+2 > len(glyph) {
+			return errors.New("invalid WOFF2 composite glyph")
+		}
+		instructionLength := int(binary.BigEndian.Uint16(glyph[offset : offset+2]))
+		offset += 2
+		if offset+instructionLength > len(glyph) {
+			return errors.New("invalid WOFF2 composite glyph")
+		}
+		offset += instructionLength
+	}
+	if err := validateWOFF2GlyphPadding(glyph[offset:]); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateWOFF2GlyphPadding(padding []byte) error {
+	if len(padding) > 3 {
+		return errors.New("invalid WOFF2 glyf padding")
+	}
+	for _, b := range padding {
+		if b != 0 {
+			return errors.New("invalid WOFF2 glyf padding")
+		}
+	}
+	return nil
 }
 
 func bitmapBit(bitmap []byte, index int) bool {

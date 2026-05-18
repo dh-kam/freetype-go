@@ -5,6 +5,7 @@ import (
 	"sync"
 
 	"github.com/dh-kam/freetype-go/api"
+	"github.com/dh-kam/freetype-go/core"
 )
 
 var tcellPool = sync.Pool{
@@ -12,6 +13,12 @@ var tcellPool = sync.Pool{
 		return make([]TCell, 2048)
 	},
 }
+
+const (
+	pixelBits = 8
+	onePixel  = 1 << pixelBits
+	upscale   = onePixel >> 6
+)
 
 // TCell represents a single pixel cell in the smooth rasterizer.
 // Based on FreeType's TCell in ftgrays.c.
@@ -37,6 +44,8 @@ type TWorker struct {
 
 	PixelMode uint8
 	XScale    int
+	YScale    int
+	FlipY     bool
 	LCDLine   []byte
 	LCDFilter int
 
@@ -69,6 +78,10 @@ func (r *SmoothRasterizer) SetLCDFilter(filterType int) {
 
 // Render implements the api.Rasterizer interface.
 func (r *SmoothRasterizer) Render(outline api.Outline, bitmap api.Bitmap) error {
+	if outline == nil || bitmap == nil {
+		return nil
+	}
+
 	rows := bitmap.GetRows()
 	width := bitmap.GetWidth()
 	pixelMode := bitmap.GetPixelMode()
@@ -78,10 +91,17 @@ func (r *SmoothRasterizer) Render(outline api.Outline, bitmap api.Bitmap) error 
 	}
 
 	r.worker.PixelMode = pixelMode
-	if pixelMode == api.MODE_LCD {
+	r.worker.XScale = 1
+	r.worker.YScale = 1
+	r.worker.FlipY = false
+	if _, top, ok := api.GetBitmapPlacement(bitmap); ok && top != 0 && pixelMode != core.PixelModeLCDV {
+		r.worker.FlipY = true
+	}
+	switch pixelMode {
+	case api.MODE_LCD:
 		r.worker.XScale = 3
-	} else {
-		r.worker.XScale = 1
+	case core.PixelModeLCDV:
+		r.worker.YScale = 3
 	}
 
 	r.worker.GraySpans = r.GraySpans
@@ -89,7 +109,7 @@ func (r *SmoothRasterizer) Render(outline api.Outline, bitmap api.Bitmap) error 
 	// Initialize worker bounds
 	r.worker.MinEx = 0
 	r.worker.MinEy = 0
-	r.worker.MaxEx = width * r.worker.XScale
+	r.worker.MaxEx = width
 	r.worker.MaxEy = rows
 
 	r.worker.NumCells = 0
@@ -131,6 +151,7 @@ func (r *SmoothRasterizer) decompose(outline api.Outline) error {
 	tags := outline.GetTags()
 	contours := outline.GetContours()
 	xScale := int32(r.worker.XScale)
+	yScale := int32(r.worker.YScale)
 
 	start := 0
 	for _, end := range contours {
@@ -152,9 +173,13 @@ func (r *SmoothRasterizer) decompose(outline api.Outline) error {
 		var segs []segmentPoint
 
 		for i := 0; i < len(contourPoints); i++ {
+			y := contourPoints[i].Y
+			if r.worker.FlipY {
+				y = int32((r.worker.MaxEy/r.worker.YScale)<<6) - y
+			}
 			segs = append(segs, segmentPoint{
-				X:  contourPoints[i].X * xScale,
-				Y:  contourPoints[i].Y,
+				X:  contourPoints[i].X * xScale * upscale,
+				Y:  y * yScale * upscale,
 				On: (contourTags[i] & 1) == 1,
 			})
 		}
@@ -174,8 +199,8 @@ func (r *SmoothRasterizer) decompose(outline api.Outline) error {
 
 		r.worker.x = segs[0].X
 		r.worker.y = segs[0].Y
-		r.worker.X = int(r.worker.x >> 6)
-		r.worker.Y = int(r.worker.y >> 6)
+		r.worker.X = int(r.worker.x >> pixelBits)
+		r.worker.Y = int(r.worker.y >> pixelBits)
 		r.worker.Area = 0
 		r.worker.Cover = 0
 
@@ -207,24 +232,71 @@ func (r *SmoothRasterizer) decompose(outline api.Outline) error {
 }
 
 func (w *TWorker) renderQuadratic(ctrlX, ctrlY, toX, toY int32) {
-	const segments = 8
-	startX := w.x
-	startY := w.y
+	// Match ftgrays' adaptive conic subdivision: each bisection reduces the
+	// control-point deviation by 4, then forward-difference the segments.
+	p0x, p0y := int64(w.x), int64(w.y)
+	p1x, p1y := int64(ctrlX), int64(ctrlY)
+	p2x, p2y := int64(toX), int64(toY)
 
-	for i := int64(1); i <= segments; i++ {
-		t := i
-		invT := segments - i
-
-		term0 := invT * invT
-		term1 := 2 * t * invT
-		term2 := t * t
-		divisor := int64(segments * segments)
-
-		currX := int32((int64(startX)*term0 + int64(ctrlX)*term1 + int64(toX)*term2) / divisor)
-		currY := int32((int64(startY)*term0 + int64(ctrlY)*term1 + int64(toY)*term2) / divisor)
-
-		w.renderLine(currX, currY)
+	if (int(p0y>>pixelBits) >= w.MaxEy && int(p1y>>pixelBits) >= w.MaxEy && int(p2y>>pixelBits) >= w.MaxEy) ||
+		(int(p0y>>pixelBits) < w.MinEy && int(p1y>>pixelBits) < w.MinEy && int(p2y>>pixelBits) < w.MinEy) {
+		w.x = toX
+		w.y = toY
+		return
 	}
+
+	bx := p1x - p0x
+	by := p1y - p0y
+	ax := p2x - p1x - bx
+	ay := p2y - p1y - by
+
+	dx := absInt64(ax)
+	if dy := absInt64(ay); dx < dy {
+		dx = dy
+	}
+
+	if dx <= onePixel/4 {
+		w.renderLine(toX, toY)
+		return
+	}
+
+	shift := 16
+	for {
+		dx >>= 2
+		shift--
+		if dx <= onePixel/4 {
+			break
+		}
+	}
+	count := 0x10000 >> shift
+
+	rx := leftShiftInt64(ax, shift+shift)
+	ry := leftShiftInt64(ay, shift+shift)
+	qx := leftShiftInt64(bx, shift+17) + rx
+	qy := leftShiftInt64(by, shift+17) + ry
+	rx *= 2
+	ry *= 2
+
+	px := leftShiftInt64(p0x, 32)
+	py := leftShiftInt64(p0y, 32)
+	for ; count > 0; count-- {
+		px += qx
+		py += qy
+		qx += rx
+		qy += ry
+		w.renderLine(int32(px>>32), int32(py>>32))
+	}
+}
+
+func leftShiftInt64(v int64, shift int) int64 {
+	return int64(uint64(v) << uint(shift))
+}
+
+func absInt64(v int64) int64 {
+	if v < 0 {
+		return -v
+	}
+	return v
 }
 
 func (w *TWorker) setCell(ex, ey int) {
@@ -249,7 +321,7 @@ func (w *TWorker) recordCell() {
 	if x < w.MinEx {
 		x = w.MinEx - 1
 	} else if x >= w.MaxEx {
-		x = w.MaxEx
+		return
 	}
 
 	// Growth check
@@ -270,103 +342,195 @@ func (w *TWorker) recordCell() {
 }
 
 func (w *TWorker) renderScanline(ey int, x1, y1, x2, y2 int32) {
-	ex1 := int(x1 >> 6)
-	ex2 := int(x2 >> 6)
-	fx1 := x1 - int32(ex1<<6)
-	fx2 := x2 - int32(ex2<<6)
+	ex1 := int(x1 >> pixelBits)
+	ex2 := int(x2 >> pixelBits)
 
-	w.setCell(ex1, ey)
-
-	if ex1 == ex2 {
-		w.Area += int((y2 - y1) * (fx1 + fx2))
-		w.Cover += int(y2 - y1)
+	if y1 == y2 {
+		w.setCell(ex2, ey)
 		return
 	}
 
-	dx := x2 - x1
-	dy := y2 - y1
+	w.setCell(ex1, ey)
+	fx1 := int32(int(x1) & (onePixel - 1))
+	fx2 := int32(int(x2) & (onePixel - 1))
 
-	incr := 1
-	if dx < 0 {
-		incr = -1
-	}
+	if ex1 != ex2 {
+		dx := int64(x2 - x1)
+		dy := y2 - y1
 
-	p := x1
-	firstY := y1
-
-	for ex := ex1; ex != ex2; ex += incr {
-		var nextX int32
-		if incr > 0 {
-			nextX = int32((ex + 1) << 6)
+		var p int64
+		var first int32
+		incr := 1
+		if dx > 0 {
+			p = int64(onePixel-fx1) * int64(dy)
+			first = onePixel
 		} else {
-			nextX = int32(ex << 6)
+			p = int64(fx1) * int64(dy)
+			first = 0
+			incr = -1
+			dx = -dx
 		}
 
-		nextY := y1 + int32((int64(nextX-x1)*int64(dy))/int64(dx))
+		delta, mod := divModFloor(p, dx)
+		w.integrate(delta, fx1+first)
+		y1 += delta
+		ex1 += incr
+		w.setCell(ex1, ey)
 
-		fx_start := p - int32(ex<<6)
-		fx_end := nextX - int32(ex<<6)
+		if ex1 != ex2 {
+			lift, rem := divModFloor(int64(onePixel)*int64(dy), dx)
+			for ex1 != ex2 {
+				delta = lift
+				mod += rem
+				if mod >= int32(dx) {
+					mod -= int32(dx)
+					delta++
+				}
 
-		w.Area += int((nextY - firstY) * (fx_start + fx_end))
-		w.Cover += int(nextY - firstY)
+				w.integrate(delta, onePixel)
+				y1 += delta
+				ex1 += incr
+				w.setCell(ex1, ey)
+			}
+		}
 
-		p = nextX
-		firstY = nextY
-		w.setCell(ex+incr, ey)
+		fx1 = onePixel - first
 	}
 
-	fx_start := p - int32(ex2<<6)
-	fx_end := fx2
-	w.Area += int((y2 - firstY) * (fx_start + fx_end))
-	w.Cover += int(y2 - firstY)
+	w.integrate(y2-y1, fx1+fx2)
 }
 
 func (w *TWorker) renderLine(toX, toY int32) {
-	ey1 := int(w.y >> 6)
-	ey2 := int(toY >> 6)
+	ey1 := int(w.y >> pixelBits)
+	ey2 := int(toY >> pixelBits)
 
-	if ey1 == ey2 {
-		w.renderScanline(ey1, w.x, w.y, toX, toY)
+	if (ey1 >= w.MaxEy && ey2 >= w.MaxEy) || (ey1 < w.MinEy && ey2 < w.MinEy) {
 		w.x = toX
 		w.y = toY
 		return
 	}
 
-	dx := toX - w.x
-	dy := toY - w.y
+	fy1 := int32(int(w.y) & (onePixel - 1))
+	ex1 := int(w.x >> pixelBits)
+	ex2 := int(toX >> pixelBits)
+	fx1 := int32(int(w.x) & (onePixel - 1))
 
-	incr := 1
-	if dy < 0 {
-		incr = -1
-	}
+	dx := int64(toX - w.x)
+	dy := int64(toY - w.y)
 
-	p := w.y
-	firstX := w.x
-
-	for ey := ey1; ey != ey2; ey += incr {
-		var nextY int32
-		if incr > 0 {
-			nextY = int32((ey + 1) << 6)
+	if ex1 == ex2 && ey1 == ey2 {
+		// The final integration below handles a segment that stays in one cell.
+	} else if dy == 0 {
+		w.setCell(ex2, ey2)
+		w.x = toX
+		w.y = toY
+		return
+	} else if dx == 0 {
+		if dy > 0 {
+			for {
+				fy2 := int32(onePixel)
+				w.integrate(fy2-fy1, fx1*2)
+				fy1 = 0
+				ey1++
+				w.setCell(ex1, ey1)
+				if ey1 == ey2 {
+					break
+				}
+			}
 		} else {
-			nextY = int32(ey << 6)
+			for {
+				fy2 := int32(0)
+				w.integrate(fy2-fy1, fx1*2)
+				fy1 = onePixel
+				ey1--
+				w.setCell(ex1, ey1)
+				if ey1 == ey2 {
+					break
+				}
+			}
 		}
-
-		nextX := w.x + int32((int64(nextY-w.y)*int64(dx))/int64(dy))
-
-		w.renderScanline(ey, firstX, p, nextX, nextY)
-
-		p = nextY
-		firstX = nextX
+	} else {
+		prod := dx*int64(fy1) - dy*int64(fx1)
+		dxReciprocal := int64(0)
+		if ex1 != ex2 {
+			dxReciprocal = 0xFFFFFFFF / dx
+		}
+		dyReciprocal := int64(0)
+		if ey1 != ey2 {
+			dyReciprocal = 0xFFFFFFFF / dy
+		}
+		for ex1 != ex2 || ey1 != ey2 {
+			switch {
+			case prod-dx*onePixel > 0 && prod <= 0:
+				fx2 := int32(0)
+				fy2 := udiv(-prod, -dxReciprocal)
+				prod -= dy * onePixel
+				w.integrate(fy2-fy1, fx1+fx2)
+				fx1 = onePixel
+				fy1 = fy2
+				ex1--
+			case prod-dx*onePixel+dy*onePixel > 0 && prod-dx*onePixel <= 0:
+				prod -= dx * onePixel
+				fx2 := udiv(-prod, dyReciprocal)
+				fy2 := int32(onePixel)
+				w.integrate(fy2-fy1, fx1+fx2)
+				fx1 = fx2
+				fy1 = 0
+				ey1++
+			case prod+dy*onePixel >= 0 && prod-dx*onePixel+dy*onePixel <= 0:
+				prod += dy * onePixel
+				fx2 := int32(onePixel)
+				fy2 := udiv(prod, dxReciprocal)
+				w.integrate(fy2-fy1, fx1+fx2)
+				fx1 = 0
+				fy1 = fy2
+				ex1++
+			default:
+				fx2 := udiv(prod, -dyReciprocal)
+				fy2 := int32(0)
+				prod += dx * onePixel
+				w.integrate(fy2-fy1, fx1+fx2)
+				fx1 = fx2
+				fy1 = onePixel
+				ey1--
+			}
+			w.setCell(ex1, ey1)
+		}
 	}
 
-	w.renderScanline(ey2, firstX, p, toX, toY)
+	fx2 := int32(int(toX) & (onePixel - 1))
+	fy2 := int32(int(toY) & (onePixel - 1))
+	w.integrate(fy2-fy1, fx1+fx2)
 	w.x = toX
 	w.y = toY
 }
 
+func (w *TWorker) integrate(delta, scale int32) {
+	w.Cover += int(delta)
+	w.Area += int(delta) * int(scale)
+}
+
+func divModFloor(dividend, divisor int64) (int32, int32) {
+	quotient := dividend / divisor
+	remainder := dividend % divisor
+	if remainder < 0 {
+		quotient--
+		remainder += divisor
+	}
+	return int32(quotient), int32(remainder)
+}
+
+func udiv(dividend, divisor int64) int32 {
+	return int32((uint64(dividend) * uint64(divisor)) >> 32)
+}
+
 func (w *TWorker) sweep(bitmap api.Bitmap) {
-	if w.PixelMode == api.MODE_LCD {
+	switch w.PixelMode {
+	case api.MODE_LCD:
 		w.sweepLCD(bitmap)
+		return
+	case core.PixelModeLCDV:
+		w.sweepLCDV(bitmap)
 		return
 	}
 
@@ -374,8 +538,16 @@ func (w *TWorker) sweep(bitmap api.Bitmap) {
 	rows := bitmap.GetRows()
 	buffer := bitmap.GetBuffer()
 	pitch := bitmap.GetPitch()
+	packedMono := usePackedMonoBitmap(bitmap, width, pitch)
 
 	if rows == 0 || width == 0 || len(buffer) == 0 {
+		return
+	}
+	lineBytes := width
+	if packedMono {
+		lineBytes = pitch
+	}
+	if pitch <= 0 || pitch < lineBytes || lineBytes <= 0 || len(buffer) < (rows-1)*pitch+lineBytes {
 		return
 	}
 
@@ -386,9 +558,10 @@ func (w *TWorker) sweep(bitmap api.Bitmap) {
 
 	cellIdx := 0
 	for y := 0; y < rows; y++ {
+		outputY := w.outputY(y, rows)
 		// BCE hint for this scanline
-		line := buffer[y*pitch : (y*pitch)+width]
-		_ = line[width-1]
+		line := buffer[outputY*pitch : (outputY*pitch)+lineBytes]
+		_ = line[lineBytes-1]
 
 		if w.GraySpans != nil {
 			spans = spans[:0]
@@ -407,11 +580,13 @@ func (w *TWorker) sweep(bitmap api.Bitmap) {
 			cellIdx++
 
 			if cell.X > x && cover != 0 {
-				val := w.calculateGray(cover << 7)
+				val := w.calculateGray(cover << (pixelBits + 1))
 				if w.PixelMode == api.MODE_MONO {
 					if val >= 128 {
 						if w.GraySpans != nil {
 							spans = append(spans, Span{X: int16(x), Len: uint16(cell.X - x), Coverage: 255})
+						} else if packedMono {
+							core.FillMonoSpan(line, pitch, 0, x, cell.X)
 						} else {
 							w.fillSpan(line, 0, x, cell.X, 255)
 						}
@@ -426,13 +601,15 @@ func (w *TWorker) sweep(bitmap api.Bitmap) {
 			}
 
 			cover += cell.Cover
-			area := (cover << 7) - cell.Area
+			area := (cover << (pixelBits + 1)) - cell.Area
 			val := w.calculateGray(area)
 
 			if w.PixelMode == api.MODE_MONO {
 				if val >= 128 && cell.X >= 0 && cell.X < width {
 					if w.GraySpans != nil {
 						spans = append(spans, Span{X: int16(cell.X), Len: 1, Coverage: 255})
+					} else if packedMono {
+						core.SetMonoPixel(line, pitch, cell.X, 0, true)
 					} else {
 						line[cell.X] = 255
 					}
@@ -449,11 +626,13 @@ func (w *TWorker) sweep(bitmap api.Bitmap) {
 		}
 
 		if x < width && cover != 0 {
-			val := w.calculateGray(cover << 7)
+			val := w.calculateGray(cover << (pixelBits + 1))
 			if w.PixelMode == api.MODE_MONO {
 				if val >= 128 {
 					if w.GraySpans != nil {
 						spans = append(spans, Span{X: int16(x), Len: uint16(width - x), Coverage: 255})
+					} else if packedMono {
+						core.FillMonoSpan(line, pitch, 0, x, width)
 					} else {
 						w.fillSpan(line, 0, x, width, 255)
 					}
@@ -468,15 +647,33 @@ func (w *TWorker) sweep(bitmap api.Bitmap) {
 		}
 
 		if w.GraySpans != nil && len(spans) > 0 {
-			w.GraySpans(y, spans)
+			w.GraySpans(outputY, spans)
 		}
 	}
 }
+
+type packedMonoBitmap interface {
+	IsPackedMono() bool
+}
+
+func usePackedMonoBitmap(bitmap api.Bitmap, width, pitch int) bool {
+	if bitmap.GetPixelMode() != api.MODE_MONO || width <= 0 || pitch <= 0 {
+		return false
+	}
+	if packed, ok := bitmap.(packedMonoBitmap); ok {
+		return packed.IsPackedMono()
+	}
+	return pitch == core.BitmapPitch(width, api.MODE_MONO) && pitch < width
+}
+
 func (w *TWorker) sweepLCD(bitmap api.Bitmap) {
 	width := bitmap.GetWidth()
 	rows := bitmap.GetRows()
 	buffer := bitmap.GetBuffer()
 	pitch := bitmap.GetPitch()
+	if rows == 0 || width == 0 || pitch < width || len(buffer) < (rows-1)*pitch+width {
+		return
+	}
 
 	var spans []Span
 	if w.GraySpans != nil {
@@ -485,6 +682,7 @@ func (w *TWorker) sweepLCD(bitmap api.Bitmap) {
 
 	cellIdx := 0
 	for y := 0; y < rows; y++ {
+		outputY := w.outputY(y, rows)
 		// BCE hint for LCDLine
 		_ = w.LCDLine[width+3]
 
@@ -507,14 +705,14 @@ func (w *TWorker) sweepLCD(bitmap api.Bitmap) {
 			cellIdx++
 
 			if cell.X > x && cover != 0 {
-				val := w.calculateGray(cover << 7)
+				val := w.calculateGray(cover << (pixelBits + 1))
 				if val != 0 {
 					w.fillSpan(w.LCDLine, 2, x, cell.X, val)
 				}
 			}
 
 			cover += cell.Cover
-			area := (cover << 7) - cell.Area
+			area := (cover << (pixelBits + 1)) - cell.Area
 			val := w.calculateGray(area)
 
 			if val != 0 && cell.X >= 0 && cell.X < w.MaxEx {
@@ -525,7 +723,7 @@ func (w *TWorker) sweepLCD(bitmap api.Bitmap) {
 		}
 
 		if x < w.MaxEx && cover != 0 {
-			val := w.calculateGray(cover << 7)
+			val := w.calculateGray(cover << (pixelBits + 1))
 			if val != 0 {
 				w.fillSpan(w.LCDLine, 2, x, w.MaxEx, val)
 			}
@@ -548,14 +746,146 @@ func (w *TWorker) sweepLCD(bitmap api.Bitmap) {
 				}
 			}
 			if len(spans) > 0 {
-				w.GraySpans(y, spans)
+				w.GraySpans(outputY, spans)
 			}
 		} else {
 			for i := 0; i < width; i++ {
-				buffer[y*pitch+i] = w.filterLCD(i)
+				buffer[outputY*pitch+i] = w.filterLCD(i)
 			}
 		}
 	}
+}
+
+func (w *TWorker) sweepLCDV(bitmap api.Bitmap) {
+	width := bitmap.GetWidth()
+	rows := bitmap.GetRows()
+	buffer := bitmap.GetBuffer()
+	pitch := bitmap.GetPitch()
+	if rows == 0 || width == 0 || pitch < width || len(buffer) < (rows-1)*pitch+width {
+		return
+	}
+
+	surface := w.renderGraySurface(width, rows)
+
+	var spans []Span
+	if w.GraySpans != nil {
+		spans = make([]Span, 0, 16)
+	}
+
+	for y := 0; y < rows; y++ {
+		outputY := w.outputY(y, rows)
+		if w.GraySpans != nil {
+			spans = spans[:0]
+			var currentSpan *Span
+			for x := 0; x < width; x++ {
+				val := w.filterLCDV(surface, width, rows, x, y)
+				if val != 0 {
+					if currentSpan != nil && currentSpan.Coverage == val && currentSpan.X+int16(currentSpan.Len) == int16(x) {
+						currentSpan.Len++
+					} else {
+						spans = append(spans, Span{X: int16(x), Len: 1, Coverage: val})
+						currentSpan = &spans[len(spans)-1]
+					}
+				} else {
+					currentSpan = nil
+				}
+			}
+			if len(spans) > 0 {
+				w.GraySpans(outputY, spans)
+			}
+			continue
+		}
+
+		line := buffer[outputY*pitch : outputY*pitch+width]
+		_ = line[width-1]
+		for x := 0; x < width; x++ {
+			line[x] = w.filterLCDV(surface, width, rows, x, y)
+		}
+	}
+}
+
+func (w *TWorker) renderGraySurface(width, rows int) []byte {
+	surface := make([]byte, width*rows)
+	cellIdx := 0
+	for y := 0; y < rows; y++ {
+		outputY := w.outputY(y, rows)
+		line := surface[outputY*width : (outputY+1)*width]
+		cover := 0
+		x := 0
+
+		for cellIdx < w.NumCells && w.Cells[cellIdx].Y == y {
+			cell := w.Cells[cellIdx]
+			for cellIdx+1 < w.NumCells && w.Cells[cellIdx+1].Y == y && w.Cells[cellIdx+1].X == cell.X {
+				cellIdx++
+				cell.Area += w.Cells[cellIdx].Area
+				cell.Cover += w.Cells[cellIdx].Cover
+			}
+			cellIdx++
+
+			if cell.X > x && cover != 0 {
+				val := w.calculateGray(cover << (pixelBits + 1))
+				if val != 0 {
+					w.fillSpan(line, 0, x, cell.X, val)
+				}
+			}
+
+			cover += cell.Cover
+			area := (cover << (pixelBits + 1)) - cell.Area
+			val := w.calculateGray(area)
+
+			if val != 0 && cell.X >= 0 && cell.X < width {
+				line[cell.X] = val
+			}
+
+			x = cell.X + 1
+		}
+
+		if x < width && cover != 0 {
+			val := w.calculateGray(cover << (pixelBits + 1))
+			if val != 0 {
+				w.fillSpan(line, 0, x, width, val)
+			}
+		}
+	}
+	return surface
+}
+
+func (w *TWorker) outputY(y, rows int) int {
+	if w.FlipY {
+		return rows - 1 - y
+	}
+	return y
+}
+
+func (w *TWorker) filterLCDV(surface []byte, width, rows, x, y int) byte {
+	var sum uint32
+	switch w.LCDFilter {
+	case api.LCD_FILTER_LIGHT:
+		sum = w.lcdvSample(surface, width, rows, x, y-1)*85 +
+			w.lcdvSample(surface, width, rows, x, y)*86 +
+			w.lcdvSample(surface, width, rows, x, y+1)*85
+	case api.LCD_FILTER_LEGACY:
+		sum = w.lcdvSample(surface, width, rows, x, y) * 255
+	case api.LCD_FILTER_NONE:
+		sum = w.lcdvSample(surface, width, rows, x, y) * 256
+	default: // api.LCD_FILTER_DEFAULT
+		sum = w.lcdvSample(surface, width, rows, x, y-2)*8 +
+			w.lcdvSample(surface, width, rows, x, y-1)*77 +
+			w.lcdvSample(surface, width, rows, x, y)*86 +
+			w.lcdvSample(surface, width, rows, x, y+1)*77 +
+			w.lcdvSample(surface, width, rows, x, y+2)*8
+	}
+	if sum > 0xff00 {
+		return 255
+	}
+	return byte(sum >> 8)
+}
+
+func (w *TWorker) lcdvSample(surface []byte, width, rows, x, y int) uint32 {
+	if y < 0 || y >= rows {
+		return 0
+	}
+	return uint32(surface[y*width+x])
 }
 
 func (w *TWorker) filterLCD(i int) byte {
@@ -576,17 +906,21 @@ func (w *TWorker) filterLCD(i int) byte {
 			uint32(w.LCDLine[i+3])*77 +
 			uint32(w.LCDLine[i+4])*8
 	}
-	return byte((sum + 128) >> 8)
+	if sum > 0xff00 {
+		return 255
+	}
+	return byte(sum >> 8)
 }
 
 func (w *TWorker) calculateGray(area int) byte {
 	if area < 0 {
 		area = -area
 	}
-	if area > 8192 {
-		area = 8192
+	coverage := area >> (pixelBits*2 + 1 - 8)
+	if coverage > 255 {
+		coverage = 255
 	}
-	return byte((area*255 + 4096) >> 13)
+	return byte(coverage)
 }
 
 func (w *TWorker) fillSpan(buffer []byte, offset int, x1, x2 int, val byte) {

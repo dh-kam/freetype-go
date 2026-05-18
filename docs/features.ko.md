@@ -1,6 +1,7 @@
 # FreeType-Go 기능 상세
 
 이 문서는 현재 저장소에 구현되어 있는 영역을 요약합니다. FreeType 전체 호환성이나 안정적인 API 범위를 보장하는 문서는 아닙니다.
+현재 parity 추적 기준과 남은 gap은 [Porting Status and Remaining Gaps](porting-status.md)를 참고하세요.
 
 ## 구현된 영역
 

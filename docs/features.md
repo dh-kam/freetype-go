@@ -2,6 +2,8 @@
 
 This page summarizes implemented areas in the current repository. It is not a
 statement of full FreeType compatibility or stable API coverage.
+Use [Porting Status and Remaining Gaps](porting-status.md) for the current
+parity tracking criteria and known incomplete areas.
 
 ## Implemented Areas
 

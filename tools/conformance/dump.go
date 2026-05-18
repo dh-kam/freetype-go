@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -14,21 +15,26 @@ import (
 	"github.com/dh-kam/freetype-go/api"
 	"github.com/dh-kam/freetype-go/core"
 	"github.com/dh-kam/freetype-go/sfnt"
+	"github.com/dh-kam/freetype-go/type1"
 )
 
 const dumpSchema = "ftgo.conformance.dump/v1"
 
+var errNotStandaloneType1 = errors.New("not a standalone Type 1 font")
+
 type dumpOptions struct {
-	FontPath    string
-	OutputPath  string
-	RequestPath string
-	Corpus      string
-	FaceIndex   int
-	PPEMs       []SizeSpec
-	Glyphs      []int
-	Chars       []CharSpec
-	LoadFlags   []loadFlagSpec
-	RenderModes []renderModeSpec
+	FontPath            string
+	OutputPath          string
+	RequestPath         string
+	Corpus              string
+	FaceIndex           int
+	PPEMs               []SizeSpec
+	Glyphs              []int
+	Chars               []CharSpec
+	LoadFlags           []loadFlagSpec
+	RenderModes         []renderModeSpec
+	ExpectedGaps        []ExpectedGap
+	IncludeBitmapBuffer bool
 }
 
 type SizeSpec struct {
@@ -74,16 +80,24 @@ type SourceInfo struct {
 }
 
 type RequestInfo struct {
-	FaceIndex    int      `json:"face_index"`
-	PPEM         []string `json:"ppem"`
-	Glyphs       []int    `json:"glyphs,omitempty"`
-	Chars        []string `json:"chars,omitempty"`
-	LoadFlags    string   `json:"load_flags"`
-	LoadFlagSets []string `json:"load_flag_sets,omitempty"`
-	RenderMode   string   `json:"render_mode,omitempty"`
-	RenderModes  []string `json:"render_modes,omitempty"`
-	RequestPath  string   `json:"request_path,omitempty"`
-	Corpus       string   `json:"corpus,omitempty"`
+	FaceIndex           int           `json:"face_index"`
+	PPEM                []string      `json:"ppem"`
+	Glyphs              []int         `json:"glyphs,omitempty"`
+	Chars               []string      `json:"chars,omitempty"`
+	LoadFlags           string        `json:"load_flags"`
+	LoadFlagSets        []string      `json:"load_flag_sets,omitempty"`
+	RenderMode          string        `json:"render_mode,omitempty"`
+	RenderModes         []string      `json:"render_modes,omitempty"`
+	RequestPath         string        `json:"request_path,omitempty"`
+	Corpus              string        `json:"corpus,omitempty"`
+	ExpectedGaps        []ExpectedGap `json:"expected_gaps,omitempty"`
+	IncludeBitmapBuffer bool          `json:"include_bitmap_buffer,omitempty"`
+}
+
+type ExpectedGap struct {
+	Kind string `json:"kind,omitempty"`
+	Path string `json:"path,omitempty"`
+	Note string `json:"note,omitempty"`
 }
 
 type FaceInfo struct {
@@ -109,17 +123,18 @@ type SizeDump struct {
 }
 
 type GlyphRecord struct {
-	GlyphIndex     int                `json:"glyph_index"`
-	Chars          []string           `json:"chars,omitempty"`
-	Format         string             `json:"format,omitempty"`
-	RenderedFormat string             `json:"rendered_format,omitempty"`
-	LoadError      string             `json:"load_error,omitempty"`
-	RenderError    string             `json:"render_error,omitempty"`
-	Metrics        MetricsRecord      `json:"metrics"`
-	SlotMetrics    *SlotMetricsRecord `json:"slot_metrics,omitempty"`
-	Outline        OutlineRecord      `json:"outline"`
-	Bitmap         BitmapRecord       `json:"bitmap"`
-	Image          *ImageRecord       `json:"image,omitempty"`
+	GlyphIndex     int                   `json:"glyph_index"`
+	Chars          []string              `json:"chars,omitempty"`
+	Format         string                `json:"format,omitempty"`
+	RenderedFormat string                `json:"rendered_format,omitempty"`
+	Type1Segments  []type1.SegmentRecord `json:"type1_segments,omitempty"`
+	LoadError      string                `json:"load_error,omitempty"`
+	RenderError    string                `json:"render_error,omitempty"`
+	Metrics        MetricsRecord         `json:"metrics"`
+	SlotMetrics    *SlotMetricsRecord    `json:"slot_metrics,omitempty"`
+	Outline        OutlineRecord         `json:"outline"`
+	Bitmap         BitmapRecord          `json:"bitmap"`
+	Image          *ImageRecord          `json:"image,omitempty"`
 }
 
 type MetricsRecord struct {
@@ -179,6 +194,7 @@ type BitmapRecord struct {
 	Top           int    `json:"top,omitempty"`
 	BufferSize    int    `json:"buffer_size,omitempty"`
 	SHA256        string `json:"sha256,omitempty"`
+	BufferHex     string `json:"buffer_hex,omitempty"`
 	Error         string `json:"error,omitempty"`
 }
 
@@ -250,7 +266,7 @@ func parseDumpOptions(name string, args []string, output io.Writer) (dumpOptions
 
 	fs := flag.NewFlagSet(name, flag.ContinueOnError)
 	fs.SetOutput(output)
-	fs.StringVar(&opts.FontPath, "font", "", "path to a TTF, OTF, or TTC font")
+	fs.StringVar(&opts.FontPath, "font", "", "path to a TTF, OTF, TTC, PFA, or PFB font")
 	fs.StringVar(&opts.OutputPath, "out", "-", "output JSON path, or '-' for stdout")
 	fs.StringVar(&opts.RequestPath, "request", "", "optional JSON request file for font, ppem, glyph, char, load flag, and render mode selections")
 	fs.StringVar(&opts.Corpus, "corpus", "", "optional corpus label recorded in the dump request")
@@ -260,6 +276,7 @@ func parseDumpOptions(name string, args []string, output io.Writer) (dumpOptions
 	fs.StringVar(&charList, "chars", "", "comma-separated chars or codepoints, e.g. U+0041,U+0061")
 	fs.StringVar(&loadFlagList, "load-flags", "no-hinting", "comma-separated load flag sets, e.g. default,no-hinting+target-light,no-bitmap+target-mono")
 	fs.StringVar(&renderModeList, "render-mode", "none", "comma-separated render modes: none, normal, light, mono, lcd, lcd-v")
+	fs.BoolVar(&opts.IncludeBitmapBuffer, "include-bitmap-buffer", false, "include raw bitmap buffers as hex for byte-level comparison diagnostics")
 
 	if err := fs.Parse(args); err != nil {
 		return opts, err
@@ -317,14 +334,9 @@ func buildGoDump(opts dumpOptions) (*Dump, error) {
 		return nil, err
 	}
 
-	numFaces, err := sfnt.NumFaces(stream)
+	face, numFaces, type1Font, err := loadGoDumpFace(core.NewSystem(), stream, opts.FontPath, opts.FaceIndex)
 	if err != nil {
-		return nil, fmt.Errorf("read face count: %w", err)
-	}
-
-	face, err := sfnt.LoadFaceIndex(core.NewSystem(), stream, opts.FaceIndex)
-	if err != nil {
-		return nil, fmt.Errorf("load face %d: %w", opts.FaceIndex, err)
+		return nil, err
 	}
 
 	selections, charmap := resolveGoSelections(face, opts)
@@ -351,7 +363,7 @@ func buildGoDump(opts dumpOptions) (*Dump, error) {
 					continue
 				}
 				for _, sel := range selections {
-					sizeDump.Glyphs = append(sizeDump.Glyphs, dumpGoGlyph(face, sel, loadFlags, renderMode))
+					sizeDump.Glyphs = append(sizeDump.Glyphs, dumpGoGlyphWithType1Segments(face, sel, loadFlags, renderMode, opts.IncludeBitmapBuffer, type1Font))
 				}
 				dump.Sizes = append(dump.Sizes, sizeDump)
 			}
@@ -361,7 +373,57 @@ func buildGoDump(opts dumpOptions) (*Dump, error) {
 	return dump, nil
 }
 
-func dumpGoGlyph(face api.Face, sel glyphSelection, loadFlags loadFlagSpec, renderMode renderModeSpec) GlyphRecord {
+func loadGoDumpFace(sys api.FreetypeSystem, stream api.Stream, fontPath string, faceIndex int) (api.Face, int, *type1.Font, error) {
+	numFaces, err := sfnt.NumFaces(stream)
+	if err != nil {
+		sfntErr := fmt.Errorf("read face count: %w", err)
+		return loadType1Fallback(sys, fontPath, faceIndex, sfntErr)
+	}
+
+	face, err := sfnt.LoadFaceIndex(sys, stream, faceIndex)
+	if err == nil {
+		return face, numFaces, nil, nil
+	}
+	sfntErr := fmt.Errorf("load face %d: %w", faceIndex, err)
+	return loadType1Fallback(sys, fontPath, faceIndex, sfntErr)
+}
+
+func loadType1Fallback(sys api.FreetypeSystem, fontPath string, faceIndex int, sfntErr error) (api.Face, int, *type1.Font, error) {
+	face, font, err := loadStandaloneType1Face(sys, fontPath, faceIndex)
+	if err == nil {
+		return face, 1, font, nil
+	}
+	if errors.Is(err, errNotStandaloneType1) {
+		return nil, 0, nil, sfntErr
+	}
+	return nil, 0, nil, fmt.Errorf("%w; Type 1 fallback failed: %v", sfntErr, err)
+}
+
+func loadStandaloneType1Face(sys api.FreetypeSystem, fontPath string, faceIndex int) (api.Face, *type1.Font, error) {
+	data, err := os.ReadFile(fontPath)
+	if err != nil {
+		return nil, nil, err
+	}
+	stream := core.NewMemoryStream(data)
+	loader := type1.NewLoader(sys)
+	if !loader.Handles(stream) {
+		return nil, nil, errNotStandaloneType1
+	}
+	if faceIndex != 0 {
+		return nil, nil, fmt.Errorf("standalone Type 1 font has one face; face index %d out of range", faceIndex)
+	}
+	font, err := type1.ParseFont(data)
+	if err != nil {
+		return nil, nil, err
+	}
+	face, err := loader.LoadFace(stream)
+	if err != nil {
+		return nil, nil, err
+	}
+	return face, font, nil
+}
+
+func dumpGoGlyph(face api.Face, sel glyphSelection, loadFlags loadFlagSpec, renderMode renderModeSpec, includeBitmapBuffer bool) GlyphRecord {
 	record := GlyphRecord{
 		GlyphIndex: sel.GlyphIndex,
 		Chars:      sel.Chars,
@@ -370,7 +432,8 @@ func dumpGoGlyph(face api.Face, sel glyphSelection, loadFlags loadFlagSpec, rend
 		Bitmap:     BitmapRecord{Available: false},
 	}
 
-	slot, err := face.LoadGlyph(sel.GlyphIndex, loadFlags.Value)
+	effectiveLoadFlags := loadFlagsForRenderMode(loadFlags.Value, renderMode.Value)
+	slot, err := face.LoadGlyph(sel.GlyphIndex, effectiveLoadFlags)
 	if err != nil {
 		record.LoadError = err.Error()
 		record.Metrics.Error = err.Error()
@@ -382,9 +445,9 @@ func dumpGoGlyph(face api.Face, sel glyphSelection, loadFlags loadFlagSpec, rend
 	record.Metrics = dumpGoMetrics(face, sel.GlyphIndex)
 	record.SlotMetrics = dumpGoSlotMetrics(slot)
 	record.Outline = dumpOutline(slot.GetOutline())
-	record.Bitmap = dumpBitmap(slot.GetBitmap())
+	record.Bitmap = dumpBitmap(slot.GetBitmap(), includeBitmapBuffer)
 	record.Format = goGlyphFormat(record.Outline, record.Bitmap, slot.GetImage())
-	record.RenderedFormat = record.Format
+	record.RenderedFormat = goRenderedGlyphFormat(record, renderMode.Value)
 	if renderMode.Value != api.RenderModeNone && !record.Bitmap.Available {
 		record.RenderError = fmt.Sprintf("render mode %s unsupported by Go conformance dumper", renderMode.Name)
 		record.Bitmap.Error = record.RenderError
@@ -402,12 +465,47 @@ func dumpGoGlyph(face api.Face, sel glyphSelection, loadFlags loadFlagSpec, rend
 	return record
 }
 
+func dumpGoGlyphWithType1Segments(face api.Face, sel glyphSelection, loadFlags loadFlagSpec, renderMode renderModeSpec, includeBitmapBuffer bool, font *type1.Font) GlyphRecord {
+	record := dumpGoGlyph(face, sel, loadFlags, renderMode, includeBitmapBuffer)
+	if record.LoadError != "" || font == nil || sel.GlyphIndex < 0 || sel.GlyphIndex >= len(font.GlyphNames) {
+		return record
+	}
+
+	result, err := font.DecodeGlyph(font.GlyphNames[sel.GlyphIndex])
+	if err != nil || result == nil || len(result.Segments) == 0 {
+		return record
+	}
+	record.Type1Segments = type1.SegmentsToRecords(result.Segments)
+	return record
+}
+
 func dumpGoSlotMetrics(slot api.GlyphSlot) *SlotMetricsRecord {
 	metrics, ok := api.GetGlyphSlotMetrics(slot)
 	if !ok {
 		return &SlotMetricsRecord{Available: false, Error: "glyph slot metrics unavailable"}
 	}
 	return slotMetricsRecord(metrics)
+}
+
+func loadFlagsForRenderMode(loadFlags int, renderMode api.RenderMode) int {
+	if renderMode == api.RenderModeNone {
+		return loadFlags
+	}
+	loadFlags |= api.LoadRender
+	loadFlags &^= api.LoadTargetMask
+	switch renderMode {
+	case api.RenderModeLight:
+		loadFlags |= api.LoadTargetLight
+	case api.RenderModeMono:
+		loadFlags |= api.LoadTargetMono
+	case api.RenderModeLCD:
+		loadFlags |= api.LoadTargetLCD
+	case api.RenderModeLCDV:
+		loadFlags |= api.LoadTargetLCDV
+	default:
+		loadFlags |= api.LoadTargetNormal
+	}
+	return loadFlags
 }
 
 func dumpGoMetrics(face api.Face, glyphIndex int) MetricsRecord {
@@ -443,6 +541,13 @@ func goGlyphFormat(outline OutlineRecord, bitmap BitmapRecord, image *api.Image)
 	default:
 		return "none"
 	}
+}
+
+func goRenderedGlyphFormat(record GlyphRecord, renderMode api.RenderMode) string {
+	if renderMode != api.RenderModeNone && record.Bitmap.Available {
+		return "bitmap"
+	}
+	return record.Format
 }
 
 func dumpOutline(outline api.Outline) OutlineRecord {
@@ -491,13 +596,13 @@ func dumpOutline(outline api.Outline) OutlineRecord {
 	}
 }
 
-func dumpBitmap(bitmap api.Bitmap) BitmapRecord {
+func dumpBitmap(bitmap api.Bitmap, includeBuffer bool) BitmapRecord {
 	if bitmap == nil {
 		return BitmapRecord{Available: false, Error: "bitmap unavailable"}
 	}
 	buffer := bitmap.GetBuffer()
 	sum := sha256.Sum256(buffer)
-	return BitmapRecord{
+	record := BitmapRecord{
 		Available:     true,
 		Rows:          bitmap.GetRows(),
 		Width:         bitmap.GetWidth(),
@@ -507,6 +612,14 @@ func dumpBitmap(bitmap api.Bitmap) BitmapRecord {
 		BufferSize:    len(buffer),
 		SHA256:        fmt.Sprintf("%x", sum),
 	}
+	if includeBuffer {
+		record.BufferHex = hex.EncodeToString(buffer)
+	}
+	if left, top, ok := api.GetBitmapPlacement(bitmap); ok {
+		record.Left = left
+		record.Top = top
+	}
+	return record
 }
 
 func realOutlinePointCount(points []api.Vector, contours []int) int {
@@ -603,16 +716,18 @@ func newDump(engineName, engineVersion string, source SourceInfo, opts dumpOptio
 		},
 		Source: source,
 		Request: RequestInfo{
-			FaceIndex:    opts.FaceIndex,
-			PPEM:         sizeSpecStrings(opts.PPEMs),
-			Glyphs:       append([]int(nil), opts.Glyphs...),
-			Chars:        charSpecLabels(opts.Chars),
-			LoadFlags:    strings.Join(loadFlagNames(opts.LoadFlags), ","),
-			LoadFlagSets: multiValue(loadFlagNames(opts.LoadFlags)),
-			RenderMode:   strings.Join(renderModeNames(opts.RenderModes), ","),
-			RenderModes:  multiValue(renderModeNames(opts.RenderModes)),
-			RequestPath:  opts.RequestPath,
-			Corpus:       opts.Corpus,
+			FaceIndex:           opts.FaceIndex,
+			PPEM:                sizeSpecStrings(opts.PPEMs),
+			Glyphs:              append([]int(nil), opts.Glyphs...),
+			Chars:               charSpecLabels(opts.Chars),
+			LoadFlags:           strings.Join(loadFlagNames(opts.LoadFlags), ","),
+			LoadFlagSets:        multiValue(loadFlagNames(opts.LoadFlags)),
+			RenderMode:          strings.Join(renderModeNames(opts.RenderModes), ","),
+			RenderModes:         multiValue(renderModeNames(opts.RenderModes)),
+			RequestPath:         opts.RequestPath,
+			Corpus:              opts.Corpus,
+			ExpectedGaps:        append([]ExpectedGap(nil), opts.ExpectedGaps...),
+			IncludeBitmapBuffer: opts.IncludeBitmapBuffer,
 		},
 		Face:    face,
 		Charmap: charmap,
@@ -674,18 +789,20 @@ func buildSourceInfo(path string) (SourceInfo, error) {
 }
 
 type dumpRequestFile struct {
-	Description string     `json:"description,omitempty"`
-	FontPath    string     `json:"font,omitempty"`
-	OutputPath  string     `json:"out,omitempty"`
-	Corpus      string     `json:"corpus,omitempty"`
-	FaceIndex   *int       `json:"face_index,omitempty"`
-	PPEM        stringList `json:"ppem,omitempty"`
-	Glyphs      intList    `json:"glyphs,omitempty"`
-	GlyphRanges stringList `json:"glyph_ranges,omitempty"`
-	Chars       stringList `json:"chars,omitempty"`
-	LoadFlags   stringList `json:"load_flags,omitempty"`
-	RenderMode  stringList `json:"render_mode,omitempty"`
-	RenderModes stringList `json:"render_modes,omitempty"`
+	Description         string        `json:"description,omitempty"`
+	FontPath            string        `json:"font,omitempty"`
+	OutputPath          string        `json:"out,omitempty"`
+	Corpus              string        `json:"corpus,omitempty"`
+	FaceIndex           *int          `json:"face_index,omitempty"`
+	PPEM                stringList    `json:"ppem,omitempty"`
+	Glyphs              intList       `json:"glyphs,omitempty"`
+	GlyphRanges         stringList    `json:"glyph_ranges,omitempty"`
+	Chars               stringList    `json:"chars,omitempty"`
+	LoadFlags           stringList    `json:"load_flags,omitempty"`
+	RenderMode          stringList    `json:"render_mode,omitempty"`
+	RenderModes         stringList    `json:"render_modes,omitempty"`
+	ExpectedGaps        []ExpectedGap `json:"expected_gaps,omitempty"`
+	IncludeBitmapBuffer bool          `json:"include_bitmap_buffer,omitempty"`
 }
 
 type stringList []string
@@ -781,6 +898,9 @@ func readDumpRequest(path string) (*dumpRequestFile, error) {
 	if err := decoder.Decode(&request); err != nil {
 		return nil, fmt.Errorf("decode request: %w", err)
 	}
+	if err := validateExpectedGaps(request.ExpectedGaps); err != nil {
+		return nil, fmt.Errorf("decode request: %w", err)
+	}
 	return &request, nil
 }
 
@@ -821,6 +941,19 @@ func applyDumpRequest(opts *dumpOptions, request *dumpRequestFile, visited map[s
 	if len(renderModes) > 0 && !visited["render-mode"] {
 		*renderModeList = strings.Join([]string(renderModes), ",")
 	}
+	opts.ExpectedGaps = append([]ExpectedGap(nil), request.ExpectedGaps...)
+	if request.IncludeBitmapBuffer && !visited["include-bitmap-buffer"] {
+		opts.IncludeBitmapBuffer = true
+	}
+}
+
+func validateExpectedGaps(gaps []ExpectedGap) error {
+	for i, gap := range gaps {
+		if strings.TrimSpace(gap.Kind) == "" && strings.TrimSpace(gap.Path) == "" {
+			return fmt.Errorf("expected_gaps[%d] must set kind or path", i)
+		}
+	}
+	return nil
 }
 
 func visitedFlags(fs *flag.FlagSet) map[string]bool {
@@ -1218,8 +1351,10 @@ func pixelModeName(mode uint8) string {
 		return "mono"
 	case api.MODE_GRAY:
 		return "gray"
-	case api.MODE_LCD:
+	case api.MODE_LCD, 5:
 		return "lcd"
+	case core.PixelModeLCDV, 6:
+		return "lcd-v"
 	default:
 		return fmt.Sprintf("unknown-%d", mode)
 	}

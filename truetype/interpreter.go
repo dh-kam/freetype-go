@@ -29,12 +29,13 @@ var (
 
 // Zone represents a TrueType zone (Twilight or Glyph).
 type Zone struct {
-	Points         []api.Vector
-	OriginalPoints []api.Vector
-	TouchedX       []bool
-	TouchedY       []bool
-	Contours       []int
-	Tags           []byte
+	Points                 []api.Vector
+	OriginalPoints         []api.Vector
+	UnscaledOriginalPoints []api.Vector
+	TouchedX               []bool
+	TouchedY               []bool
+	Contours               []int
+	Tags                   []byte
 }
 
 // CallRecord stores the state to return to after a function call.
@@ -61,6 +62,7 @@ type GraphicsState struct {
 	SuperRoundPeriod      int32
 	SuperRoundPhase       int32
 	SuperRoundThreshold   int32
+	Compensations         [4]F26Dot6
 	InstructControl       byte
 	ScanControl           bool
 	ScanType              int32
@@ -95,6 +97,8 @@ type ExecutionEnv struct {
 	PPEM       int
 	PointSize  int32
 	UnitsPerEm uint16
+	XScale     int32
+	YScale     int32
 
 	InterpreterVersion int32
 	Rotated            bool
@@ -109,6 +113,8 @@ type ExecutionEnv struct {
 
 	steps      int
 	pendingErr error
+	iupXCalled bool
+	iupYCalled bool
 }
 
 var contextPool = sync.Pool{
@@ -151,6 +157,7 @@ func (e *ExecutionEnv) Reset(sys api.FreetypeSystem) {
 	e.GS.SuperRoundPeriod = 64
 	e.GS.SuperRoundPhase = 0
 	e.GS.SuperRoundThreshold = 0
+	e.GS.Compensations = [4]F26Dot6{}
 	e.GS.InstructControl = 0
 	e.GS.ScanControl = false
 	e.GS.ScanType = 0
@@ -175,6 +182,8 @@ func (e *ExecutionEnv) Reset(sys api.FreetypeSystem) {
 	e.MaxCallDepth = defaultMaxCallDepth
 	e.MaxLoopCallRepeat = defaultLoopCallRepeat
 	e.UnitsPerEm = 0
+	e.XScale = 1 << 16
+	e.YScale = 1 << 16
 	e.InterpreterVersion = 35
 	e.Rotated = false
 	e.Stretched = false
@@ -183,6 +192,8 @@ func (e *ExecutionEnv) Reset(sys api.FreetypeSystem) {
 	e.RenderMode = api.RenderModeNone
 	e.steps = 0
 	e.pendingErr = nil
+	e.iupXCalled = false
+	e.iupYCalled = false
 
 	e.ZP0 = 1
 	e.ZP1 = 1
@@ -191,11 +202,15 @@ func (e *ExecutionEnv) Reset(sys api.FreetypeSystem) {
 	e.RP1 = 0
 	e.RP2 = 0
 	e.System = sys
+	e.Zones[1].UnscaledOriginalPoints = nil
 
 	// Clear Zone 0 (Twilight Zone)
 	for i := range e.Zones[0].Points {
 		e.Zones[0].Points[i] = api.Vector{}
 		e.Zones[0].OriginalPoints[i] = api.Vector{}
+		if i < len(e.Zones[0].UnscaledOriginalPoints) {
+			e.Zones[0].UnscaledOriginalPoints[i] = api.Vector{}
+		}
 		e.Zones[0].TouchedX[i] = false
 		e.Zones[0].TouchedY[i] = false
 		if i < len(e.Zones[0].Tags) {
@@ -211,12 +226,18 @@ func (e *ExecutionEnv) Prepare(maxTwilightPoints, maxStorage, maxStack int, ppem
 	if maxTwilightPoints > len(e.Zones[0].Points) {
 		e.Zones[0].Points = make([]api.Vector, maxTwilightPoints)
 		e.Zones[0].OriginalPoints = make([]api.Vector, maxTwilightPoints)
+		e.Zones[0].UnscaledOriginalPoints = make([]api.Vector, maxTwilightPoints)
 		e.Zones[0].TouchedX = make([]bool, maxTwilightPoints)
 		e.Zones[0].TouchedY = make([]bool, maxTwilightPoints)
 		e.Zones[0].Tags = make([]byte, maxTwilightPoints)
 	} else {
 		e.Zones[0].Points = e.Zones[0].Points[:maxTwilightPoints]
 		e.Zones[0].OriginalPoints = e.Zones[0].OriginalPoints[:maxTwilightPoints]
+		if len(e.Zones[0].UnscaledOriginalPoints) >= maxTwilightPoints {
+			e.Zones[0].UnscaledOriginalPoints = e.Zones[0].UnscaledOriginalPoints[:maxTwilightPoints]
+		} else {
+			e.Zones[0].UnscaledOriginalPoints = make([]api.Vector, maxTwilightPoints)
+		}
 		e.Zones[0].TouchedX = e.Zones[0].TouchedX[:maxTwilightPoints]
 		e.Zones[0].TouchedY = e.Zones[0].TouchedY[:maxTwilightPoints]
 		if len(e.Zones[0].Tags) >= maxTwilightPoints {
@@ -306,6 +327,9 @@ func (e *ExecutionEnv) Run() error {
 		}
 		if e.pendingErr != nil {
 			return fmt.Errorf("error at IP %d (opcode 0x%02x): %w", startIP, opcode, e.pendingErr)
+		}
+		if e.IP < 0 || e.IP > len(e.Code) {
+			return fmt.Errorf("error at IP %d (opcode 0x%02x): instruction pointer out of bounds: %d", startIP, opcode, e.IP)
 		}
 	}
 	return nil

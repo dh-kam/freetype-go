@@ -13,6 +13,7 @@ type GPOS struct {
 	ScriptList   *ScriptList
 	FeatureList  *FeatureList
 	LookupList   *LookupList
+	GDEF         *GDEF
 	Data         []byte
 }
 
@@ -99,8 +100,12 @@ func (g *GPOS) applyLookup(lookup *LookupTable, glyphs []int, adjustments []api.
 		g.applySinglePos(lookup, glyphs, adjustments)
 	case 2: // Pair Adjustment
 		g.applyPairAdj(lookup, glyphs, adjustments)
+	case 3: // Cursive Attachment
+		g.applyCursivePos(lookup, glyphs, adjustments)
 	case 4: // Mark-to-Base
 		g.applyMarkToBasePos(lookup, glyphs, adjustments)
+	case 5: // Mark-to-Ligature
+		g.applyMarkToLigaturePos(lookup, glyphs, adjustments)
 	case 6: // Mark-to-Mark
 		g.applyMarkToMarkPos(lookup, glyphs, adjustments)
 	case 9: // Extension Positioning
@@ -108,6 +113,91 @@ func (g *GPOS) applyLookup(lookup *LookupTable, glyphs []int, adjustments []api.
 	default:
 		// Unsupported
 	}
+}
+
+func (g *GPOS) applyCursivePos(lookup *LookupTable, glyphs []int, adjustments []api.Vector) {
+	for _, off := range lookup.SubtableOffsets {
+		if !hasTableBytes(g.Data, off, 6) {
+			continue
+		}
+		d := g.Data[off:]
+		format := binary.BigEndian.Uint16(d[0:2])
+		if format != 1 {
+			continue
+		}
+
+		coverageOffset, ok := resolveTableOffset(off, binary.BigEndian.Uint16(d[2:4]))
+		if !ok {
+			continue
+		}
+		coverage, err := ParseCoverage(g.Data, uint16(coverageOffset))
+		if err != nil {
+			continue
+		}
+
+		entryExitCount := binary.BigEndian.Uint16(d[4:6])
+		if !hasTableBytes(g.Data, off, 6+int(entryExitCount)*4) {
+			continue
+		}
+
+		for i := 0; i < len(glyphs); i++ {
+			if lookupIgnoresGlyph(g.GDEF, lookup, glyphs[i]) {
+				continue
+			}
+			prevGlyphIndex := prevLookupGlyphIndex(g.GDEF, lookup, glyphs, i-1)
+			if prevGlyphIndex < 0 {
+				continue
+			}
+			prevIndex := coverage.GetIndex(glyphs[prevGlyphIndex])
+			currIndex := coverage.GetIndex(glyphs[i])
+			if prevIndex < 0 || prevIndex >= int(entryExitCount) || currIndex < 0 || currIndex >= int(entryExitCount) {
+				continue
+			}
+
+			_, exitAnchor, ok := g.readEntryExitRecord(int(off), prevIndex)
+			if !ok || exitAnchor == nil {
+				continue
+			}
+			entryAnchor, _, ok := g.readEntryExitRecord(int(off), currIndex)
+			if !ok || entryAnchor == nil {
+				continue
+			}
+
+			adjustments[i].X += adjustments[prevGlyphIndex].X + int32(exitAnchor.X-entryAnchor.X)
+			adjustments[i].Y += adjustments[prevGlyphIndex].Y + int32(exitAnchor.Y-entryAnchor.Y)
+		}
+	}
+}
+
+func (g *GPOS) readEntryExitRecord(cursiveOffset int, coverageIndex int) (*anchor, *anchor, bool) {
+	recordOffset := cursiveOffset + 6 + coverageIndex*4
+	if coverageIndex < 0 || !hasBytesAt(g.Data, recordOffset, 4) {
+		return nil, nil, false
+	}
+
+	entryRel := binary.BigEndian.Uint16(g.Data[recordOffset : recordOffset+2])
+	exitRel := binary.BigEndian.Uint16(g.Data[recordOffset+2 : recordOffset+4])
+	var entryAnchor *anchor
+	var exitAnchor *anchor
+
+	if entryRel != 0 {
+		entryOffset := cursiveOffset + int(entryRel)
+		if !hasBytesAt(g.Data, entryOffset, 6) {
+			return nil, nil, false
+		}
+		entry := parseAnchor(g.Data, entryOffset)
+		entryAnchor = &entry
+	}
+	if exitRel != 0 {
+		exitOffset := cursiveOffset + int(exitRel)
+		if !hasBytesAt(g.Data, exitOffset, 6) {
+			return nil, nil, false
+		}
+		exit := parseAnchor(g.Data, exitOffset)
+		exitAnchor = &exit
+	}
+
+	return entryAnchor, exitAnchor, true
 }
 
 func (g *GPOS) applySinglePos(lookup *LookupTable, glyphs []int, adjustments []api.Vector) {
@@ -136,6 +226,9 @@ func (g *GPOS) applySinglePos(lookup *LookupTable, glyphs []int, adjustments []a
 			}
 			vr, _ := ParseValueRecord(d[6:6+valueSize], valueFormat)
 			for i, gid := range glyphs {
+				if lookupIgnoresGlyph(g.GDEF, lookup, gid) {
+					continue
+				}
 				if coverage.GetIndex(gid) >= 0 {
 					adjustments[i].X += int32(vr.XPlacement)
 					adjustments[i].Y += int32(vr.YPlacement)
@@ -154,6 +247,9 @@ func (g *GPOS) applySinglePos(lookup *LookupTable, glyphs []int, adjustments []a
 				continue
 			}
 			for i, gid := range glyphs {
+				if lookupIgnoresGlyph(g.GDEF, lookup, gid) {
+					continue
+				}
 				idx := coverage.GetIndex(gid)
 				if idx >= 0 && idx < int(count) {
 					// This is inefficient to parse every time, but for simplicity:
@@ -216,6 +312,9 @@ func (g *GPOS) applyMarkToBasePos(lookup *LookupTable, glyphs []int, adjustments
 		// Iterate through glyphs to find marks
 		for i := 1; i < len(glyphs); i++ {
 			markGid := glyphs[i]
+			if lookupIgnoresGlyph(g.GDEF, lookup, markGid) {
+				continue
+			}
 			markIdx := markCoverage.GetIndex(markGid)
 			if markIdx < 0 {
 				continue
@@ -224,6 +323,9 @@ func (g *GPOS) applyMarkToBasePos(lookup *LookupTable, glyphs []int, adjustments
 			// Found a mark, find its preceding base
 			baseIdxInGlyphs := -1
 			for j := i - 1; j >= 0; j-- {
+				if lookupIgnoresGlyph(g.GDEF, lookup, glyphs[j]) {
+					continue
+				}
 				if baseCoverage.GetIndex(glyphs[j]) >= 0 {
 					baseIdxInGlyphs = j
 					break
@@ -302,6 +404,95 @@ func (g *GPOS) applyMarkToBasePos(lookup *LookupTable, glyphs []int, adjustments
 	}
 }
 
+func (g *GPOS) applyMarkToLigaturePos(lookup *LookupTable, glyphs []int, adjustments []api.Vector) {
+	for _, off := range lookup.SubtableOffsets {
+		if !hasTableBytes(g.Data, off, 12) {
+			continue
+		}
+		d := g.Data[off:]
+		format := binary.BigEndian.Uint16(d[0:2])
+		if format != 1 {
+			continue
+		}
+
+		markCoverageOff := binary.BigEndian.Uint16(d[2:4])
+		ligatureCoverageOff := binary.BigEndian.Uint16(d[4:6])
+		markClassCount := binary.BigEndian.Uint16(d[6:8])
+		markArrayOff := binary.BigEndian.Uint16(d[8:10])
+		ligatureArrayOff := binary.BigEndian.Uint16(d[10:12])
+		if markClassCount == 0 {
+			continue
+		}
+
+		markCoverageOffset, ok := resolveTableOffset(off, markCoverageOff)
+		if !ok {
+			continue
+		}
+		ligatureCoverageOffset, ok := resolveTableOffset(off, ligatureCoverageOff)
+		if !ok {
+			continue
+		}
+		markCoverage, err := ParseCoverage(g.Data, uint16(markCoverageOffset))
+		if err != nil {
+			continue
+		}
+		ligatureCoverage, err := ParseCoverage(g.Data, uint16(ligatureCoverageOffset))
+		if err != nil {
+			continue
+		}
+		markArrayOffset, ok := resolveTableOffset(off, markArrayOff)
+		if !ok || !hasBytesAt(g.Data, markArrayOffset, 2) {
+			continue
+		}
+		ligatureArrayOffset, ok := resolveTableOffset(off, ligatureArrayOff)
+		if !ok || !hasBytesAt(g.Data, ligatureArrayOffset, 2) {
+			continue
+		}
+
+		for i := 1; i < len(glyphs); i++ {
+			if lookupIgnoresGlyph(g.GDEF, lookup, glyphs[i]) {
+				continue
+			}
+			markIndex := markCoverage.GetIndex(glyphs[i])
+			if markIndex < 0 {
+				continue
+			}
+
+			ligatureGlyphIndex := -1
+			ligatureCoverageIndex := -1
+			for j := i - 1; j >= 0; j-- {
+				if lookupIgnoresGlyph(g.GDEF, lookup, glyphs[j]) {
+					continue
+				}
+				if coverageIndex := ligatureCoverage.GetIndex(glyphs[j]); coverageIndex >= 0 {
+					ligatureGlyphIndex = j
+					ligatureCoverageIndex = coverageIndex
+					break
+				}
+			}
+			if ligatureGlyphIndex < 0 {
+				continue
+			}
+
+			class, markAnchor, ok := g.readMarkArrayRecord(markArrayOffset, markIndex, markClassCount)
+			if !ok {
+				continue
+			}
+			componentIndex := i - ligatureGlyphIndex - 1
+			if g.GDEF != nil {
+				componentIndex = countNonMarkGlyphs(g.GDEF, lookup, glyphs, ligatureGlyphIndex+1, i)
+			}
+			ligatureAnchor, ok := g.readLigatureArrayAnchor(ligatureArrayOffset, ligatureCoverageIndex, componentIndex, int(class), markClassCount)
+			if !ok {
+				continue
+			}
+
+			adjustments[i].X += int32(ligatureAnchor.X-markAnchor.X) + adjustments[ligatureGlyphIndex].X
+			adjustments[i].Y += int32(ligatureAnchor.Y-markAnchor.Y) + adjustments[ligatureGlyphIndex].Y
+		}
+	}
+}
+
 func (g *GPOS) applyMarkToMarkPos(lookup *LookupTable, glyphs []int, adjustments []api.Vector) {
 	for _, off := range lookup.SubtableOffsets {
 		if !hasTableBytes(g.Data, off, 12) {
@@ -348,6 +539,9 @@ func (g *GPOS) applyMarkToMarkPos(lookup *LookupTable, glyphs []int, adjustments
 		}
 
 		for i := 1; i < len(glyphs); i++ {
+			if lookupIgnoresGlyph(g.GDEF, lookup, glyphs[i]) {
+				continue
+			}
 			mark1Index := mark1Coverage.GetIndex(glyphs[i])
 			if mark1Index < 0 {
 				continue
@@ -356,6 +550,9 @@ func (g *GPOS) applyMarkToMarkPos(lookup *LookupTable, glyphs []int, adjustments
 			mark2GlyphIndex := -1
 			mark2CoverageIndex := -1
 			for j := i - 1; j >= 0; j-- {
+				if lookupIgnoresGlyph(g.GDEF, lookup, glyphs[j]) {
+					continue
+				}
 				if coverageIndex := mark2Coverage.GetIndex(glyphs[j]); coverageIndex >= 0 {
 					mark2GlyphIndex = j
 					mark2CoverageIndex = coverageIndex
@@ -436,6 +633,55 @@ func (g *GPOS) readMark2ArrayAnchor(mark2ArrayOffset int, mark2Index int, class 
 	return parseAnchor(g.Data, anchorAbsoluteOffset), true
 }
 
+func (g *GPOS) readLigatureArrayAnchor(ligatureArrayOffset int, ligatureIndex int, componentIndex int, class int, markClassCount uint16) (anchor, bool) {
+	if ligatureIndex < 0 || class < 0 || class >= int(markClassCount) || !hasBytesAt(g.Data, ligatureArrayOffset, 2) {
+		return anchor{}, false
+	}
+	ligatureCount := binary.BigEndian.Uint16(g.Data[ligatureArrayOffset : ligatureArrayOffset+2])
+	if ligatureIndex >= int(ligatureCount) {
+		return anchor{}, false
+	}
+
+	ligatureAttachOffsetEntry := ligatureArrayOffset + 2 + ligatureIndex*2
+	if !hasBytesAt(g.Data, ligatureAttachOffsetEntry, 2) {
+		return anchor{}, false
+	}
+	ligatureAttachRel := binary.BigEndian.Uint16(g.Data[ligatureAttachOffsetEntry : ligatureAttachOffsetEntry+2])
+	if ligatureAttachRel == 0 {
+		return anchor{}, false
+	}
+	ligatureAttachOffset := ligatureArrayOffset + int(ligatureAttachRel)
+	if !hasBytesAt(g.Data, ligatureAttachOffset, 2) {
+		return anchor{}, false
+	}
+	componentCount := binary.BigEndian.Uint16(g.Data[ligatureAttachOffset : ligatureAttachOffset+2])
+	if componentCount == 0 {
+		return anchor{}, false
+	}
+	if componentIndex < 0 {
+		componentIndex = 0
+	}
+	if componentIndex >= int(componentCount) {
+		componentIndex = int(componentCount) - 1
+	}
+
+	recordOffset := ligatureAttachOffset + 2 + componentIndex*int(markClassCount)*2
+	anchorOffsetEntry := recordOffset + class*2
+	if !hasBytesAt(g.Data, anchorOffsetEntry, 2) {
+		return anchor{}, false
+	}
+	anchorOffset := binary.BigEndian.Uint16(g.Data[anchorOffsetEntry : anchorOffsetEntry+2])
+	if anchorOffset == 0 {
+		return anchor{}, false
+	}
+
+	anchorAbsoluteOffset := ligatureAttachOffset + int(anchorOffset)
+	if !hasBytesAt(g.Data, anchorAbsoluteOffset, 6) {
+		return anchor{}, false
+	}
+	return parseAnchor(g.Data, anchorAbsoluteOffset), true
+}
+
 type anchor struct {
 	X, Y int16
 }
@@ -479,17 +725,21 @@ func (g *GPOS) applyPairAdj(lookup *LookupTable, glyphs []int, adjustments []api
 			if !hasTableBytes(g.Data, off, 10+int(pairSetCount)*2) {
 				continue
 			}
-			pairSetOffsets := make([]uint16, int(pairSetCount))
-			for i := 0; i < int(pairSetCount); i++ {
-				pairSetOffsets[i] = binary.BigEndian.Uint16(d[10+i*2 : 12+i*2])
-			}
 
-			for i := 0; i < len(glyphs)-1; i++ {
+			for i := 0; i < len(glyphs); i++ {
+				if lookupIgnoresGlyph(g.GDEF, lookup, glyphs[i]) {
+					continue
+				}
+				secondIndex := nextLookupGlyphIndex(g.GDEF, lookup, glyphs, i+1)
+				if secondIndex < 0 {
+					continue
+				}
 				gid1 := glyphs[i]
-				gid2 := glyphs[i+1]
+				gid2 := glyphs[secondIndex]
 				covIdx := coverage.GetIndex(gid1)
 				if covIdx >= 0 && covIdx < int(pairSetCount) {
-					psOff := int(off) + int(pairSetOffsets[covIdx])
+					pairSetRel := binary.BigEndian.Uint16(d[10+covIdx*2 : 12+covIdx*2])
+					psOff := int(off) + int(pairSetRel)
 					if !hasBytesAt(g.Data, psOff, 2) {
 						continue
 					}
@@ -509,7 +759,7 @@ func (g *GPOS) applyPairAdj(lookup *LookupTable, glyphs []int, adjustments []api
 							vr2, _ := ParseValueRecord(g.Data[curr+2+size1:], valFormat2)
 
 							applyPairValueRecord(adjustments, i, vr1)
-							applyPairValueRecord(adjustments, i+1, vr2)
+							applyPairValueRecord(adjustments, secondIndex, vr2)
 							break
 						}
 						// Need to calculate size of pair value record to skip
@@ -554,13 +804,20 @@ func (g *GPOS) applyPairAdj(lookup *LookupTable, glyphs []int, adjustments []api
 			}
 
 			classRecordsOffset := int(off) + 16
-			for i := 0; i < len(glyphs)-1; i++ {
+			for i := 0; i < len(glyphs); i++ {
+				if lookupIgnoresGlyph(g.GDEF, lookup, glyphs[i]) {
+					continue
+				}
+				secondIndex := nextLookupGlyphIndex(g.GDEF, lookup, glyphs, i+1)
+				if secondIndex < 0 {
+					continue
+				}
 				if coverage.GetIndex(glyphs[i]) < 0 {
 					continue
 				}
 
 				class1 := classDef1.GetClass(glyphs[i])
-				class2 := classDef2.GetClass(glyphs[i+1])
+				class2 := classDef2.GetClass(glyphs[secondIndex])
 				if class1 < 0 || class1 >= int(class1Count) || class2 < 0 || class2 >= int(class2Count) {
 					continue
 				}
@@ -574,7 +831,7 @@ func (g *GPOS) applyPairAdj(lookup *LookupTable, glyphs []int, adjustments []api
 				vr1, _ := ParseValueRecord(g.Data[recordOffset:recordOffset+valueSize1], valFormat1)
 				vr2, _ := ParseValueRecord(g.Data[recordOffset+valueSize1:recordOffset+class2RecordSize], valFormat2)
 				applyPairValueRecord(adjustments, i, vr1)
-				applyPairValueRecord(adjustments, i+1, vr2)
+				applyPairValueRecord(adjustments, secondIndex, vr2)
 			}
 		}
 	}
@@ -590,7 +847,7 @@ func applyPairValueRecord(adjustments []api.Vector, index int, vr ValueRecord) {
 
 func (g *GPOS) applyExtensionPos(lookup *LookupTable, glyphs []int, adjustments []api.Vector) {
 	for _, off := range lookup.SubtableOffsets {
-		extensionLookup, ok := parseExtensionLookup(g.Data, off, lookup.Flag, 9)
+		extensionLookup, ok := parseExtensionLookup(g.Data, off, lookup.Flag, lookup.MarkFilteringSet, 9)
 		if !ok {
 			continue
 		}

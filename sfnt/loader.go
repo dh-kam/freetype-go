@@ -17,6 +17,11 @@ import (
 
 const tagTTCF = 0x74746366
 
+const (
+	outlineTagHasScanMode = 0x04
+	outlineTagScanMode    = 0xE0
+)
+
 // loader implements api.Driver for SFNT formats.
 type loader struct {
 	sys api.FreetypeSystem
@@ -55,7 +60,21 @@ func (f *Face) getVM() *truetype.ExecutionEnv {
 	}
 
 	vm.Prepare(maxT, maxS, maxStk, f.yPPEM, f.pointSize)
+	f.configureVM(vm, api.LoadDefault)
 	return vm
+}
+
+func (f *Face) configureVM(vm *truetype.ExecutionEnv, loadFlags int) {
+	if vm == nil {
+		return
+	}
+	vm.UnitsPerEm = f.GetUnitsPerEm()
+	vm.XScale = f.xScale
+	vm.YScale = f.yScale
+	vm.InterpreterVersion = 40
+	vm.Variation = f.varEngine != nil
+	vm.RenderMode = renderModeForLoadFlags(loadFlags)
+	vm.Grayscale = vm.RenderMode != api.RenderModeNone && vm.RenderMode != api.RenderModeMono
 }
 
 func (l *loader) Handles(stream api.Stream) bool {
@@ -128,6 +147,45 @@ func (l *loader) LoadFaceIndex(stream api.Stream, faceIndex int) (api.Face, erro
 		f.cvt, _ = parseCvt(s)
 	}
 
+	// Variation tables are needed before CVT scaling/prep so cvar deltas and
+	// VM variation state are visible during size setup.
+	var fvar *ftvar.FvarTable
+	var gvar *ftvar.GvarTable
+	var hvar *ftvar.HVARTable
+	var vvar *ftvar.VVARTable
+	var avar *ftvar.AvarTable
+	var cvar *ftvar.CvarTable
+	var mvar *ftvar.MVARTable
+
+	if s, err := f.GetTable("fvar"); err == nil {
+		fvar, _ = ftvar.ParseFvar(s)
+	}
+	if s, err := f.GetTable("gvar"); err == nil {
+		gvar, _ = ftvar.ParseGvar(s)
+	}
+	if s, err := f.GetTable("HVAR"); err == nil {
+		hvar, _ = ftvar.ParseHVAR(s)
+	}
+	if s, err := f.GetTable("VVAR"); err == nil {
+		vvar, _ = ftvar.ParseVVAR(s)
+	}
+	if fvar != nil {
+		if s, err := f.GetTable("avar"); err == nil {
+			avar, _ = ftvar.ParseAvar(s)
+		}
+		if s, err := f.GetTable("cvar"); err == nil {
+			cvar, _ = ftvar.ParseCvar(s, len(fvar.Axes))
+		}
+		if s, err := f.GetTable("MVAR"); err == nil {
+			mvar, _ = ftvar.ParseMVAR(s)
+		}
+
+		f.varEngine = ftvar.NewVariationEngine(fvar, gvar, hvar, vvar)
+		f.varEngine.SetAvar(avar)
+		f.varEngine.SetCvar(cvar)
+		f.varEngine.SetMVAR(mvar)
+	}
+
 	f.funcs = make(map[int32][]byte)
 	f.instrs = make(map[int32][]byte)
 	f.recomputeSizeMetrics()
@@ -135,7 +193,9 @@ func (l *loader) LoadFaceIndex(stream api.Stream, faceIndex int) (api.Face, erro
 	vm := f.getVM()
 	defer vm.Free()
 
-	f.scaleCVT()
+	if err := f.scaleCVT(); err != nil {
+		return nil, fmt.Errorf("failed to apply CVT variations: %w", err)
+	}
 	vm.CVT = f.scaledCVT
 
 	// Run fpgm once at load time to populate functions/instructions
@@ -149,11 +209,7 @@ func (l *loader) LoadFaceIndex(stream api.Stream, faceIndex int) (api.Face, erro
 
 	// Run prep
 	if len(f.prep) > 0 {
-		vm.Code = f.prep
-		vm.IP = 0
-		vm.Functions = f.funcs
-		vm.Instructions = f.instrs
-		_ = vm.Run()
+		_ = f.runPrep()
 	}
 
 	// Parse 'CFF ' table if present
@@ -162,6 +218,12 @@ func (l *loader) LoadFaceIndex(stream api.Stream, faceIndex int) (api.Face, erro
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse 'CFF ' table: %v", err)
 		}
+	} else if cff2Stream, err := f.GetTable("CFF2"); err == nil {
+		f.cff, err = cff.ParseCFF(cff2Stream, 0)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse 'CFF2' table: %v", err)
+		}
+		f.syncCFFVariationCoordinates()
 	}
 
 	f.glyphSlot = &GlyphSlot{}
@@ -170,6 +232,8 @@ func (l *loader) LoadFaceIndex(stream api.Stream, faceIndex int) (api.Face, erro
 	if hheaStream, err := f.GetTable("hhea"); err == nil {
 		if hhea, err := parseHhea(hheaStream); err == nil {
 			f.hhea = hhea
+			f.baseHhea = hhea
+			f.hasBaseHhea = true
 			if hmtxStream, err := f.GetTable("hmtx"); err == nil {
 				if hmtx, err := parseHmtx(hmtxStream, f.GetNumGlyphs(), int(f.hhea.NumberOfHMetrics)); err == nil {
 					f.hmtx = hmtx
@@ -185,10 +249,21 @@ func (l *loader) LoadFaceIndex(stream api.Stream, faceIndex int) (api.Face, erro
 		}
 	}
 
+	// Parse 'GDEF' table before GSUB/GPOS so lookup flags can use glyph classes
+	// and mark filtering data.
+	if gdefStream, err := f.GetTable("GDEF"); err == nil {
+		if data, err := readStreamData(gdefStream); err == nil {
+			f.gdef, _ = layout.ParseGDEF(data)
+		}
+	}
+
 	// Parse 'GSUB' table
 	if gsubStream, err := f.GetTable("GSUB"); err == nil {
 		if data, err := readStreamData(gsubStream); err == nil {
 			f.gsub, _ = layout.ParseGSUB(data)
+			if f.gsub != nil {
+				f.gsub.GDEF = f.gdef
+			}
 		}
 	}
 
@@ -196,23 +271,36 @@ func (l *loader) LoadFaceIndex(stream api.Stream, faceIndex int) (api.Face, erro
 	if gposStream, err := f.GetTable("GPOS"); err == nil {
 		if data, err := readStreamData(gposStream); err == nil {
 			f.gpos, _ = layout.ParseGPOS(data)
+			if f.gpos != nil {
+				f.gpos.GDEF = f.gdef
+			}
 		}
 	}
 
 	// Parse 'OS/2' table
 	if s, err := f.GetTable("OS/2"); err == nil {
-		f.os2, _ = parseOS2(s)
+		if os2, err := parseOS2(s); err == nil {
+			f.os2 = os2
+			f.baseOS2 = os2
+			f.hasBaseOS2 = true
+		}
 	}
 
 	// Parse 'post' table
 	if s, err := f.GetTable("post"); err == nil {
-		f.post, _ = parsePost(s)
+		if post, err := parsePost(s); err == nil {
+			f.post = post
+			f.basePost = post
+			f.hasBasePost = true
+		}
 	}
 
 	// Parse 'vhea' and 'vmtx' tables
 	if vheaStream, err := f.GetTable("vhea"); err == nil {
 		f.vhea, err = parseVhea(vheaStream)
 		if err == nil {
+			f.baseVhea = f.vhea
+			f.hasBaseVhea = true
 			if vmtxStream, err := f.GetTable("vmtx"); err == nil {
 				f.vmtx, err = parseVmtx(vmtxStream, f.GetNumGlyphs(), int(f.vhea.NumOfLongVerMetrics))
 			}
@@ -221,7 +309,10 @@ func (l *loader) LoadFaceIndex(stream api.Stream, faceIndex int) (api.Face, erro
 
 	// Parse 'VORG' table
 	if s, err := f.GetTable("VORG"); err == nil {
-		f.vorg, _ = parseVORG(s)
+		if vorg, err := parseVORG(s); err == nil {
+			f.vorg = vorg
+			f.hasVORG = true
+		}
 	}
 
 	if s, err := f.GetTable("gasp"); err == nil {
@@ -240,28 +331,31 @@ func (l *loader) LoadFaceIndex(stream api.Stream, faceIndex int) (api.Face, erro
 		f.stat, _ = parseSTAT(s)
 	}
 
-	// Variation tables
-	var fvar *ftvar.FvarTable
-	var gvar *ftvar.GvarTable
-	var hvar *ftvar.HVARTable
-	var vvar *ftvar.VVARTable
+	if s, err := f.GetTable("sbix"); err == nil {
+		if sbix, err := parseSbix(s); err == nil {
+			f.sbix = &sbix
+		}
+	}
+	if s, err := f.GetTable("CBLC"); err == nil {
+		if cblc, err := parseCBLC(s); err == nil {
+			f.cblc = &cblc
+		}
+	} else if s, err := f.GetTable("EBLC"); err == nil {
+		if eblc, err := parseCBLC(s); err == nil {
+			f.cblc = &eblc
+		}
+	}
+	if s, err := f.GetTable("CBDT"); err == nil {
+		if cbdt, err := parseCBDT(s); err == nil {
+			f.cbdt = &cbdt
+		}
+	} else if s, err := f.GetTable("EBDT"); err == nil {
+		if ebdt, err := parseCBDT(s); err == nil {
+			f.cbdt = &ebdt
+		}
+	}
 
-	if s, err := f.GetTable("fvar"); err == nil {
-		fvar, _ = ftvar.ParseFvar(s)
-	}
-	if s, err := f.GetTable("gvar"); err == nil {
-		gvar, _ = ftvar.ParseGvar(s)
-	}
-	if s, err := f.GetTable("HVAR"); err == nil {
-		hvar, _ = ftvar.ParseHVAR(s)
-	}
-	if s, err := f.GetTable("VVAR"); err == nil {
-		vvar, _ = ftvar.ParseVVAR(s)
-	}
-
-	if fvar != nil {
-		f.varEngine = ftvar.NewVariationEngine(fvar, gvar, hvar, vvar)
-	}
+	f.applyMVARMetricDeltas()
 
 	// Parse 'COLR' and 'CPAL' tables
 	if s, err := f.GetTable("COLR"); err == nil {
@@ -351,12 +445,21 @@ type Face struct {
 	head            HeadTable
 	maxp            MaxpTable
 	hhea            HheaTable
+	baseHhea        HheaTable
+	hasBaseHhea     bool
 	hmtx            HmtxTable
 	os2             OS2Table
+	baseOS2         OS2Table
+	hasBaseOS2      bool
 	post            PostTable
+	basePost        PostTable
+	hasBasePost     bool
 	vhea            VheaTable
+	baseVhea        VheaTable
+	hasBaseVhea     bool
 	vmtx            VmtxTable
 	vorg            VORGTable
+	hasVORG         bool
 	gasp            GaspTable
 	hdmx            HdmxTable
 	vdmx            VDMXTable
@@ -365,6 +468,7 @@ type Face struct {
 	colr            *color.COLR
 	cpal            *color.CPAL
 	cmap            CMap
+	gdef            *layout.GDEF
 	gsub            *layout.GSUB
 	gpos            *layout.GPOS
 	fpgm            []byte
@@ -373,6 +477,8 @@ type Face struct {
 	scaledCVT       []int32
 	funcs           map[int32][]byte
 	instrs          map[int32][]byte
+	prepGS          truetype.GraphicsState
+	hasPrepGS       bool
 	sys             api.FreetypeSystem
 	cff             *cff.CFF
 	glyphSlot       *GlyphSlot
@@ -513,18 +619,27 @@ func (f *Face) computeScale(ppem int) int32 {
 	return ftmath.DivFix(int32(ppem), int32(unitsPerEm))
 }
 
-func (f *Face) scaleCVT() {
+func (f *Face) scaleCVT() error {
 	if len(f.cvt) == 0 {
 		f.scaledCVT = nil
-		return
+		return nil
+	}
+	cvt := make([]int32, len(f.cvt))
+	copy(cvt, f.cvt)
+	if f.varEngine != nil {
+		if err := f.varEngine.ApplyCVTDeltas(cvt); err != nil {
+			return err
+		}
 	}
 	f.scaledCVT = make([]int32, len(f.cvt))
-	for i, v := range f.cvt {
+	for i, v := range cvt {
 		f.scaledCVT[i] = f.scaleFUnitsY(v)
 	}
+	return nil
 }
 
 func (f *Face) runPrep() error {
+	f.hasPrepGS = false
 	if len(f.prep) == 0 {
 		return nil
 	}
@@ -543,7 +658,12 @@ func (f *Face) runPrep() error {
 	vm.Functions = f.funcs
 	vm.Instructions = f.instrs
 	vm.CVT = f.scaledCVT
-	return vm.Run()
+	if err := vm.Run(); err != nil {
+		return err
+	}
+	f.prepGS = *vm.GS
+	f.hasPrepGS = true
+	return nil
 }
 
 func (f *Face) scaleFUnitsX(v int32) int32 {
@@ -594,6 +714,15 @@ func shouldHintGlyph(loadFlags int) bool {
 	return loadFlags&(api.LoadNoHinting|api.LoadNoScale) == 0
 }
 
+func shouldGridFitSlotMetrics(loadFlags int) bool {
+	return shouldHintGlyph(loadFlags)
+}
+
+func useMinimalSubpixelHinting(loadFlags int) bool {
+	mode := renderModeForLoadFlags(loadFlags)
+	return shouldHintGlyph(loadFlags) && mode != api.RenderModeNone && mode != api.RenderModeMono
+}
+
 func (f *Face) scaleOutline(outline *core.Outline) {
 	if outline == nil {
 		return
@@ -604,7 +733,25 @@ func (f *Face) scaleOutline(outline *core.Outline) {
 	}
 }
 
-func (f *Face) runGlyphProgram(outline *core.Outline, instructions []byte) error {
+func copyTTOrusPoints(outline *core.Outline) []api.Vector {
+	if outline == nil || len(outline.Points) == 0 {
+		return nil
+	}
+	points := make([]api.Vector, len(outline.Points))
+	for i, p := range outline.Points {
+		points[i] = api.Vector{X: p.X >> 6, Y: p.Y >> 6}
+	}
+	return points
+}
+
+func cloneVectors(points []api.Vector) []api.Vector {
+	if len(points) == 0 {
+		return nil
+	}
+	return append([]api.Vector(nil), points...)
+}
+
+func (f *Face) runGlyphProgram(outline *core.Outline, instructions []byte, loadFlags int, unscaledOriginalPoints []api.Vector) error {
 	if outline == nil || len(instructions) == 0 {
 		return nil
 	}
@@ -617,18 +764,33 @@ func (f *Face) runGlyphProgram(outline *core.Outline, instructions []byte) error
 
 	vm := f.getVM()
 	defer vm.Free()
+	if f.hasPrepGS {
+		*vm.GS = f.prepGS
+	}
+	f.configureVM(vm, loadFlags)
+	vm.GS.BackwardCompatibility = vm.InterpreterVersion >= 40 && useMinimalSubpixelHinting(loadFlags)
+	if vm.GS.BackwardCompatibility {
+		vm.GS.ProjVector = api.Vector{X: 0x4000, Y: 0}
+		vm.GS.FreeVector = vm.GS.ProjVector
+		vm.GS.DualVector = vm.GS.ProjVector
+	}
 
 	vm.Functions = f.funcs
 	vm.Instructions = f.instrs
 	vm.CVT = cvt
 	vm.Zones[1] = truetype.Zone{
-		Points:         points,
-		OriginalPoints: make([]api.Vector, len(outline.Points)),
-		TouchedX:       make([]bool, len(outline.Points)),
-		TouchedY:       make([]bool, len(outline.Points)),
-		Contours:       outline.Contours,
+		Points:                 points,
+		OriginalPoints:         make([]api.Vector, len(outline.Points)),
+		UnscaledOriginalPoints: nil,
+		TouchedX:               make([]bool, len(outline.Points)),
+		TouchedY:               make([]bool, len(outline.Points)),
+		Contours:               outline.Contours,
+		Tags:                   append([]byte{}, outline.Tags...),
 	}
 	copy(vm.Zones[1].OriginalPoints, outline.Points)
+	if len(unscaledOriginalPoints) == len(outline.Points) {
+		vm.Zones[1].UnscaledOriginalPoints = cloneVectors(unscaledOriginalPoints)
+	}
 
 	vm.Code = instructions
 	vm.IP = 0
@@ -643,9 +805,21 @@ func (f *Face) runGlyphProgram(outline *core.Outline, instructions []byte) error
 		return err
 	}
 
+	applyScanModeTag(vm.Zones[1].Tags[:clampRealPointCount(realPointCount(outline), outline)], vm.GS.ScanControl, vm.GS.ScanType)
 	copy(outline.Points, points)
+	if len(vm.Zones[1].Tags) == len(outline.Tags) {
+		copy(outline.Tags, vm.Zones[1].Tags)
+	}
 	copy(f.scaledCVT, cvt)
 	return nil
+}
+
+func applyScanModeTag(tags []byte, scanControl bool, scanType int32) {
+	if len(tags) == 0 || !scanControl {
+		return
+	}
+	tags[0] &^= outlineTagHasScanMode | outlineTagScanMode
+	tags[0] |= outlineTagHasScanMode | byte(scanType&7)<<5
 }
 
 // SetVariationNormalizedCoordinates sets normalized variation coordinates in [-1, 1].
@@ -655,7 +829,7 @@ func (f *Face) SetVariationNormalizedCoordinates(coords []float32) error {
 	}
 	f.varEngine.SetNormalizedCoordinates(coords)
 	f.loadedMetrics = nil
-	return nil
+	return f.refreshVariationDependentState()
 }
 
 // SetVariationDesignCoordinates sets design-space variation coordinates.
@@ -665,7 +839,115 @@ func (f *Face) SetVariationDesignCoordinates(coords []ftvar.Fixed) error {
 	}
 	f.varEngine.SetDesignCoordinates(coords)
 	f.loadedMetrics = nil
+	return f.refreshVariationDependentState()
+}
+
+func (f *Face) refreshVariationDependentState() error {
+	f.syncCFFVariationCoordinates()
+	if err := f.scaleCVT(); err != nil {
+		return fmt.Errorf("failed to apply CVT variations: %w", err)
+	}
+	if err := f.runPrep(); err != nil {
+		return fmt.Errorf("failed to run prep program: %w", err)
+	}
+	f.applyMVARMetricDeltas()
 	return nil
+}
+
+func (f *Face) syncCFFVariationCoordinates() {
+	if f == nil || f.cff == nil || f.varEngine == nil {
+		return
+	}
+	f.cff.SetVariationCoordinates(f.normalizedVariationCoordinates64())
+}
+
+func (f *Face) normalizedVariationCoordinates64() []float64 {
+	if f == nil || f.varEngine == nil {
+		return nil
+	}
+	coords := make([]float64, len(f.varEngine.Coords))
+	for i, coord := range f.varEngine.Coords {
+		coords[i] = float64(coord)
+	}
+	return coords
+}
+
+func (f *Face) applyMVARMetricDeltas() {
+	if f.varEngine == nil {
+		return
+	}
+	if f.hasBaseHhea {
+		hhea := f.baseHhea
+		hhea.CaretSlopeRise = f.mvarInt16("hcrs", hhea.CaretSlopeRise)
+		hhea.CaretSlopeRun = f.mvarInt16("hcrn", hhea.CaretSlopeRun)
+		hhea.CaretOffset = f.mvarInt16("hcof", hhea.CaretOffset)
+		f.hhea = hhea
+	}
+	if f.hasBaseVhea {
+		vhea := f.baseVhea
+		vhea.Ascent = f.mvarInt16("vasc", vhea.Ascent)
+		vhea.Descent = f.mvarInt16("vdsc", vhea.Descent)
+		vhea.LineGap = f.mvarInt16("vlgp", vhea.LineGap)
+		vhea.CaretSlopeRise = f.mvarInt16("vcrs", vhea.CaretSlopeRise)
+		vhea.CaretSlopeRun = f.mvarInt16("vcrn", vhea.CaretSlopeRun)
+		vhea.CaretOffset = f.mvarInt16("vcof", vhea.CaretOffset)
+		f.vhea = vhea
+	}
+	if f.hasBaseOS2 {
+		os2 := f.baseOS2
+		os2.STypoAscender = f.mvarInt16("hasc", os2.STypoAscender)
+		os2.STypoDescender = f.mvarInt16("hdsc", os2.STypoDescender)
+		os2.STypoLineGap = f.mvarInt16("hlgp", os2.STypoLineGap)
+		os2.UsWinAscent = f.mvarUint16("hcla", os2.UsWinAscent)
+		os2.UsWinDescent = f.mvarUint16("hcld", os2.UsWinDescent)
+		os2.SxHeight = f.mvarInt16("xhgt", os2.SxHeight)
+		os2.SCapHeight = f.mvarInt16("cpht", os2.SCapHeight)
+		os2.YSubscriptXSize = f.mvarInt16("sbxs", os2.YSubscriptXSize)
+		os2.YSubscriptYSize = f.mvarInt16("sbys", os2.YSubscriptYSize)
+		os2.YSubscriptXOffset = f.mvarInt16("sbxo", os2.YSubscriptXOffset)
+		os2.YSubscriptYOffset = f.mvarInt16("sbyo", os2.YSubscriptYOffset)
+		os2.YSuperscriptXSize = f.mvarInt16("spxs", os2.YSuperscriptXSize)
+		os2.YSuperscriptYSize = f.mvarInt16("spys", os2.YSuperscriptYSize)
+		os2.YSuperscriptXOffset = f.mvarInt16("spxo", os2.YSuperscriptXOffset)
+		os2.YSuperscriptYOffset = f.mvarInt16("spyo", os2.YSuperscriptYOffset)
+		os2.YStrikeoutSize = f.mvarInt16("strs", os2.YStrikeoutSize)
+		os2.YStrikeoutPosition = f.mvarInt16("stro", os2.YStrikeoutPosition)
+		f.os2 = os2
+	}
+	if f.hasBasePost {
+		post := f.basePost
+		post.UnderlineThickness = f.mvarInt16("unds", post.UnderlineThickness)
+		post.UnderlinePosition = f.mvarInt16("undo", post.UnderlinePosition)
+		f.post = post
+	}
+}
+
+func (f *Face) mvarInt16(tag string, value int16) int16 {
+	return clampInt16Metric(int32(value) + f.varEngine.GetMetricDelta(stringToTag(tag)))
+}
+
+func (f *Face) mvarUint16(tag string, value uint16) uint16 {
+	return clampUint16Metric(int32(value) + f.varEngine.GetMetricDelta(stringToTag(tag)))
+}
+
+func clampInt16Metric(value int32) int16 {
+	if value < -32768 {
+		return -32768
+	}
+	if value > 32767 {
+		return 32767
+	}
+	return int16(value)
+}
+
+func clampUint16Metric(value int32) uint16 {
+	if value < 0 {
+		return 0
+	}
+	if value > 65535 {
+		return 65535
+	}
+	return uint16(value)
 }
 
 func (f *Face) SetPixelSizes(width, height int) error {
@@ -689,7 +971,10 @@ func (f *Face) SetPixelSizes(width, height int) error {
 	f.yPPEM = height
 	f.recomputeSizeMetrics()
 	f.loadedMetrics = nil
-	f.scaleCVT()
+	f.syncCFFVariationCoordinates()
+	if err := f.scaleCVT(); err != nil {
+		return fmt.Errorf("failed to apply CVT variations: %w", err)
+	}
 	if err := f.runPrep(); err != nil {
 		return fmt.Errorf("failed to run prep program: %w", err)
 	}
@@ -984,7 +1269,8 @@ func (f *Face) LoadGlyph(glyphIndex int, loadFlags int) (api.GlyphSlot, error) {
 	}
 
 	if f.cff != nil {
-		outline, err := f.cff.LoadGlyphOutline(glyphIndex)
+		f.syncCFFVariationCoordinates()
+		outline, err := f.cff.LoadGlyphOutlineAt(glyphIndex, f.normalizedVariationCoordinates64())
 		if err != nil {
 			if decodedImage != nil {
 				slot := &GlyphSlot{image: decodedImage}
@@ -1000,7 +1286,15 @@ func (f *Face) LoadGlyph(glyphIndex int, loadFlags int) (api.GlyphSlot, error) {
 		if err != nil {
 			return nil, err
 		}
-		slotMetrics, hasSlotMetrics := glyphSlotMetricsFromOutline(outline, realPointCount(outline), glyphMetrics26Dot6{}, false)
+		metrics, hasMetrics := f.glyphMetricsForLoadFlags(glyphIndex, loadFlags)
+		syntheticVertAdvance := int32(0)
+		if !f.hasExplicitVerticalMetrics() {
+			syntheticVertAdvance = f.syntheticVerticalAdvance(loadFlags)
+		}
+		slotMetrics, hasSlotMetrics := glyphSlotMetricsFromOutline(outline, realPointCount(outline), metrics, hasMetrics, syntheticVertAdvance)
+		if syntheticVertAdvance == 0 {
+			f.applyCFFVerticalSlotMetrics(glyphIndex, loadFlags, &slotMetrics)
+		}
 		slot := &GlyphSlot{outline: outline, bitmap: bitmap, image: decodedImage, slotMetrics: slotMetrics, hasSlotMetrics: hasSlotMetrics}
 		f.glyphSlot = slot
 		return slot, nil
@@ -1020,7 +1314,18 @@ func (f *Face) LoadGlyph(glyphIndex int, loadFlags int) (api.GlyphSlot, error) {
 			result.hasMetrics = true
 		}
 	}
-	slotMetrics, hasSlotMetrics := glyphSlotMetricsFromOutline(result.outline, result.realPointCount, result.metrics, result.hasMetrics)
+	slotMetrics, hasSlotMetrics := glyphSlotMetricsFromOutline(result.outline, result.realPointCount, result.metrics, result.hasMetrics, 0)
+	if !f.hasExplicitVerticalMetrics() {
+		f.applySyntheticVerticalSlotMetrics(loadFlags, &slotMetrics)
+	}
+	if shouldGridFitSlotMetrics(loadFlags) {
+		gridFitSlotMetricsFromOutline(result.outline, result.realPointCount, &slotMetrics)
+		if result.hasMetrics {
+			result.metrics.advance = roundToPixel26Dot6(slotMetrics.HoriAdvance)
+			result.metrics.lsb = slotMetrics.HoriBearingX
+			slotMetrics.HoriAdvance = result.metrics.advance
+		}
+	}
 	outline := stripGlyphPhantoms(result.outline, result.realPointCount)
 	bitmap, err := f.renderGlyphBitmap(outline, loadFlags)
 	if err != nil {
@@ -1058,11 +1363,12 @@ func (f *Face) renderGlyphBitmap(outline *core.Outline, loadFlags int) (api.Bitm
 		return nil, nil
 	}
 
-	mode := bitmapPixelModeForLoadFlags(loadFlags)
-	renderOutline, width, rows := renderOutlineForBitmap(outline)
-	bitmap := core.NewBitmap(width, rows)
-	bitmap.SetPixelMode(mode)
-	if renderOutline == nil || width == 0 || rows == 0 {
+	mode := renderModeForLoadFlags(loadFlags)
+	renderOutline, bitmap, _, ok := core.PrepareBitmapForOutline(outline, realPointCount(outline), mode)
+	if !ok {
+		return nil, nil
+	}
+	if renderOutline == nil {
 		return bitmap, nil
 	}
 
@@ -1079,48 +1385,59 @@ func (f *Face) renderGlyphBitmap(outline *core.Outline, loadFlags int) (api.Bitm
 	return bitmap, nil
 }
 
-func bitmapPixelModeForLoadFlags(loadFlags int) uint8 {
-	if loadFlags&api.LoadMonochrome != 0 || loadFlags&api.LoadTargetMask == api.LoadTargetMono {
-		return api.MODE_MONO
+func renderModeForLoadFlags(loadFlags int) api.RenderMode {
+	if loadFlags&api.LoadMonochrome != 0 {
+		return api.RenderModeMono
 	}
-	return api.MODE_GRAY
+	switch loadFlags & api.LoadTargetMask {
+	case api.LoadTargetLight:
+		return api.RenderModeLight
+	case api.LoadTargetMono:
+		return api.RenderModeMono
+	case api.LoadTargetLCD:
+		return api.RenderModeLCD
+	case api.LoadTargetLCDV:
+		return api.RenderModeLCDV
+	}
+	if loadFlags&api.LoadRender != 0 {
+		return api.RenderModeNormal
+	}
+	return api.RenderModeNormal
 }
 
-func renderOutlineForBitmap(outline *core.Outline) (*core.Outline, int, int) {
-	minX, minY, maxX, maxY, ok := outlineBounds(outline, realPointCount(outline))
-	if !ok {
-		return nil, 0, 0
-	}
-	minPX := floor26Dot6(minX)
-	minPY := floor26Dot6(minY)
-	maxPX := ceil26Dot6(maxX)
-	maxPY := ceil26Dot6(maxY)
-	width := int(maxPX - minPX)
-	rows := int(maxPY - minPY)
-	if width < 0 {
-		width = 0
-	}
-	if rows < 0 {
-		rows = 0
-	}
-
-	renderOutline := &core.Outline{
-		Points:   make([]api.Vector, len(outline.Points)),
-		Tags:     append([]byte{}, outline.Tags...),
-		Contours: append([]int{}, outline.Contours...),
-	}
-	maxY26Dot6 := maxPY << 6
-	minX26Dot6 := minPX << 6
-	for i, p := range outline.Points {
-		renderOutline.Points[i] = api.Vector{
-			X: p.X - minX26Dot6,
-			Y: maxY26Dot6 - p.Y,
-		}
-	}
-	return renderOutline, width, rows
+func (f *Face) hasExplicitVerticalMetrics() bool {
+	return f.vhea.NumOfLongVerMetrics > 0 && len(f.vmtx.VMetrics) > 0
 }
 
-func glyphSlotMetricsFromOutline(outline *core.Outline, realPoints int, metrics glyphMetrics26Dot6, hasMetrics bool) (api.GlyphMetrics, bool) {
+func (f *Face) syntheticVerticalAdvance(loadFlags int) int32 {
+	advance := f.syntheticVerticalAdvanceFUnits()
+	if advance == 0 {
+		return 0
+	}
+	if loadFlags&api.LoadNoScale != 0 {
+		return advance << 6
+	}
+	return f.scaleFUnitsY(advance)
+}
+
+func (f *Face) syntheticVerticalAdvanceFUnits() int32 {
+	if f.hasBaseOS2 {
+		return absInt32(int32(f.os2.STypoAscender) - int32(f.os2.STypoDescender))
+	}
+	if f.hasBaseHhea && (f.hhea.Ascender != 0 || f.hhea.Descender != 0) {
+		return absInt32(int32(f.hhea.Ascender) - int32(f.hhea.Descender))
+	}
+	return int32(f.GetUnitsPerEm())
+}
+
+func absInt32(v int32) int32 {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
+
+func glyphSlotMetricsFromOutline(outline *core.Outline, realPoints int, metrics glyphMetrics26Dot6, hasMetrics bool, syntheticVertAdvance int32) (api.GlyphMetrics, bool) {
 	if outline == nil {
 		return api.GlyphMetrics{}, false
 	}
@@ -1137,12 +1454,94 @@ func glyphSlotMetricsFromOutline(outline *core.Outline, realPoints int, metrics 
 		slotMetrics.HoriBearingX = metrics.lsb
 		slotMetrics.HoriAdvance = metrics.advance
 	}
+	if syntheticVertAdvance != 0 {
+		slotMetrics.VertBearingX = slotMetrics.HoriBearingX - slotMetrics.HoriAdvance/2
+		slotMetrics.VertBearingY = (syntheticVertAdvance - slotMetrics.Height) / 2
+		slotMetrics.VertAdvance = syntheticVertAdvance
+		return slotMetrics, true
+	}
 	if phantoms, ok := copyGlyphPhantoms(outline, realPoints); ok {
 		slotMetrics.VertBearingX = minX - phantoms[2].X
-		slotMetrics.VertBearingY = maxY - phantoms[2].Y
+		slotMetrics.VertBearingY = phantoms[2].Y - maxY
 		slotMetrics.VertAdvance = phantoms[2].Y - phantoms[3].Y
 	}
 	return slotMetrics, true
+}
+
+func gridFitSlotMetricsFromOutline(outline *core.Outline, realPoints int, slotMetrics *api.GlyphMetrics) {
+	if outline == nil || slotMetrics == nil {
+		return
+	}
+	minX, minY, maxX, maxY, ok := outlineBounds(outline, realPoints)
+	if !ok {
+		if slotMetrics.HoriAdvance != 0 {
+			slotMetrics.HoriAdvance = roundToPixel26Dot6(slotMetrics.HoriAdvance)
+		}
+		slotMetrics.VertBearingX = floorToPixel26Dot6(slotMetrics.VertBearingX)
+		slotMetrics.VertBearingY = floorToPixel26Dot6(slotMetrics.VertBearingY)
+		slotMetrics.VertAdvance = roundToPixel26Dot6(slotMetrics.VertAdvance)
+		return
+	}
+	slotMetrics.VertBearingX = floorToPixel26Dot6(slotMetrics.VertBearingX)
+	slotMetrics.VertBearingY = floorToPixel26Dot6(slotMetrics.VertBearingY)
+	slotMetrics.VertAdvance = roundToPixel26Dot6(slotMetrics.VertAdvance)
+	fittedMinX := floorToPixel26Dot6(minX)
+	fittedMinY := floorToPixel26Dot6(minY)
+	fittedMaxX := ceilToPixel26Dot6(maxX)
+	fittedMaxY := ceilToPixel26Dot6(maxY)
+	slotMetrics.Width = fittedMaxX - fittedMinX
+	slotMetrics.Height = fittedMaxY - fittedMinY
+	slotMetrics.HoriBearingX = fittedMinX
+	slotMetrics.HoriBearingY = fittedMaxY
+	slotMetrics.HoriAdvance = roundToPixel26Dot6(slotMetrics.HoriAdvance)
+}
+
+func floorToPixel26Dot6(v int32) int32 {
+	return v &^ 63
+}
+
+func ceilToPixel26Dot6(v int32) int32 {
+	return (v + 63) &^ 63
+}
+
+func roundToPixel26Dot6(v int32) int32 {
+	return floorToPixel26Dot6(v + 32)
+}
+
+func (f *Face) applyCFFVerticalSlotMetrics(glyphIndex int, loadFlags int, slotMetrics *api.GlyphMetrics) {
+	if slotMetrics == nil {
+		return
+	}
+	advanceHeight, topSideBearing, ok := f.verticalMetricsFUnits(glyphIndex)
+	if !ok {
+		return
+	}
+	slotMetrics.VertBearingX = slotMetrics.HoriBearingX - slotMetrics.HoriAdvance/2
+	slotMetrics.VertAdvance = f.scaleFUnitsYForLoadFlags(advanceHeight, loadFlags)
+	if f.hasVORG {
+		originY := f.vorgOriginYFUnits(glyphIndex)
+		slotMetrics.VertBearingY = f.scaleFUnitsYForLoadFlags(originY, loadFlags) - slotMetrics.HoriBearingY
+		return
+	}
+	slotMetrics.VertBearingY = f.scaleFUnitsYForLoadFlags(topSideBearing, loadFlags)
+}
+
+func (f *Face) applySyntheticVerticalSlotMetrics(loadFlags int, slotMetrics *api.GlyphMetrics) {
+	if slotMetrics == nil {
+		return
+	}
+	advance := f.syntheticVerticalAdvanceFUnits()
+	if advance == 0 {
+		return
+	}
+	height := ceil26Dot6(slotMetrics.Height)
+	if loadFlags&api.LoadNoScale == 0 {
+		height = ceil26Dot6(ftmath.DivFix(slotMetrics.Height, f.yScale))
+	}
+	topSideBearing := (advance - height) / 2
+	slotMetrics.VertBearingX = slotMetrics.HoriBearingX - slotMetrics.HoriAdvance/2
+	slotMetrics.VertBearingY = f.scaleFUnitsYForLoadFlags(topSideBearing, loadFlags)
+	slotMetrics.VertAdvance = f.scaleFUnitsYForLoadFlags(advance, loadFlags)
 }
 
 func outlineBounds(outline *core.Outline, realPoints int) (minX, minY, maxX, maxY int32, ok bool) {
@@ -1336,33 +1735,62 @@ func (f *Face) getPhantomPointsFUnits(glyphIndex int, bbox glyphBBox) []api.Vect
 
 	advanceHeight := int32(f.GetUnitsPerEm())
 	topOrigin := bbox.yMax
+	verticalOriginX := (leftOrigin << 6) + (advance<<6)/2
 
-	if f.vhea.NumOfLongVerMetrics > 0 {
-		numVMetrics := int(f.vhea.NumOfLongVerMetrics)
-		var tsb int16
-		if glyphIndex < numVMetrics {
-			advanceHeight = int32(f.vmtx.VMetrics[glyphIndex].AdvanceHeight)
-			tsb = f.vmtx.VMetrics[glyphIndex].TopSideBearing
-		} else {
-			advanceHeight = int32(f.vmtx.VMetrics[numVMetrics-1].AdvanceHeight)
-			tsbIndex := glyphIndex - numVMetrics
-			if tsbIndex >= 0 && tsbIndex < len(f.vmtx.TopSideBearings) {
-				tsb = f.vmtx.TopSideBearings[tsbIndex]
-			}
-		}
-		topOrigin = bbox.yMax + int32(tsb)
-	}
-	if f.varEngine != nil {
-		advanceHeight += f.varEngine.GetAdvanceHeightDelta(glyphIndex)
-		topOrigin += f.varEngine.GetTSBDelta(glyphIndex)
+	if verticalAdvance, topSideBearing, ok := f.verticalMetricsFUnits(glyphIndex); ok {
+		advanceHeight = verticalAdvance
+		topOrigin = bbox.yMax + topSideBearing
+	} else {
+		advanceHeight = f.syntheticVerticalAdvanceFUnits()
+		topSideBearing := (advanceHeight - (bbox.yMax - bbox.yMin)) / 2
+		topOrigin = bbox.yMax + topSideBearing
 	}
 
 	return []api.Vector{
 		{X: leftOrigin << 6, Y: 0},
 		{X: (leftOrigin + advance) << 6, Y: 0},
-		{X: 0, Y: topOrigin << 6},
-		{X: 0, Y: (topOrigin - advanceHeight) << 6},
+		{X: verticalOriginX, Y: topOrigin << 6},
+		{X: verticalOriginX, Y: (topOrigin - advanceHeight) << 6},
 	}
+}
+
+func (f *Face) verticalMetricsFUnits(glyphIndex int) (advanceHeight int32, topSideBearing int32, ok bool) {
+	if !f.hasExplicitVerticalMetrics() {
+		return 0, 0, false
+	}
+	numVMetrics := int(f.vhea.NumOfLongVerMetrics)
+	if numVMetrics <= 0 || numVMetrics > len(f.vmtx.VMetrics) {
+		return 0, 0, false
+	}
+	if glyphIndex < numVMetrics {
+		advanceHeight = int32(f.vmtx.VMetrics[glyphIndex].AdvanceHeight)
+		topSideBearing = int32(f.vmtx.VMetrics[glyphIndex].TopSideBearing)
+	} else {
+		advanceHeight = int32(f.vmtx.VMetrics[numVMetrics-1].AdvanceHeight)
+		tsbIndex := glyphIndex - numVMetrics
+		if tsbIndex >= 0 && tsbIndex < len(f.vmtx.TopSideBearings) {
+			topSideBearing = int32(f.vmtx.TopSideBearings[tsbIndex])
+		}
+	}
+	if f.varEngine != nil {
+		advanceHeight += f.varEngine.GetAdvanceHeightDelta(glyphIndex)
+		topSideBearing += f.varEngine.GetTSBDelta(glyphIndex)
+	}
+	return advanceHeight, topSideBearing, true
+}
+
+func (f *Face) vorgOriginYFUnits(glyphIndex int) int32 {
+	originY := int32(f.vorg.DefaultVertOriginY)
+	for _, metric := range f.vorg.VertOriginYMetrics {
+		if int(metric.GlyphIndex) == glyphIndex {
+			originY = int32(metric.VertOriginY)
+			break
+		}
+	}
+	if f.varEngine != nil {
+		originY += f.varEngine.GetVOrgDelta(glyphIndex)
+	}
+	return originY
 }
 
 func (f *Face) applyGlyphVariation(glyphIndex int, outline *core.Outline) error {
@@ -1521,12 +1949,13 @@ func (f *Face) parseSimpleGlyph(s api.Stream, offset int64, numberOfContours int
 	if err := f.applyGlyphVariation(glyphIndex, outline); err != nil {
 		return nil, err
 	}
+	unscaledOriginalPoints := copyTTOrusPoints(outline)
 	if loadFlags&api.LoadNoScale == 0 {
 		f.scaleOutline(outline)
 	}
 
 	if len(instructions) > 0 && shouldHintGlyph(loadFlags) {
-		_ = f.runGlyphProgram(outline, instructions)
+		_ = f.runGlyphProgram(outline, instructions, loadFlags, unscaledOriginalPoints)
 	}
 
 	result := &glyphLoadResult{
@@ -1679,6 +2108,7 @@ func (f *Face) parseCompositeGlyph(s api.Stream, offset int64, glyphIndex int, l
 		if subOutline == nil {
 			subOutline = &core.Outline{}
 		}
+		componentMetricPhantoms, hasComponentMetricPhantoms := copyGlyphPhantoms(subOutline, subResult.realPointCount)
 
 		// Apply transform and initial translation
 		var dx, dy int32
@@ -1726,8 +2156,8 @@ func (f *Face) parseCompositeGlyph(s api.Stream, offset int64, glyphIndex int, l
 			mergePointStart = len(finalOutline.Points)
 		}
 		if flags&USE_MY_METRICS != 0 && subResult.hasMetrics {
-			if phantoms, ok := copyGlyphPhantoms(subOutline, subResult.realPointCount); ok {
-				metricPhantoms = phantoms
+			if hasComponentMetricPhantoms {
+				metricPhantoms = componentMetricPhantoms
 				metricPointStart = mergePointStart + subResult.metricPointStart
 				metricPointEnd = mergePointStart + subResult.metricPointEnd
 			}
@@ -1790,7 +2220,7 @@ func (f *Face) parseCompositeGlyph(s api.Stream, offset int64, glyphIndex int, l
 	finalOutline.Tags = append(finalOutline.Tags, 0, 0, 0, 0)
 
 	if len(instructions) > 0 && shouldHintGlyph(loadFlags) {
-		_ = f.runGlyphProgram(finalOutline, instructions)
+		_ = f.runGlyphProgram(finalOutline, instructions, loadFlags, nil)
 	}
 
 	result := &glyphLoadResult{
@@ -1898,7 +2328,7 @@ func updateGlyphMetricsFromPhantoms(result *glyphLoadResult) {
 	if !ok {
 		return
 	}
-	minX, ok := outlineMinXRange(result.outline, result.metricPointStart, result.metricPointEnd)
+	minX, ok := outlineMinXRange(result.outline, 0, result.realPointCount)
 	if !ok {
 		return
 	}
@@ -1930,10 +2360,42 @@ func (f *Face) GetGlyphSlot() api.GlyphSlot {
 }
 
 func (f *Face) GetColorLayers(glyphIndex int) ([]color.Layer, error) {
-	if f.colr == nil {
+	return f.GetColorLayersForPalette(glyphIndex, 0)
+}
+
+func (f *Face) GetColorLayersForPalette(glyphIndex int, paletteIndex int) ([]color.Layer, error) {
+	if f == nil || f.colr == nil {
 		return nil, nil
 	}
-	return f.colr.GetLayers(uint16(glyphIndex), f.cpal, 0)
+	if glyphIndex < 0 || glyphIndex > 0xffff {
+		return nil, errors.New("invalid glyph index")
+	}
+	record, ok := f.colr.BaseGlyphRecords[uint16(glyphIndex)]
+	if !ok {
+		return nil, nil
+	}
+
+	end := int(record.FirstLayerIndex) + int(record.NumLayers)
+	if end > len(f.colr.LayerRecords) {
+		return nil, errors.New("invalid layer index in COLR table")
+	}
+
+	layers := make([]color.Layer, int(record.NumLayers))
+	for i := 0; i < int(record.NumLayers); i++ {
+		lr := f.colr.LayerRecords[int(record.FirstLayerIndex)+i]
+		layerColor := color.RGBA{R: 0, G: 0, B: 0, A: 255}
+		if lr.PaletteIndex != 0xffff && f.cpal != nil {
+			if c, ok := f.cpal.Color(paletteIndex, lr.PaletteIndex); ok {
+				layerColor = c
+			}
+		}
+		layers[i] = color.Layer{
+			GlyphID:      lr.GlyphID,
+			Color:        layerColor,
+			PaletteIndex: lr.PaletteIndex,
+		}
+	}
+	return layers, nil
 }
 
 var _ api.Driver = (*loader)(nil)

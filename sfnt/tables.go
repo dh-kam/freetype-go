@@ -307,6 +307,63 @@ func (m *CMapFormat0) Lookup(char rune) uint16 {
 	return 0
 }
 
+type CMapFormat2SubHeader struct {
+	FirstCode     uint16
+	EntryCount    uint16
+	IDDelta       int16
+	IDRangeOffset uint16
+
+	glyphIdArrayIndex int
+}
+
+type CMapFormat2 struct {
+	SubHeaderKeys [256]uint16
+	SubHeaders    []CMapFormat2SubHeader
+	GlyphIdArray  []uint16
+}
+
+func (m *CMapFormat2) Lookup(char rune) uint16 {
+	if char < 0 || char > 0xffff {
+		return 0
+	}
+
+	c := uint16(char)
+	var subHeaderIndex int
+	var codeByte uint16
+	if c <= 0xff {
+		key := m.SubHeaderKeys[byte(c)]
+		if key != 0 {
+			return 0
+		}
+		codeByte = uint16(byte(c))
+	} else {
+		key := m.SubHeaderKeys[byte(c>>8)]
+		if key == 0 {
+			return 0
+		}
+		subHeaderIndex = int(key / 8)
+		codeByte = uint16(byte(c))
+	}
+
+	if subHeaderIndex >= len(m.SubHeaders) {
+		return 0
+	}
+	subHeader := m.SubHeaders[subHeaderIndex]
+	if codeByte < subHeader.FirstCode || codeByte-subHeader.FirstCode >= subHeader.EntryCount {
+		return 0
+	}
+
+	glyphIndex := subHeader.glyphIdArrayIndex + int(codeByte-subHeader.FirstCode)
+	if glyphIndex < 0 || glyphIndex >= len(m.GlyphIdArray) {
+		return 0
+	}
+	gid := m.GlyphIdArray[glyphIndex]
+	if gid != 0 {
+		gid += uint16(subHeader.IDDelta)
+	}
+	return gid
+}
+
 type CMapFormat6 struct {
 	FirstCode    uint16
 	GlyphIdArray []uint16
@@ -596,6 +653,8 @@ func (r *CMapVariationSelectorRecord) lookupNonDefault(char uint32) (uint16, boo
 const (
 	maxCMapGlyphID        = uint32(0xffff)
 	maxUnicodeScalar      = uint32(0x10ffff)
+	cmapFormat2HeaderSize = 6 + 256*2
+	cmapFormat2MinSize    = cmapFormat2HeaderSize + 8
 	cmapFormat8Is32Size   = 8192
 	cmapFormat8HeaderSize = 12 + cmapFormat8Is32Size + 4
 )
@@ -643,6 +702,11 @@ func parseCMap(s api.Stream) (CMap, error) {
 		if err != nil {
 			continue
 		}
+		if score < 0 {
+			if _, ok := cmap.(*CMapFormat2); ok && isCMapFormat2Encoding(platformID, encodingID) {
+				score = 0
+			}
+		}
 		if variation, ok := cmap.(*CMapFormat14); ok {
 			if score > bestVariationScore {
 				bestVariation = variation
@@ -669,6 +733,10 @@ func parseCMap(s api.Stream) (CMap, error) {
 	return bestCMap, nil
 }
 
+func isCMapFormat2Encoding(platformID uint16, encodingID uint16) bool {
+	return platformID == 1 || (platformID == 3 && encodingID >= 2 && encodingID <= 6)
+}
+
 func parseCMapSubtable(s api.Stream, offset int64) (CMap, error) {
 	format, err := readUint16(s, offset)
 	if err != nil {
@@ -693,6 +761,95 @@ func parseCMapSubtable(s api.Stream, offset int64) (CMap, error) {
 			m.GlyphIdArray[i] = b
 		}
 		return &m, nil
+
+	case 2:
+		length, err := readUint16(s, offset+2)
+		if err != nil {
+			return nil, err
+		}
+		if err := checkCMapSubtableLength(s, offset, uint32(length), cmapFormat2MinSize, "cmap format 2"); err != nil {
+			return nil, err
+		}
+
+		var subHeaderKeys [256]uint16
+		var maxSubHeaderKey uint16
+		for i := 0; i < 256; i++ {
+			key, err := readUint16(s, offset+6+int64(i*2))
+			if err != nil {
+				return nil, err
+			}
+			if key%8 != 0 {
+				return nil, errors.New("cmap format 2 subHeaderKey is not a subHeader offset")
+			}
+			subHeaderKeys[i] = key
+			if key > maxSubHeaderKey {
+				maxSubHeaderKey = key
+			}
+		}
+
+		subHeaderCount := uint32(maxSubHeaderKey/8) + 1
+		if !cmapItemsFit(uint32(length), cmapFormat2HeaderSize, 8, subHeaderCount) {
+			return nil, errors.New("cmap format 2 too short for subHeaders")
+		}
+		subHeaderCountInt, err := cmapCountToInt(subHeaderCount)
+		if err != nil {
+			return nil, err
+		}
+		glyphArrayOffset := uint32(cmapFormat2HeaderSize) + subHeaderCount*8
+		if (uint32(length)-glyphArrayOffset)%2 != 0 {
+			return nil, errors.New("cmap format 2 glyph array has odd byte length")
+		}
+
+		m := &CMapFormat2{
+			SubHeaderKeys: subHeaderKeys,
+			SubHeaders:    make([]CMapFormat2SubHeader, subHeaderCountInt),
+			GlyphIdArray:  make([]uint16, int((uint32(length)-glyphArrayOffset)/2)),
+		}
+		for i := 0; i < subHeaderCountInt; i++ {
+			subHeaderOffset := offset + cmapFormat2HeaderSize + int64(i*8)
+			subHeader := &m.SubHeaders[i]
+			subHeader.FirstCode, err = readUint16(s, subHeaderOffset)
+			if err != nil {
+				return nil, err
+			}
+			subHeader.EntryCount, err = readUint16(s, subHeaderOffset+2)
+			if err != nil {
+				return nil, err
+			}
+			subHeader.IDDelta, err = readInt16(s, subHeaderOffset+4)
+			if err != nil {
+				return nil, err
+			}
+			subHeader.IDRangeOffset, err = readUint16(s, subHeaderOffset+6)
+			if err != nil {
+				return nil, err
+			}
+			if subHeader.EntryCount == 0 {
+				continue
+			}
+			if uint32(subHeader.FirstCode)+uint32(subHeader.EntryCount) > 0x100 {
+				return nil, errors.New("cmap format 2 subHeader byte range overflows")
+			}
+			if subHeader.IDRangeOffset%2 != 0 {
+				return nil, errors.New("cmap format 2 idRangeOffset is not word aligned")
+			}
+
+			idRangeOffsetWordOffset := uint32(cmapFormat2HeaderSize + i*8 + 6)
+			glyphStartOffset := idRangeOffsetWordOffset + uint32(subHeader.IDRangeOffset)
+			if glyphStartOffset < glyphArrayOffset ||
+				glyphStartOffset > uint32(length) ||
+				uint32(length)-glyphStartOffset < uint32(subHeader.EntryCount)*2 {
+				return nil, errors.New("cmap format 2 subHeader glyph range exceeds glyph array")
+			}
+			subHeader.glyphIdArrayIndex = int((glyphStartOffset - glyphArrayOffset) / 2)
+		}
+		for i := range m.GlyphIdArray {
+			m.GlyphIdArray[i], err = readUint16(s, offset+int64(glyphArrayOffset)+int64(i*2))
+			if err != nil {
+				return nil, err
+			}
+		}
+		return m, nil
 
 	case 6:
 		length, err := readUint16(s, offset+2)
@@ -1646,6 +1803,17 @@ type VheaTable struct {
 	Ascent               int16
 	Descent              int16
 	LineGap              int16
+	AdvanceHeightMax     uint16
+	MinTopSideBearing    int16
+	MinBottomSideBearing int16
+	YMaxExtent           int16
+	CaretSlopeRise       int16
+	CaretSlopeRun        int16
+	CaretOffset          int16
+	Reserved             [4]int16
+	MetricDataFormat     int16
+	NumOfLongVerMetrics  uint16
+
 	advanceHeightMax     int16
 	minTopSideBearing    int16
 	minBottomSideBearing int16
@@ -1654,7 +1822,6 @@ type VheaTable struct {
 	caretSlopeRun        int16
 	caretOffset          int16
 	metricDataFormat     int16
-	NumOfLongVerMetrics  uint16
 }
 
 func parseVhea(s api.Stream) (VheaTable, error) {
@@ -1681,38 +1848,52 @@ func parseVhea(s api.Stream) (VheaTable, error) {
 	if err != nil {
 		return h, err
 	}
-	h.advanceHeightMax, err = readInt16(s, 10)
+	h.AdvanceHeightMax, err = readUint16(s, 10)
 	if err != nil {
 		return h, err
 	}
-	h.minTopSideBearing, err = readInt16(s, 12)
+	h.advanceHeightMax = int16(h.AdvanceHeightMax)
+	h.MinTopSideBearing, err = readInt16(s, 12)
 	if err != nil {
 		return h, err
 	}
-	h.minBottomSideBearing, err = readInt16(s, 14)
+	h.minTopSideBearing = h.MinTopSideBearing
+	h.MinBottomSideBearing, err = readInt16(s, 14)
 	if err != nil {
 		return h, err
 	}
-	h.yMaxExtent, err = readInt16(s, 16)
+	h.minBottomSideBearing = h.MinBottomSideBearing
+	h.YMaxExtent, err = readInt16(s, 16)
 	if err != nil {
 		return h, err
 	}
-	h.caretSlopeRise, err = readInt16(s, 18)
+	h.yMaxExtent = h.YMaxExtent
+	h.CaretSlopeRise, err = readInt16(s, 18)
 	if err != nil {
 		return h, err
 	}
-	h.caretSlopeRun, err = readInt16(s, 20)
+	h.caretSlopeRise = h.CaretSlopeRise
+	h.CaretSlopeRun, err = readInt16(s, 20)
 	if err != nil {
 		return h, err
 	}
-	h.caretOffset, err = readInt16(s, 22)
+	h.caretSlopeRun = h.CaretSlopeRun
+	h.CaretOffset, err = readInt16(s, 22)
 	if err != nil {
 		return h, err
 	}
-	h.metricDataFormat, err = readInt16(s, 32)
+	h.caretOffset = h.CaretOffset
+	for i := range h.Reserved {
+		h.Reserved[i], err = readInt16(s, 24+int64(i*2))
+		if err != nil {
+			return h, err
+		}
+	}
+	h.MetricDataFormat, err = readInt16(s, 32)
 	if err != nil {
 		return h, err
 	}
+	h.metricDataFormat = h.MetricDataFormat
 	h.NumOfLongVerMetrics, err = readUint16(s, 34)
 	if err != nil {
 		return h, err
@@ -1831,6 +2012,16 @@ type BASECoord struct {
 	ReferenceGlyph uint16
 	BaseCoordPoint uint16
 	DeviceOffset   uint16
+	Device         *BASEDevice
+}
+
+type BASEDevice struct {
+	StartSize          uint16
+	EndSize            uint16
+	DeltaFormat        uint16
+	DeltaValues        []int16
+	DeltaSetOuterIndex uint16
+	DeltaSetInnerIndex uint16
 }
 
 type BASEMinMax struct {
@@ -2115,10 +2306,79 @@ func parseBASECoord(s api.Stream, offset int64) (*BASECoord, error) {
 		if err != nil {
 			return nil, err
 		}
+		if coord.DeviceOffset != 0 {
+			coord.Device, err = parseBASEDevice(s, offset+int64(coord.DeviceOffset))
+			if err != nil {
+				return nil, err
+			}
+		}
 		return coord, nil
 	default:
 		return nil, fmt.Errorf("unsupported BASE BaseCoord format: %d", coord.Format)
 	}
+}
+
+func parseBASEDevice(s api.Stream, offset int64) (*BASEDevice, error) {
+	if err := checkTableRange(s, offset, 6, "BASE Device table"); err != nil {
+		return nil, err
+	}
+	device := &BASEDevice{}
+	var err error
+	device.StartSize, err = readUint16(s, offset)
+	if err != nil {
+		return nil, err
+	}
+	device.EndSize, err = readUint16(s, offset+2)
+	if err != nil {
+		return nil, err
+	}
+	device.DeltaFormat, err = readUint16(s, offset+4)
+	if err != nil {
+		return nil, err
+	}
+
+	if device.DeltaFormat == 0x8000 {
+		device.DeltaSetOuterIndex = device.StartSize
+		device.DeltaSetInnerIndex = device.EndSize
+		return device, nil
+	}
+	if device.EndSize < device.StartSize {
+		return nil, errors.New("BASE Device table has descending size range")
+	}
+
+	bitsPerDelta := 0
+	switch device.DeltaFormat {
+	case 1:
+		bitsPerDelta = 2
+	case 2:
+		bitsPerDelta = 4
+	case 3:
+		bitsPerDelta = 8
+	default:
+		return nil, fmt.Errorf("unsupported BASE Device delta format: %d", device.DeltaFormat)
+	}
+
+	count := int(device.EndSize-device.StartSize) + 1
+	words := (count*bitsPerDelta + 15) / 16
+	if err := checkTableRange(s, offset+6, int64(words*2), "BASE Device delta values"); err != nil {
+		return nil, err
+	}
+	device.DeltaValues = make([]int16, count)
+	for i := 0; i < count; i++ {
+		bitOffset := i * bitsPerDelta
+		word, err := readUint16(s, offset+6+int64(bitOffset/16)*2)
+		if err != nil {
+			return nil, err
+		}
+		shift := 16 - bitsPerDelta - bitOffset%16
+		raw := int16((word >> shift) & uint16((1<<bitsPerDelta)-1))
+		signBit := int16(1 << (bitsPerDelta - 1))
+		if raw&signBit != 0 {
+			raw -= int16(1 << bitsPerDelta)
+		}
+		device.DeltaValues[i] = raw
+	}
+	return device, nil
 }
 
 func parseBASEMinMax(s api.Stream, offset int64) (*BASEMinMax, error) {
@@ -2189,12 +2449,73 @@ type JstfTable struct {
 	MajorVersion    uint16
 	MinorVersion    uint16
 	JstfScriptCount uint16
+	JstfScripts     []JstfScriptRecord
+}
+
+type JstfScriptRecord struct {
+	JstfScriptTag    uint32
+	JstfScriptOffset uint16
+	JstfScript       *JstfScript
+}
+
+type JstfScript struct {
+	ExtenderGlyphOffset  uint16
+	DefJstfLangSysOffset uint16
+	JstfLangSysCount     uint16
+	ExtenderGlyphs       []uint16
+	DefJstfLangSys       *JstfLangSys
+	JstfLangSysRecords   []JstfLangSysRecord
+}
+
+type JstfLangSysRecord struct {
+	JstfLangSysTag    uint32
+	JstfLangSysOffset uint16
+	JstfLangSys       *JstfLangSys
+}
+
+type JstfLangSys struct {
+	JstfPriorityCount   uint16
+	JstfPriorityOffsets []uint16
+	JstfPriorities      []*JstfPriority
+}
+
+type JstfPriority struct {
+	GsubShrinkageEnableOffset  uint16
+	GsubShrinkageDisableOffset uint16
+	GposShrinkageEnableOffset  uint16
+	GposShrinkageDisableOffset uint16
+	ShrinkageJstfMaxOffset     uint16
+	GsubExtensionEnableOffset  uint16
+	GsubExtensionDisableOffset uint16
+	GposExtensionEnableOffset  uint16
+	GposExtensionDisableOffset uint16
+	ExtensionJstfMaxOffset     uint16
+	GsubShrinkageEnable        *JstfModList
+	GsubShrinkageDisable       *JstfModList
+	GposShrinkageEnable        *JstfModList
+	GposShrinkageDisable       *JstfModList
+	ShrinkageJstfMax           *JstfMax
+	GsubExtensionEnable        *JstfModList
+	GsubExtensionDisable       *JstfModList
+	GposExtensionEnable        *JstfModList
+	GposExtensionDisable       *JstfModList
+	ExtensionJstfMax           *JstfMax
+}
+
+type JstfModList struct {
+	LookupCount   uint16
+	LookupIndices []uint16
+}
+
+type JstfMax struct {
+	LookupCount   uint16
+	LookupOffsets []uint16
 }
 
 func ParseJstf(s api.Stream) (JstfTable, error) {
 	var t JstfTable
 	var err error
-	if s.Size() < 4 {
+	if s.Size() < 6 {
 		return t, errors.New("Jstf table too short")
 	}
 	t.MajorVersion, err = readUint16(s, 0)
@@ -2205,13 +2526,269 @@ func ParseJstf(s api.Stream) (JstfTable, error) {
 	if err != nil {
 		return t, err
 	}
-	if s.Size() >= 6 {
-		t.JstfScriptCount, err = readUint16(s, 4)
+	t.JstfScriptCount, err = readUint16(s, 4)
+	if err != nil {
+		return t, err
+	}
+	if err := checkTableRange(s, 0, 6+int64(t.JstfScriptCount)*6, "Jstf table"); err != nil {
+		return t, err
+	}
+
+	t.JstfScripts = make([]JstfScriptRecord, int(t.JstfScriptCount))
+	for i := 0; i < int(t.JstfScriptCount); i++ {
+		recordOffset := int64(6 + i*6)
+		t.JstfScripts[i].JstfScriptTag, err = readUint32(s, recordOffset)
 		if err != nil {
 			return t, err
 		}
+		t.JstfScripts[i].JstfScriptOffset, err = readUint16(s, recordOffset+4)
+		if err != nil {
+			return t, err
+		}
+		if t.JstfScripts[i].JstfScriptOffset == 0 {
+			return t, errors.New("JstfScriptRecord has null script offset")
+		}
+		script, err := parseJstfScript(s, int64(t.JstfScripts[i].JstfScriptOffset))
+		if err != nil {
+			return t, err
+		}
+		t.JstfScripts[i].JstfScript = script
 	}
 	return t, nil
+}
+
+func parseJstfScript(s api.Stream, offset int64) (*JstfScript, error) {
+	if err := checkTableRange(s, offset, 6, "JstfScript table"); err != nil {
+		return nil, err
+	}
+	script := &JstfScript{}
+	var err error
+	script.ExtenderGlyphOffset, err = readUint16(s, offset)
+	if err != nil {
+		return nil, err
+	}
+	script.DefJstfLangSysOffset, err = readUint16(s, offset+2)
+	if err != nil {
+		return nil, err
+	}
+	script.JstfLangSysCount, err = readUint16(s, offset+4)
+	if err != nil {
+		return nil, err
+	}
+	if err := checkTableRange(s, offset, 6+int64(script.JstfLangSysCount)*6, "JstfScript table"); err != nil {
+		return nil, err
+	}
+	if script.ExtenderGlyphOffset != 0 {
+		script.ExtenderGlyphs, err = parseJstfExtenderGlyphs(s, offset+int64(script.ExtenderGlyphOffset))
+		if err != nil {
+			return nil, err
+		}
+	}
+	if script.DefJstfLangSysOffset != 0 {
+		script.DefJstfLangSys, err = parseJstfLangSys(s, offset+int64(script.DefJstfLangSysOffset))
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	script.JstfLangSysRecords = make([]JstfLangSysRecord, int(script.JstfLangSysCount))
+	for i := 0; i < int(script.JstfLangSysCount); i++ {
+		recordOffset := offset + 6 + int64(i*6)
+		record := &script.JstfLangSysRecords[i]
+		record.JstfLangSysTag, err = readUint32(s, recordOffset)
+		if err != nil {
+			return nil, err
+		}
+		record.JstfLangSysOffset, err = readUint16(s, recordOffset+4)
+		if err != nil {
+			return nil, err
+		}
+		if record.JstfLangSysOffset == 0 {
+			return nil, errors.New("JstfLangSysRecord has null language-system offset")
+		}
+		record.JstfLangSys, err = parseJstfLangSys(s, offset+int64(record.JstfLangSysOffset))
+		if err != nil {
+			return nil, err
+		}
+	}
+	return script, nil
+}
+
+func parseJstfExtenderGlyphs(s api.Stream, offset int64) ([]uint16, error) {
+	if err := checkTableRange(s, offset, 2, "Jstf ExtenderGlyph table"); err != nil {
+		return nil, err
+	}
+	count, err := readUint16(s, offset)
+	if err != nil {
+		return nil, err
+	}
+	if err := checkTableRange(s, offset, 2+int64(count)*2, "Jstf ExtenderGlyph table"); err != nil {
+		return nil, err
+	}
+	glyphs := make([]uint16, int(count))
+	for i := range glyphs {
+		glyphs[i], err = readUint16(s, offset+2+int64(i*2))
+		if err != nil {
+			return nil, err
+		}
+	}
+	return glyphs, nil
+}
+
+func parseJstfLangSys(s api.Stream, offset int64) (*JstfLangSys, error) {
+	if err := checkTableRange(s, offset, 2, "JstfLangSys table"); err != nil {
+		return nil, err
+	}
+	langSys := &JstfLangSys{}
+	var err error
+	langSys.JstfPriorityCount, err = readUint16(s, offset)
+	if err != nil {
+		return nil, err
+	}
+	if err := checkTableRange(s, offset, 2+int64(langSys.JstfPriorityCount)*2, "JstfLangSys table"); err != nil {
+		return nil, err
+	}
+	langSys.JstfPriorityOffsets = make([]uint16, int(langSys.JstfPriorityCount))
+	langSys.JstfPriorities = make([]*JstfPriority, int(langSys.JstfPriorityCount))
+	for i := 0; i < int(langSys.JstfPriorityCount); i++ {
+		langSys.JstfPriorityOffsets[i], err = readUint16(s, offset+2+int64(i*2))
+		if err != nil {
+			return nil, err
+		}
+		if langSys.JstfPriorityOffsets[i] == 0 {
+			continue
+		}
+		priority, err := parseJstfPriority(s, offset+int64(langSys.JstfPriorityOffsets[i]))
+		if err != nil {
+			return nil, err
+		}
+		langSys.JstfPriorities[i] = priority
+	}
+	return langSys, nil
+}
+
+func parseJstfPriority(s api.Stream, offset int64) (*JstfPriority, error) {
+	if err := checkTableRange(s, offset, 20, "JstfPriority table"); err != nil {
+		return nil, err
+	}
+	priority := &JstfPriority{}
+	offsets := []*uint16{
+		&priority.GsubShrinkageEnableOffset,
+		&priority.GsubShrinkageDisableOffset,
+		&priority.GposShrinkageEnableOffset,
+		&priority.GposShrinkageDisableOffset,
+		&priority.ShrinkageJstfMaxOffset,
+		&priority.GsubExtensionEnableOffset,
+		&priority.GsubExtensionDisableOffset,
+		&priority.GposExtensionEnableOffset,
+		&priority.GposExtensionDisableOffset,
+		&priority.ExtensionJstfMaxOffset,
+	}
+	for i, out := range offsets {
+		v, err := readUint16(s, offset+int64(i*2))
+		if err != nil {
+			return nil, err
+		}
+		*out = v
+	}
+
+	var err error
+	if priority.GsubShrinkageEnable, err = parseOptionalJstfModList(s, offset, priority.GsubShrinkageEnableOffset); err != nil {
+		return nil, err
+	}
+	if priority.GsubShrinkageDisable, err = parseOptionalJstfModList(s, offset, priority.GsubShrinkageDisableOffset); err != nil {
+		return nil, err
+	}
+	if priority.GposShrinkageEnable, err = parseOptionalJstfModList(s, offset, priority.GposShrinkageEnableOffset); err != nil {
+		return nil, err
+	}
+	if priority.GposShrinkageDisable, err = parseOptionalJstfModList(s, offset, priority.GposShrinkageDisableOffset); err != nil {
+		return nil, err
+	}
+	if priority.ShrinkageJstfMax, err = parseOptionalJstfMax(s, offset, priority.ShrinkageJstfMaxOffset); err != nil {
+		return nil, err
+	}
+	if priority.GsubExtensionEnable, err = parseOptionalJstfModList(s, offset, priority.GsubExtensionEnableOffset); err != nil {
+		return nil, err
+	}
+	if priority.GsubExtensionDisable, err = parseOptionalJstfModList(s, offset, priority.GsubExtensionDisableOffset); err != nil {
+		return nil, err
+	}
+	if priority.GposExtensionEnable, err = parseOptionalJstfModList(s, offset, priority.GposExtensionEnableOffset); err != nil {
+		return nil, err
+	}
+	if priority.GposExtensionDisable, err = parseOptionalJstfModList(s, offset, priority.GposExtensionDisableOffset); err != nil {
+		return nil, err
+	}
+	if priority.ExtensionJstfMax, err = parseOptionalJstfMax(s, offset, priority.ExtensionJstfMaxOffset); err != nil {
+		return nil, err
+	}
+	return priority, nil
+}
+
+func parseOptionalJstfModList(s api.Stream, parentOffset int64, relativeOffset uint16) (*JstfModList, error) {
+	if relativeOffset == 0 {
+		return nil, nil
+	}
+	return parseJstfModList(s, parentOffset+int64(relativeOffset))
+}
+
+func parseJstfModList(s api.Stream, offset int64) (*JstfModList, error) {
+	if err := checkTableRange(s, offset, 2, "JstfModList table"); err != nil {
+		return nil, err
+	}
+	modList := &JstfModList{}
+	var err error
+	modList.LookupCount, err = readUint16(s, offset)
+	if err != nil {
+		return nil, err
+	}
+	if err := checkTableRange(s, offset, 2+int64(modList.LookupCount)*2, "JstfModList table"); err != nil {
+		return nil, err
+	}
+	modList.LookupIndices = make([]uint16, int(modList.LookupCount))
+	for i := range modList.LookupIndices {
+		modList.LookupIndices[i], err = readUint16(s, offset+2+int64(i*2))
+		if err != nil {
+			return nil, err
+		}
+	}
+	return modList, nil
+}
+
+func parseOptionalJstfMax(s api.Stream, parentOffset int64, relativeOffset uint16) (*JstfMax, error) {
+	if relativeOffset == 0 {
+		return nil, nil
+	}
+	return parseJstfMax(s, parentOffset+int64(relativeOffset))
+}
+
+func parseJstfMax(s api.Stream, offset int64) (*JstfMax, error) {
+	if err := checkTableRange(s, offset, 2, "JstfMax table"); err != nil {
+		return nil, err
+	}
+	max := &JstfMax{}
+	var err error
+	max.LookupCount, err = readUint16(s, offset)
+	if err != nil {
+		return nil, err
+	}
+	if err := checkTableRange(s, offset, 2+int64(max.LookupCount)*2, "JstfMax table"); err != nil {
+		return nil, err
+	}
+	max.LookupOffsets = make([]uint16, int(max.LookupCount))
+	for i := range max.LookupOffsets {
+		max.LookupOffsets[i], err = readUint16(s, offset+2+int64(i*2))
+		if err != nil {
+			return nil, err
+		}
+		if max.LookupOffsets[i] != 0 {
+			if err := checkTableRange(s, offset+int64(max.LookupOffsets[i]), 6, "JstfMax Lookup table"); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return max, nil
 }
 
 type GaspRange struct {
@@ -2470,6 +3047,26 @@ func parseHdmx(s api.Stream, numGlyphs int) (HdmxTable, error) {
 	}
 
 	return t, nil
+}
+
+func (t HdmxTable) RecordForPixelSize(ppem uint8) (HdmxDeviceRecord, bool) {
+	for _, record := range t.Records {
+		if record.PixelSize == ppem {
+			return record, true
+		}
+	}
+	return HdmxDeviceRecord{}, false
+}
+
+func (t HdmxTable) Width(glyphIndex int, ppem uint8) (uint8, bool) {
+	if glyphIndex < 0 {
+		return 0, false
+	}
+	record, ok := t.RecordForPixelSize(ppem)
+	if !ok || glyphIndex >= len(record.Widths) {
+		return 0, false
+	}
+	return record.Widths[glyphIndex], true
 }
 
 type LTSHTable struct {

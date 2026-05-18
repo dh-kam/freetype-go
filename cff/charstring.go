@@ -10,18 +10,53 @@ import (
 )
 
 type charStringContext struct {
-	stack       []float64
-	x, y        float64
-	outline     *core.Outline
-	globalSubrs *Index
-	localSubrs  *Index
-	blendVector []float64
-	nesting     int
-	widthParsed bool
-	hintCount   int
-	vsIndex     int
-	transient   [32]float64
-	randomSeed  uint32
+	stack        []float64
+	x, y         float64
+	outline      *core.Outline
+	segments     []charStringSegment
+	globalSubrs  *Index
+	localSubrs   *Index
+	blendVector  []float64
+	zeroBlend    []float64
+	blendVectors map[int][]float64
+	varStore     *VariationStore
+	varCoords    []float64
+	nesting      int
+	widthParsed  bool
+	hintCount    int
+	vsIndex      int
+	transient    [32]float64
+	randomSeed   uint32
+}
+
+type charStringSegmentKind uint8
+
+const (
+	charStringMoveSegment charStringSegmentKind = iota
+	charStringLineSegment
+	charStringCubicSegment
+)
+
+type charStringSegment struct {
+	kind  charStringSegmentKind
+	from  api.Vector
+	ctrl1 api.Vector
+	ctrl2 api.Vector
+	to    api.Vector
+}
+
+type charStringResult struct {
+	outline  *core.Outline
+	segments []charStringSegment
+}
+
+type charStringDecodeOptions struct {
+	globalSubrs     *Index
+	localSubrs      *Index
+	blendVector     []float64
+	variationStore  *VariationStore
+	variationCoords []float64
+	defaultVSIndex  int
 }
 
 func (c *charStringContext) push(v float64) {
@@ -138,17 +173,32 @@ func calculateBias(count int) int {
 }
 
 func DecodeCharString(data []byte, globalSubrs *Index, localSubrs *Index, blendVector []float64) (*core.Outline, error) {
-	ctx := &charStringContext{
-		outline:     &core.Outline{},
+	result, err := decodeCharString(data, charStringDecodeOptions{
 		globalSubrs: globalSubrs,
 		localSubrs:  localSubrs,
 		blendVector: blendVector,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result.outline, nil
+}
+
+func decodeCharString(data []byte, opts charStringDecodeOptions) (*charStringResult, error) {
+	ctx := &charStringContext{
+		outline:     &core.Outline{},
+		globalSubrs: opts.globalSubrs,
+		localSubrs:  opts.localSubrs,
+		blendVector: opts.blendVector,
+		varStore:    opts.variationStore,
+		varCoords:   opts.variationCoords,
+		vsIndex:     opts.defaultVSIndex,
 	}
 	err := ctx.interpret(data)
 	if err != nil {
 		return nil, err
 	}
-	return ctx.outline, nil
+	return &charStringResult{outline: ctx.outline, segments: ctx.segments}, nil
 }
 
 func (c *charStringContext) interpret(data []byte) error {
@@ -473,8 +523,9 @@ func (c *charStringContext) interpret(data []byte) error {
 					return err
 				}
 			case 16: // blend
-				if len(c.blendVector) == 0 {
-					return errors.New("blend operator but no blend vector")
+				blendVector, err := c.currentBlendVector()
+				if err != nil {
+					return err
 				}
 				operand, err := c.pop()
 				if err != nil {
@@ -484,7 +535,7 @@ func (c *charStringContext) interpret(data []byte) error {
 				if n < 0 {
 					return errors.New("negative operand count in blend")
 				}
-				k := len(c.blendVector)
+				k := len(blendVector)
 				if len(c.stack) < n+n*k {
 					return errors.New("stack underflow in blend")
 				}
@@ -495,7 +546,7 @@ func (c *charStringContext) interpret(data []byte) error {
 				for i := 0; i < n; i++ {
 					val := c.stack[baseIdx+i]
 					for j := 0; j < k; j++ {
-						val += c.stack[deltasIdx+i*k+j] * c.blendVector[j]
+						val += c.stack[deltasIdx+i*k+j] * blendVector[j]
 					}
 					c.stack[baseIdx+i] = val
 				}
@@ -525,8 +576,7 @@ func (c *charStringContext) interpret(data []byte) error {
 					return err
 				}
 			default:
-				// Ignore unknown operators for now
-				c.stack = c.stack[:0]
+				return fmt.Errorf("unsupported charstring operator %d", op)
 			}
 		}
 	}
@@ -541,9 +591,43 @@ func (c *charStringContext) vsindex() error {
 	if idx < 0 {
 		return errors.New("negative variation store index in vsindex")
 	}
+	if c.varStore != nil {
+		if _, ok := c.varStore.ActiveRegionCount(idx); !ok {
+			return fmt.Errorf("variation store index %d out of range in vsindex", idx)
+		}
+	}
 	c.stack = c.stack[:len(c.stack)-1]
 	c.vsIndex = idx
 	return nil
+}
+
+func (c *charStringContext) currentBlendVector() ([]float64, error) {
+	if len(c.blendVector) > 0 {
+		return c.blendVector, nil
+	}
+	if c.varStore == nil {
+		return nil, errors.New("blend operator but no blend vector")
+	}
+	if c.blendVectors != nil {
+		if vector, ok := c.blendVectors[c.vsIndex]; ok {
+			return vector, nil
+		}
+	}
+	if vector, ok := c.varStore.BlendVector(c.vsIndex, c.varCoords); ok {
+		if c.blendVectors == nil {
+			c.blendVectors = make(map[int][]float64)
+		}
+		c.blendVectors[c.vsIndex] = vector
+		return vector, nil
+	}
+	k, ok := c.varStore.ActiveRegionCount(c.vsIndex)
+	if !ok {
+		return nil, fmt.Errorf("variation store index %d out of range in blend", c.vsIndex)
+	}
+	if cap(c.zeroBlend) < k {
+		c.zeroBlend = make([]float64, k)
+	}
+	return c.zeroBlend[:k], nil
 }
 
 func (c *charStringContext) drop() error {
@@ -695,15 +779,27 @@ func (c *charStringContext) rmoveto(dx, dy float64) {
 	}
 	c.x += dx
 	c.y += dy
-	c.outline.Points = append(c.outline.Points, api.Vector{X: int32(c.x * 64), Y: int32(c.y * 64)})
+	to := charStringPoint(c.x, c.y)
+	c.outline.Points = append(c.outline.Points, to)
 	c.outline.Tags = append(c.outline.Tags, 1) // On-curve
+	c.segments = append(c.segments, charStringSegment{
+		kind: charStringMoveSegment,
+		to:   to,
+	})
 }
 
 func (c *charStringContext) rlineto(dx, dy float64) {
+	from := charStringPoint(c.x, c.y)
 	c.x += dx
 	c.y += dy
-	c.outline.Points = append(c.outline.Points, api.Vector{X: int32(c.x * 64), Y: int32(c.y * 64)})
+	to := charStringPoint(c.x, c.y)
+	c.outline.Points = append(c.outline.Points, to)
 	c.outline.Tags = append(c.outline.Tags, 1) // On-curve
+	c.segments = append(c.segments, charStringSegment{
+		kind: charStringLineSegment,
+		from: from,
+		to:   to,
+	})
 }
 
 func (c *charStringContext) rcurveline() error {
@@ -893,6 +989,13 @@ func (c *charStringContext) rrcurveto(dx1, dy1, dx2, dy2, dx3, dy3 float64) {
 	x1, y1 := x0+dx1, y0+dy1
 	x2, y2 := x1+dx2, y1+dy2
 	x3, y3 := x2+dx3, y2+dy3
+	c.segments = append(c.segments, charStringSegment{
+		kind:  charStringCubicSegment,
+		from:  charStringPoint(x0, y0),
+		ctrl1: charStringPoint(x1, y1),
+		ctrl2: charStringPoint(x2, y2),
+		to:    charStringPoint(x3, y3),
+	})
 
 	// Flatten cubic Bezier to line segments
 	const steps = 10
@@ -907,8 +1010,12 @@ func (c *charStringContext) rrcurveto(dx1, dy1, dx2, dy2, dx3, dy3 float64) {
 		px := mt3*x0 + 3*mt2*t*x1 + 3*mt*t2*x2 + t3*x3
 		py := mt3*y0 + 3*mt2*t*y1 + 3*mt*t2*y2 + t3*y3
 
-		c.outline.Points = append(c.outline.Points, api.Vector{X: int32(px * 64), Y: int32(py * 64)})
+		c.outline.Points = append(c.outline.Points, charStringPoint(px, py))
 		c.outline.Tags = append(c.outline.Tags, 1)
 	}
 	c.x, c.y = x3, y3
+}
+
+func charStringPoint(x, y float64) api.Vector {
+	return api.Vector{X: int32(x * 64), Y: int32(y * 64)}
 }

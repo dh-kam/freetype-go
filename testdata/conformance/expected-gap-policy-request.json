@@ -1,0 +1,15 @@
+{
+  "description": "Tiny request fixture used to exercise expected_gaps policy and stale-gap reporting in corpus comparisons.",
+  "corpus": "expected-gap-policy",
+  "ppem": "16",
+  "glyphs": [0],
+  "chars": ["U+0061"],
+  "load_flags": "no-hinting",
+  "render_modes": ["none", "normal"],
+  "expected_gaps": [
+    {
+      "path": "sizes[16x16/no-hinting/render-normal].glyphs[68].bitmap*",
+      "note": "Path-scoped render gap for the current byte-level gray raster mismatch."
+    }
+  ]
+}

@@ -11,6 +11,10 @@ type mockStream struct {
 	data []byte
 }
 
+type unsupportedEvaluatePaint struct{}
+
+func (unsupportedEvaluatePaint) Format() uint8 { return 255 }
+
 func (m *mockStream) ReadAt(p []byte, off int64) (n int, err error) {
 	if off < 0 || int(off) >= len(m.data) {
 		return 0, nil
@@ -338,6 +342,17 @@ func smokePaint(format byte) []byte {
 	default:
 		panic("unknown paint format")
 	}
+	return buf.Bytes()
+}
+
+func compositePaint(mode byte) []byte {
+	var buf bytes.Buffer
+	buf.WriteByte(32)
+	writeOffset24(&buf, 8)
+	buf.WriteByte(mode)
+	writeOffset24(&buf, 13)
+	buf.Write(solidPaint(0, 16384))
+	buf.Write(solidPaint(1, 8192))
 	return buf.Bytes()
 }
 
@@ -790,6 +805,23 @@ func TestEvaluateClipBoxAppliesVariationAndExpandsBounds(t *testing.T) {
 	}
 }
 
+func TestEvaluateClipBoxStaticNoVariationSemantics(t *testing.T) {
+	static := &ClipBox{Format: 1, XMin: -1, YMin: -2, XMax: 3, YMax: 4}
+	got := (*COLR)(nil).EvaluateClipBox(static, []float32{1})
+	if got == nil || got == static || *got != *static {
+		t.Fatalf("static clip box should be copied without variation: got=%+v input=%+v", got, static)
+	}
+
+	variable := &ClipBox{Format: 2, XMin: 10, YMin: 20, XMax: 30, YMax: 40, VarIndexBase: NoVariationIndex}
+	got = (*COLR)(nil).EvaluateClipBox(variable, []float32{1})
+	if got.Format != 1 || got.XMin != 10 || got.YMin != 20 || got.XMax != 30 || got.YMax != 40 || got.VarIndexBase != 0 {
+		t.Fatalf("NoVariationIndex clip box should lower to static bounds: %+v", got)
+	}
+	if got := (*COLR)(nil).EvaluateClipBox(nil, []float32{1}); got != nil {
+		t.Fatalf("nil clip box should evaluate to nil: %+v", got)
+	}
+}
+
 func TestEvaluatePaintAppliesVarLinearGradientDeltas(t *testing.T) {
 	colr := colrWithVariationDeltas([]int32{10, 20, 30, 40, 50, -5, 8192, -4096})
 	paint := &PaintVarLinearGradient{
@@ -853,6 +885,221 @@ func TestEvaluatePaintVarTransformAppliesFixedDeltasAndChild(t *testing.T) {
 	child, ok := got.Paint.(*PaintSolid)
 	if !ok || child.PaletteIndex != 3 || child.Alpha != 1 {
 		t.Fatalf("unexpected effective child paint: %#v", got.Paint)
+	}
+}
+
+func TestEvaluatePaintVarGradientClampsEdges(t *testing.T) {
+	colr := colrWithVariationDeltas([]int32{-40000, 40000, -10, 40000, -40000, 70000, -49152, 65536})
+	paint := &PaintVarRadialGradient{
+		ColorLine: ColorLine{
+			Extend: 1,
+			ColorStops: []ColorStop{
+				{StopOffset: F2Dot14(0.5), PaletteIndex: 1, Alpha: F2Dot14(0.5), VarIndexBase: 6},
+			},
+		},
+		X0:           -32000,
+		Y0:           32000,
+		R0:           5,
+		X1:           0,
+		Y1:           0,
+		R1:           100,
+		VarIndexBase: 0,
+	}
+
+	effective, err := colr.EvaluatePaint(paint, []float32{1})
+	if err != nil {
+		t.Fatalf("EvaluatePaint failed: %v", err)
+	}
+	got, ok := effective.(*PaintRadialGradient)
+	if !ok {
+		t.Fatalf("expected PaintRadialGradient, got %T", effective)
+	}
+	if got.X0 != -32768 || got.Y0 != 32767 || got.R0 != 0 || got.X1 != 32767 || got.Y1 != -32768 || got.R1 != 65535 {
+		t.Fatalf("unexpected clamped radial geometry: %+v", got)
+	}
+	stop := got.ColorLine.ColorStops[0]
+	if stop.StopOffset != F2Dot14(-2) || stop.Alpha != F2Dot14(1) || stop.VarIndexBase != 0 {
+		t.Fatalf("unexpected clamped color stop: %+v", stop)
+	}
+}
+
+func TestEvaluatePaintVarSweepGradientClampsAngles(t *testing.T) {
+	colr := colrWithVariationDeltas([]int32{-40000, 40000, -49152, 65536})
+	paint := &PaintVarSweepGradient{
+		ColorLine:    ColorLine{Extend: 0, ColorStops: []ColorStop{{StopOffset: 0, PaletteIndex: 1, Alpha: 1}}},
+		CenterX:      0,
+		CenterY:      0,
+		StartAngle:   1,
+		EndAngle:     0,
+		VarIndexBase: 0,
+	}
+
+	effective, err := colr.EvaluatePaint(paint, []float32{1})
+	if err != nil {
+		t.Fatalf("EvaluatePaint failed: %v", err)
+	}
+	got, ok := effective.(*PaintSweepGradient)
+	if !ok {
+		t.Fatalf("expected PaintSweepGradient, got %T", effective)
+	}
+	if got.CenterX != -32768 || got.CenterY != 32767 {
+		t.Fatalf("unexpected clamped sweep center: %+v", got)
+	}
+	if got.StartAngle != F2Dot14(-2) || got.EndAngle != F2Dot14(float32(32767)/16384) {
+		t.Fatalf("unexpected clamped sweep angles: %+v/%+v", got.StartAngle, got.EndAngle)
+	}
+}
+
+func TestEvaluateColorLineStableSortsTiedVariableStops(t *testing.T) {
+	colr := colrWithVariationDeltas([]int32{4096, 0, -4096, 0})
+	paint := &PaintVarLinearGradient{
+		ColorLine: ColorLine{
+			Extend: 0,
+			ColorStops: []ColorStop{
+				{StopOffset: F2Dot14(0.25), PaletteIndex: 10, Alpha: 1, VarIndexBase: 0},
+				{StopOffset: F2Dot14(0.75), PaletteIndex: 20, Alpha: 1, VarIndexBase: 2},
+			},
+		},
+		VarIndexBase: NoVariationIndex,
+	}
+
+	effective, err := colr.EvaluatePaint(paint, []float32{1})
+	if err != nil {
+		t.Fatalf("EvaluatePaint failed: %v", err)
+	}
+	got := effective.(*PaintLinearGradient)
+	if got.ColorLine.ColorStops[0].StopOffset != F2Dot14(0.5) || got.ColorLine.ColorStops[1].StopOffset != F2Dot14(0.5) {
+		t.Fatalf("expected tied effective stop offsets: %+v", got.ColorLine.ColorStops)
+	}
+	if got.ColorLine.ColorStops[0].PaletteIndex != 10 || got.ColorLine.ColorStops[1].PaletteIndex != 20 {
+		t.Fatalf("tied stops should keep font order: %+v", got.ColorLine.ColorStops)
+	}
+}
+
+func TestEvaluatePaintStaticFormatsReturnCopies(t *testing.T) {
+	for format := byte(1); format <= 32; format++ {
+		if format%2 != 0 && format != 1 && format != 11 {
+			continue
+		}
+		colr, err := ParseCOLR(&mockStream{data: colrV1WithPaint(smokePaint(format))})
+		if err != nil {
+			t.Fatalf("format %d parse failed: %v", format, err)
+		}
+		paint := colr.BaseGlyphV1Records[42].Paint
+		effective, err := colr.EvaluatePaint(paint, []float32{1})
+		if err != nil {
+			t.Fatalf("format %d evaluate failed: %v", format, err)
+		}
+		if effective == nil || effective.Format() != format {
+			t.Fatalf("format %d evaluated as %T/%v", format, effective, effective)
+		}
+		if effective == paint {
+			t.Fatalf("format %d should evaluate to a copy, got original pointer", format)
+		}
+	}
+}
+
+func TestEvaluatePaintCompositeEvaluatesChildrenAndPreservesMode(t *testing.T) {
+	colr := colrWithVariationDeltas([]int32{8192, -10, 20})
+	paint := &PaintComposite{
+		SourcePaint:   &PaintVarSolid{PaletteIndex: 3, Alpha: F2Dot14(0.75), VarIndexBase: 0},
+		CompositeMode: 27,
+		BackdropPaint: &PaintVarTranslate{
+			Paint:        &PaintSolid{PaletteIndex: 4, Alpha: 1},
+			DX:           5,
+			DY:           6,
+			VarIndexBase: 1,
+		},
+	}
+
+	effective, err := colr.EvaluatePaint(paint, []float32{1})
+	if err != nil {
+		t.Fatalf("EvaluatePaint failed: %v", err)
+	}
+	got, ok := effective.(*PaintComposite)
+	if !ok {
+		t.Fatalf("expected PaintComposite, got %T", effective)
+	}
+	if got.CompositeMode != 27 {
+		t.Fatalf("unexpected composite mode: %d", got.CompositeMode)
+	}
+	if source, ok := got.SourcePaint.(*PaintSolid); !ok || source.Alpha != 1 {
+		t.Fatalf("unexpected evaluated source: %#v", got.SourcePaint)
+	}
+	if backdrop, ok := got.BackdropPaint.(*PaintTranslate); !ok || backdrop.DX != -5 || backdrop.DY != 26 {
+		t.Fatalf("unexpected evaluated backdrop: %#v", got.BackdropPaint)
+	}
+}
+
+func TestEvaluatePaintCompositeNormalizesConstructedUnknownMode(t *testing.T) {
+	paint := &PaintComposite{
+		SourcePaint:   &PaintSolid{PaletteIndex: 1, Alpha: 1},
+		CompositeMode: 99,
+		BackdropPaint: &PaintSolid{PaletteIndex: 2, Alpha: 1},
+	}
+
+	effective, err := (*COLR)(nil).EvaluatePaint(paint, nil)
+	if err != nil {
+		t.Fatalf("EvaluatePaint failed: %v", err)
+	}
+	got, ok := effective.(*PaintComposite)
+	if !ok {
+		t.Fatalf("expected PaintComposite, got %T", effective)
+	}
+	if got.CompositeMode != 0 {
+		t.Fatalf("unrecognized composite mode should normalize to COMPOSITE_CLEAR, got %d", got.CompositeMode)
+	}
+}
+
+func TestEvaluatePaintColrGlyphTraversesReferencedGraph(t *testing.T) {
+	colr := &COLR{
+		BaseGlyphV1Records: map[uint16]BaseGlyphV1Record{
+			7: {GlyphID: 7, Paint: &PaintGlyph{Paint: unsupportedEvaluatePaint{}, GlyphID: 9}},
+		},
+	}
+
+	if _, err := colr.EvaluatePaint(&PaintColrGlyph{GlyphID: 7}, nil); err == nil {
+		t.Fatalf("expected referenced PaintColrGlyph graph evaluation to fail")
+	}
+
+	effective, err := colr.EvaluatePaint(&PaintColrGlyph{GlyphID: 8}, nil)
+	if err != nil {
+		t.Fatalf("missing referenced glyph should remain a renderer-level concern: %v", err)
+	}
+	if got, ok := effective.(*PaintColrGlyph); !ok || got.GlyphID != 8 {
+		t.Fatalf("unexpected missing glyph evaluation result: %#v", effective)
+	}
+}
+
+func TestEvaluatePaintColrGlyphCycleReturnsError(t *testing.T) {
+	colr := &COLR{
+		BaseGlyphV1Records: map[uint16]BaseGlyphV1Record{
+			7: {GlyphID: 7, Paint: &PaintColrGlyph{GlyphID: 8}},
+			8: {GlyphID: 8, Paint: &PaintColrGlyph{GlyphID: 7}},
+		},
+	}
+
+	if _, err := colr.EvaluatePaint(&PaintColrGlyph{GlyphID: 7}, nil); err == nil {
+		t.Fatalf("expected cyclic PaintColrGlyph graph evaluation to fail")
+	}
+}
+
+func TestEvaluatePaintColrLayersTraversesLayerList(t *testing.T) {
+	colr := &COLR{
+		LayerList: []Paint{
+			&PaintSolid{PaletteIndex: 1, Alpha: 1},
+			unsupportedEvaluatePaint{},
+		},
+	}
+	paint := &PaintColrLayers{NumLayers: 2, FirstLayerIndex: 0}
+
+	if _, err := colr.EvaluatePaint(paint, nil); err == nil {
+		t.Fatalf("expected layer list graph evaluation to fail")
+	}
+
+	_, err := colr.EvaluatePaint(&PaintColrLayers{NumLayers: 2, FirstLayerIndex: 1}, nil)
+	if err == nil {
+		t.Fatalf("expected out-of-range layer list evaluation to fail")
 	}
 }
 
@@ -956,6 +1203,26 @@ func TestParseCOLR_V1_AllSpecPaintFormats(t *testing.T) {
 		if paint.Format() != format {
 			t.Fatalf("format %d parsed as %d (%T)", format, paint.Format(), paint)
 		}
+	}
+}
+
+func TestParseCOLR_V1_PaintCompositeNormalizesUnknownModeToClear(t *testing.T) {
+	colr, err := ParseCOLR(&mockStream{data: colrV1WithPaint(compositePaint(28))})
+	if err != nil {
+		t.Fatalf("ParseCOLR failed: %v", err)
+	}
+	got, ok := colr.BaseGlyphV1Records[42].Paint.(*PaintComposite)
+	if !ok {
+		t.Fatalf("expected PaintComposite, got %T", colr.BaseGlyphV1Records[42].Paint)
+	}
+	if got.CompositeMode != 0 {
+		t.Fatalf("unrecognized composite mode should normalize to COMPOSITE_CLEAR, got %d", got.CompositeMode)
+	}
+	if source, ok := got.SourcePaint.(*PaintSolid); !ok || source.PaletteIndex != 0 {
+		t.Fatalf("unexpected source paint: %#v", got.SourcePaint)
+	}
+	if backdrop, ok := got.BackdropPaint.(*PaintSolid); !ok || backdrop.PaletteIndex != 1 || backdrop.Alpha != F2Dot14(0.5) {
+		t.Fatalf("unexpected backdrop paint: %#v", got.BackdropPaint)
 	}
 }
 

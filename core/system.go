@@ -8,13 +8,25 @@ import (
 // System implements api.FreetypeSystem interface.
 type System struct {
 	mathEngine   api.MathEngine
+	rasterizer   api.Rasterizer
+	hinter       api.Hinter
 	imageDecoder api.ImageDecoder
 }
 
 // NewSystem creates and returns a new instance of FreetypeSystem.
 func NewSystem() api.FreetypeSystem {
+	return NewSystemWithServices(nil, nil, nil)
+}
+
+// NewSystemWithServices creates a System with optional module services.
+func NewSystemWithServices(mathEngine api.MathEngine, rasterizer api.Rasterizer, hinter api.Hinter) *System {
+	if mathEngine == nil {
+		mathEngine = math.NewMathEngine()
+	}
 	return &System{
-		mathEngine: math.NewMathEngine(),
+		mathEngine: mathEngine,
+		rasterizer: rasterizer,
+		hinter:     hinter,
 	}
 }
 
@@ -31,12 +43,22 @@ func (s *System) Math() api.MathEngine {
 	return s.mathEngine
 }
 
-// Rasterizer returns the rasterizer (currently nil).
-func (s *System) Rasterizer() api.Rasterizer {
-	return nil
+// SetRasterizer installs the rasterizer service returned through FreetypeSystem.
+func (s *System) SetRasterizer(r api.Rasterizer) {
+	s.rasterizer = r
 }
 
-// Hinter returns the hinter (currently nil).
+// Rasterizer returns the configured rasterizer service.
+func (s *System) Rasterizer() api.Rasterizer {
+	return s.rasterizer
+}
+
+// SetHinter installs the hinter service returned through FreetypeSystem.
+func (s *System) SetHinter(h api.Hinter) {
+	s.hinter = h
+}
+
+// Hinter returns the configured hinter service.
 func (s *System) Hinter() api.Hinter {
-	return nil
+	return s.hinter
 }

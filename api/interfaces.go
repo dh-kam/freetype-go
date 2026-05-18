@@ -98,6 +98,27 @@ func GetGlyphSlotMetrics(slot GlyphSlot) (GlyphMetrics, bool) {
 	return provider.GetMetrics()
 }
 
+// BitmapPlacementProvider is optional. Rendered outline bitmaps can expose
+// FreeType-style bitmap_left and bitmap_top placement without changing the
+// stable Bitmap interface.
+type BitmapPlacementProvider interface {
+	GetLeft() int
+	GetTop() int
+}
+
+// GetBitmapPlacement returns FreeType-style bitmap placement when a bitmap
+// implementation exposes it through BitmapPlacementProvider.
+func GetBitmapPlacement(bitmap Bitmap) (left, top int, ok bool) {
+	if bitmap == nil {
+		return 0, 0, false
+	}
+	provider, ok := bitmap.(BitmapPlacementProvider)
+	if !ok {
+		return 0, 0, false
+	}
+	return provider.GetLeft(), provider.GetTop(), true
+}
+
 // GlyphSlot holds the currently loaded glyph.
 type GlyphSlot interface {
 	GetOutline() Outline

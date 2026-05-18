@@ -5,5 +5,12 @@
   "glyphs": [0],
   "chars": ["U+0041", "U+0061"],
   "load_flags": ["no-hinting", "no-hinting+target-light"],
-  "render_modes": ["none", "normal", "lcd"]
+  "render_modes": ["none", "normal", "lcd"],
+  "include_bitmap_buffer": true,
+  "expected_gaps": [
+    {
+      "kind": "go render output mismatch",
+      "note": "Rendered bitmap hashes and byte-level diffs may differ until rasterizer, filtering, and hinting parity are closed."
+    }
+  ]
 }

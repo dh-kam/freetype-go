@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"strings"
@@ -15,62 +16,80 @@ import (
 )
 
 func main() {
-	fontPath := flag.String("font", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "Path to TTF/OTF/TTC/WOFF/WOFF2 font file")
-	charToRender := flag.String("char", "G", "Character to render")
-	size := flag.Int("size", 24, "Font size in pixels")
-	faceIndex := flag.Int("face-index", 0, "Face index for TTC/OTC collections")
-	flag.Parse()
+	if err := run(os.Args[1:], os.Stdout); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func run(args []string, out io.Writer) error {
+	fs := flag.NewFlagSet("ftgo", flag.ContinueOnError)
+	fs.SetOutput(out)
+	fontPath := fs.String("font", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "Path to TTF/OTF/TTC/WOFF/WOFF2 font file")
+	charToRender := fs.String("char", "G", "Character to render")
+	size := fs.Int("size", 24, "Font size in pixels")
+	faceIndex := fs.Int("face-index", 0, "Face index for TTC/OTC collections")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
 
 	if len(*charToRender) == 0 {
-		log.Fatal("Please provide a character to render")
+		return fmt.Errorf("please provide a character to render")
 	}
 	r := []rune(*charToRender)[0]
 
-	fmt.Printf("Loading font: %s\n", *fontPath)
+	fmt.Fprintf(out, "Loading font: %s\n", *fontPath)
 	f, err := os.Open(*fontPath)
 	if err != nil {
-		log.Fatalf("Failed to open font file: %v", err)
+		return fmt.Errorf("failed to open font file: %w", err)
 	}
 	defer f.Close()
 
 	fileStream, err := core.NewFileStream(f)
 	if err != nil {
-		log.Fatalf("Failed to create font stream: %v", err)
+		return fmt.Errorf("failed to create font stream: %w", err)
 	}
 	var stream api.Stream = fileStream
 	stream, err = helper.DecodeWOFFIfNeeded(stream)
 	if err != nil {
-		log.Fatalf("Failed to decode WOFF container: %v", err)
+		return fmt.Errorf("failed to decode WOFF container: %w", err)
 	}
 	sys := core.NewSystem()
-	face, err := sfnt.LoadFaceIndex(sys, stream, *faceIndex)
+	lib := core.NewLibrary()
+	lib.AddDriver(sfnt.NewLoader(sys))
+
+	var face api.Face
+	if *faceIndex == 0 {
+		face, err = lib.LoadFace(stream)
+	} else {
+		face, err = sfnt.LoadFaceIndex(sys, stream, *faceIndex)
+	}
 	if err != nil {
-		log.Fatalf("Failed to load face: %v", err)
+		return fmt.Errorf("failed to load face: %w", err)
 	}
 	if err := face.SetPixelSizes(*size, *size); err != nil {
-		log.Fatalf("Invalid pixel size: %v", err)
+		return fmt.Errorf("invalid pixel size: %w", err)
 	}
 
-	fmt.Printf("Looking up glyph index for character '%c'\n", r)
+	fmt.Fprintf(out, "Looking up glyph index for character '%c'\n", r)
 	glyphIndex, err := face.GetGlyphIndex(r)
 	if err != nil {
-		log.Fatalf("Glyph not found for character '%c': %v", r, err)
+		return fmt.Errorf("glyph not found for character '%c': %w", r, err)
 	}
 
-	fmt.Printf("Loading glyph index: %d\n", glyphIndex)
+	fmt.Fprintf(out, "Loading glyph index: %d\n", glyphIndex)
 	slot, err := face.LoadGlyph(glyphIndex, api.LoadDefault)
 	if err != nil {
-		log.Fatalf("Failed to load glyph: %v", err)
+		return fmt.Errorf("failed to load glyph: %w", err)
 	}
 
 	advance, lsb, err := face.GetGlyphMetrics(glyphIndex)
 	if err == nil {
-		fmt.Printf("Metrics: Advance=%d, LSB=%d\n", advance, lsb)
+		fmt.Fprintf(out, "Metrics: Advance=%d, LSB=%d\n", advance, lsb)
 	}
 
 	outline := slot.GetOutline()
 	if outline == nil {
-		log.Fatal("Outline is empty")
+		return fmt.Errorf("outline is empty")
 	}
 
 	// Calculate bounding box after scaling
@@ -91,17 +110,21 @@ func main() {
 
 	rast := raster.NewSmoothRasterizer()
 	if err := rast.Render(outline, bitmap); err != nil {
-		log.Fatalf("Rasterizer failed: %v", err)
+		return fmt.Errorf("rasterizer failed: %w", err)
 	}
 
-	fmt.Printf("\n--- Rendering of '%c' (Size: %d) ---\n\n", r, *size)
-	printASCII(bitmap)
+	fmt.Fprintf(out, "\n--- Rendering of '%c' (Size: %d) ---\n\n", r, *size)
+	printASCII(out, bitmap)
+	return nil
 }
 
 func getBBox(outline api.Outline) (minX, minY, maxX, maxY int32) {
+	if outline == nil {
+		return 0, 0, 0, 0
+	}
 	points := outline.GetPoints()
 	contours := outline.GetContours()
-	if len(contours) == 0 {
+	if len(points) == 0 || len(contours) == 0 {
 		return 0, 0, 0, 0
 	}
 	lastPoint := contours[len(contours)-1]
@@ -132,7 +155,10 @@ func getBBox(outline api.Outline) (minX, minY, maxX, maxY int32) {
 	return
 }
 
-func printASCII(b *core.Bitmap) {
+func printASCII(w io.Writer, b *core.Bitmap) {
+	if b == nil {
+		return
+	}
 	buf := b.GetBuffer()
 	pitch := b.GetPitch()
 	rows := b.GetRows()
@@ -144,7 +170,11 @@ func printASCII(b *core.Bitmap) {
 		var line strings.Builder
 		emptyLine := true
 		for x := 0; x < width; x++ {
-			val := buf[y*pitch+x]
+			offset := y*pitch + x
+			if offset < 0 || offset >= len(buf) {
+				break
+			}
+			val := buf[offset]
 			if val > 0 {
 				emptyLine = false
 			}
@@ -153,7 +183,7 @@ func printASCII(b *core.Bitmap) {
 			line.WriteString(shades[idx]) // Double wide for aspect ratio
 		}
 		if !emptyLine {
-			fmt.Println(line.String())
+			fmt.Fprintln(w, line.String())
 		}
 	}
 }

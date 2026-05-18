@@ -1,0 +1,16 @@
+{
+  "description": "Render bitmap placement request for common bearing-sensitive glyphs. Supply the font with CONFORMANCE_FONT or -font.",
+  "corpus": "render-placement",
+  "ppem": ["16", "24"],
+  "glyphs": [0],
+  "chars": ["U+0041", "U+0067", "U+006A"],
+  "load_flags": ["no-hinting", "no-hinting+target-light"],
+  "render_modes": ["normal", "light", "mono", "lcd", "lcd-v"],
+  "include_bitmap_buffer": true,
+  "expected_gaps": [
+    {
+      "kind": "go render output mismatch",
+      "note": "Tracks rendered format, bitmap geometry, pixel mode, placement, and buffer hash/byte differences until render parity is closed."
+    }
+  ]
+}

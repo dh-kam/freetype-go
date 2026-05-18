@@ -12,7 +12,8 @@ import (
 )
 
 const (
-	maxPaintDepth = 32
+	maxPaintDepth    = 32
+	maxCompositeMode = 27
 
 	// NoVariationIndex disables variation for COLR varIndexBase fields.
 	NoVariationIndex = uint32(0xFFFFFFFF)
@@ -1364,7 +1365,7 @@ func readPaintAt(s api.Stream, baseOffset int64, paintOffset int64, depth int) (
 			return nil, err
 		}
 		srcOffset := readOffset24(buf[0:3])
-		compositeMode := buf[3]
+		compositeMode := normalizeCompositeMode(buf[3])
 		bgOffset := readOffset24(buf[4:7])
 
 		srcPaint, err := readPaintAt(s, absOffset, int64(srcOffset), depth+1)
@@ -1382,6 +1383,13 @@ func readPaintAt(s api.Stream, baseOffset int64, paintOffset int64, depth int) (
 		}, nil
 	}
 	return nil, fmt.Errorf("unsupported paint format %d", format)
+}
+
+func normalizeCompositeMode(mode uint8) uint8 {
+	if mode > maxCompositeMode {
+		return 0
+	}
+	return mode
 }
 
 func parseLayerList(s api.Stream, layerListOffset uint32) ([]Paint, error) {
@@ -1939,6 +1947,17 @@ func (c *COLR) evaluatePaint(p Paint, coords []float32, depth int) (Paint, error
 	switch paint := p.(type) {
 	case *PaintColrLayers:
 		out := *paint
+		if c != nil && len(c.LayerList) > 0 {
+			layers, ok := c.LayerPaints(paint.FirstLayerIndex, paint.NumLayers)
+			if !ok {
+				return nil, errors.New("COLR paint layer range out of bounds")
+			}
+			for _, layer := range layers {
+				if _, err := c.evaluatePaint(layer, coords, depth+1); err != nil {
+					return nil, err
+				}
+			}
+		}
 		return &out, nil
 	case *PaintSolid:
 		out := *paint
@@ -1997,6 +2016,13 @@ func (c *COLR) evaluatePaint(p Paint, coords []float32, depth int) (Paint, error
 		return &PaintGlyph{Paint: child, GlyphID: paint.GlyphID}, nil
 	case *PaintColrGlyph:
 		out := *paint
+		if c != nil {
+			if record, ok := c.BaseGlyphV1Records[paint.GlyphID]; ok {
+				if _, err := c.evaluatePaint(record.Paint, coords, depth+1); err != nil {
+					return nil, err
+				}
+			}
+		}
 		return &out, nil
 	case *PaintTransform:
 		child, err := c.evaluatePaint(paint.Paint, coords, depth+1)
@@ -2175,7 +2201,7 @@ func (c *COLR) evaluatePaint(p Paint, coords []float32, depth int) (Paint, error
 		if err != nil {
 			return nil, err
 		}
-		return &PaintComposite{SourcePaint: source, CompositeMode: paint.CompositeMode, BackdropPaint: backdrop}, nil
+		return &PaintComposite{SourcePaint: source, CompositeMode: normalizeCompositeMode(paint.CompositeMode), BackdropPaint: backdrop}, nil
 	default:
 		return nil, fmt.Errorf("unsupported paint type %T", p)
 	}

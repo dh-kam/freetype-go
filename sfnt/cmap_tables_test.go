@@ -5,6 +5,64 @@ import (
 	"testing"
 )
 
+func TestCMapFormat2Lookup(t *testing.T) {
+	data := makeCMapFormat2Mixed()
+
+	cmap, err := parseCMapSubtable(&mockStream{data: data}, 0)
+	if err != nil {
+		t.Fatalf("parseCMapSubtable failed: %v", err)
+	}
+	format2, ok := cmap.(*CMapFormat2)
+	if !ok {
+		t.Fatalf("expected *CMapFormat2, got %T", cmap)
+	}
+	if len(format2.SubHeaders) != 3 {
+		t.Fatalf("expected 3 subHeaders, got %d", len(format2.SubHeaders))
+	}
+	if gid := cmap.Lookup(0x41); gid != 7 {
+		t.Fatalf("expected single-byte GID 7 for 0x41, got %d", gid)
+	}
+	if gid := cmap.Lookup(0x81); gid != 0 {
+		t.Fatalf("expected lead byte without low byte to return 0, got %d", gid)
+	}
+	if gid := cmap.Lookup(0x8140); gid != 22 {
+		t.Fatalf("expected GID 22 for 0x8140, got %d", gid)
+	}
+	if gid := cmap.Lookup(0x8141); gid != 0 {
+		t.Fatalf("expected zero glyph entry to stay missing, got %d", gid)
+	}
+	if gid := cmap.Lookup(0x8240); gid != 25 {
+		t.Fatalf("expected shared sub-array with delta to map 0x8240 to GID 25, got %d", gid)
+	}
+	if gid := cmap.Lookup(0x823f); gid != 0 {
+		t.Fatalf("expected low byte below firstCode to return 0, got %d", gid)
+	}
+	if gid := cmap.Lookup(0x8340); gid != 0 {
+		t.Fatalf("expected non-lead high byte to return 0, got %d", gid)
+	}
+}
+
+func TestParseCMapSelectsFormat2DBCSFallback(t *testing.T) {
+	format2 := makeCMapFormat2Mixed()
+	data := make([]byte, 12+len(format2))
+	binary.BigEndian.PutUint16(data[2:4], 1)
+	binary.BigEndian.PutUint16(data[4:6], 3)
+	binary.BigEndian.PutUint16(data[6:8], 2)
+	binary.BigEndian.PutUint32(data[8:12], 12)
+	copy(data[12:], format2)
+
+	cmap, err := parseCMap(&mockStream{data: data})
+	if err != nil {
+		t.Fatalf("parseCMap failed: %v", err)
+	}
+	if _, ok := cmap.(*CMapFormat2); !ok {
+		t.Fatalf("expected *CMapFormat2 fallback, got %T", cmap)
+	}
+	if gid := cmap.Lookup(0x8140); gid != 22 {
+		t.Fatalf("expected format 2 fallback to map 0x8140 to GID 22, got %d", gid)
+	}
+}
+
 func TestCMapFormat6Lookup(t *testing.T) {
 	data := make([]byte, 10+3*2)
 	binary.BigEndian.PutUint16(data[0:2], 6)
@@ -262,6 +320,59 @@ func TestCMapMalformedSubtablesRejected(t *testing.T) {
 				binary.BigEndian.PutUint16(data[0:2], 4)
 				binary.BigEndian.PutUint16(data[2:4], uint16(len(data)))
 				binary.BigEndian.PutUint16(data[6:8], 2)
+				return data
+			}(),
+		},
+		{
+			name: "format 2 subHeaderKeys exceed length",
+			data: func() []byte {
+				data := make([]byte, cmapFormat2MinSize)
+				binary.BigEndian.PutUint16(data[0:2], 2)
+				binary.BigEndian.PutUint16(data[2:4], uint16(len(data)))
+				binary.BigEndian.PutUint16(data[6:8], 8)
+				return data
+			}(),
+		},
+		{
+			name: "format 2 subHeaderKey not multiple of eight",
+			data: func() []byte {
+				data := make([]byte, cmapFormat2MinSize)
+				binary.BigEndian.PutUint16(data[0:2], 2)
+				binary.BigEndian.PutUint16(data[2:4], uint16(len(data)))
+				binary.BigEndian.PutUint16(data[6:8], 2)
+				return data
+			}(),
+		},
+		{
+			name: "format 2 subHeader byte range overflows",
+			data: func() []byte {
+				data := make([]byte, cmapFormat2MinSize)
+				binary.BigEndian.PutUint16(data[0:2], 2)
+				binary.BigEndian.PutUint16(data[2:4], uint16(len(data)))
+				binary.BigEndian.PutUint16(data[cmapFormat2HeaderSize:cmapFormat2HeaderSize+2], 250)
+				binary.BigEndian.PutUint16(data[cmapFormat2HeaderSize+2:cmapFormat2HeaderSize+4], 7)
+				return data
+			}(),
+		},
+		{
+			name: "format 2 idRangeOffset not word aligned",
+			data: func() []byte {
+				data := make([]byte, cmapFormat2MinSize+2)
+				binary.BigEndian.PutUint16(data[0:2], 2)
+				binary.BigEndian.PutUint16(data[2:4], uint16(len(data)))
+				binary.BigEndian.PutUint16(data[cmapFormat2HeaderSize+2:cmapFormat2HeaderSize+4], 1)
+				binary.BigEndian.PutUint16(data[cmapFormat2HeaderSize+6:cmapFormat2HeaderSize+8], 3)
+				return data
+			}(),
+		},
+		{
+			name: "format 2 glyph range exceeds length",
+			data: func() []byte {
+				data := make([]byte, cmapFormat2MinSize+2)
+				binary.BigEndian.PutUint16(data[0:2], 2)
+				binary.BigEndian.PutUint16(data[2:4], uint16(len(data)))
+				binary.BigEndian.PutUint16(data[cmapFormat2HeaderSize+2:cmapFormat2HeaderSize+4], 2)
+				binary.BigEndian.PutUint16(data[cmapFormat2HeaderSize+6:cmapFormat2HeaderSize+8], 2)
 				return data
 			}(),
 		},
@@ -525,6 +636,36 @@ func makeCMapFormat4Range(start rune, end rune, delta int16) []byte {
 		binary.BigEndian.PutUint16(data[14:16], uint16(end))
 	}
 	return data
+}
+
+func makeCMapFormat2Mixed() []byte {
+	subHeaderCount := 3
+	glyphArrayOffset := cmapFormat2HeaderSize + subHeaderCount*8
+	singleByteGlyphsOffset := glyphArrayOffset
+	doubleByteGlyphsOffset := singleByteGlyphsOffset + 256*2
+	data := make([]byte, doubleByteGlyphsOffset+2*2)
+
+	binary.BigEndian.PutUint16(data[0:2], 2)
+	binary.BigEndian.PutUint16(data[2:4], uint16(len(data)))
+	binary.BigEndian.PutUint16(data[6+0x81*2:6+0x81*2+2], 8)
+	binary.BigEndian.PutUint16(data[6+0x82*2:6+0x82*2+2], 16)
+
+	putCMapFormat2SubHeader(data, 0, 0, 256, 0, singleByteGlyphsOffset)
+	putCMapFormat2SubHeader(data, 1, 0x40, 2, 2, doubleByteGlyphsOffset)
+	putCMapFormat2SubHeader(data, 2, 0x40, 2, 5, doubleByteGlyphsOffset)
+
+	binary.BigEndian.PutUint16(data[singleByteGlyphsOffset+0x41*2:singleByteGlyphsOffset+0x41*2+2], 7)
+	binary.BigEndian.PutUint16(data[doubleByteGlyphsOffset:doubleByteGlyphsOffset+2], 20)
+	return data
+}
+
+func putCMapFormat2SubHeader(data []byte, index int, firstCode uint16, entryCount uint16, idDelta int16, glyphStartOffset int) {
+	subHeaderOffset := cmapFormat2HeaderSize + index*8
+	idRangeOffsetWordOffset := subHeaderOffset + 6
+	binary.BigEndian.PutUint16(data[subHeaderOffset:subHeaderOffset+2], firstCode)
+	binary.BigEndian.PutUint16(data[subHeaderOffset+2:subHeaderOffset+4], entryCount)
+	binary.BigEndian.PutUint16(data[subHeaderOffset+4:subHeaderOffset+6], uint16(idDelta))
+	binary.BigEndian.PutUint16(data[subHeaderOffset+6:subHeaderOffset+8], uint16(glyphStartOffset-idRangeOffsetWordOffset))
 }
 
 func putCMapUint24(dst []byte, v uint32) {

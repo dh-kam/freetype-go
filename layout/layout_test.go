@@ -125,6 +125,23 @@ func TestValueRecordSizeAndNilParse(t *testing.T) {
 	}
 }
 
+func TestParseLookupTableWithMarkFilteringSet(t *testing.T) {
+	data := make([]byte, 10)
+	binary.BigEndian.PutUint16(data[0:2], 4)
+	binary.BigEndian.PutUint16(data[2:4], lookupFlagUseMarkFilteringSet)
+	binary.BigEndian.PutUint16(data[4:6], 1)
+	binary.BigEndian.PutUint16(data[6:8], 10)
+	binary.BigEndian.PutUint16(data[8:10], 3)
+
+	lookup, err := ParseLookupTable(data, 0)
+	if err != nil {
+		t.Fatalf("ParseLookupTable failed: %v", err)
+	}
+	if lookup.MarkFilteringSet != 3 {
+		t.Fatalf("expected mark filtering set 3, got %d", lookup.MarkFilteringSet)
+	}
+}
+
 func TestLayoutParsersRejectTruncatedCountRecords(t *testing.T) {
 	tests := map[string]func() error{
 		"script list": func() error {

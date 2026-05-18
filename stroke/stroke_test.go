@@ -44,6 +44,90 @@ func TestStrokeLine(t *testing.T) {
 	}
 }
 
+func TestStrokeUsesConfiguredRadiusWhenArgumentIsZero(t *testing.T) {
+	s := NewStroker()
+	s.SetRadius(5 << 6)
+
+	result, err := s.Stroke(horizontalLine(), 0)
+	if err != nil {
+		t.Fatalf("Stroke failed: %v", err)
+	}
+
+	_, _, minY, maxY := bounds(result.Points)
+	if minY != -(5<<6) || maxY != 5<<6 {
+		t.Fatalf("stroke y bounds = %d..%d, want %d..%d", minY, maxY, -(5 << 6), 5<<6)
+	}
+}
+
+func TestStrokeSquareCapExtendsLineEnds(t *testing.T) {
+	s := NewStroker()
+	s.SetCaps(LineCapSquare)
+
+	result, err := s.Stroke(horizontalLine(), 10<<6)
+	if err != nil {
+		t.Fatalf("Stroke failed: %v", err)
+	}
+
+	minX, maxX, _, _ := bounds(result.Points)
+	if minX != -(10<<6) || maxX != 110<<6 {
+		t.Fatalf("stroke x bounds = %d..%d, want %d..%d", minX, maxX, -(10 << 6), 110<<6)
+	}
+}
+
+func TestStrokeRoundCapAddsArcPoints(t *testing.T) {
+	s := NewStroker()
+	s.SetCaps(LineCapRound)
+
+	result, err := s.Stroke(horizontalLine(), 10<<6)
+	if err != nil {
+		t.Fatalf("Stroke failed: %v", err)
+	}
+
+	if len(result.Points) <= 4 {
+		t.Fatalf("round-capped line has %d points, want more than butt cap", len(result.Points))
+	}
+}
+
+func TestStrokeJoinStyles(t *testing.T) {
+	outline := &Outline{
+		Points: []api.Vector{
+			{X: 0, Y: 0},
+			{X: 100 << 6, Y: 0},
+			{X: 100 << 6, Y: 100 << 6},
+		},
+		Tags:     []byte{1, 1, 1},
+		Contours: []int{2},
+	}
+
+	bevel := NewStroker()
+	bevel.SetJoins(LineJoinBevel)
+	bevelResult, err := bevel.Stroke(outline, 10<<6)
+	if err != nil {
+		t.Fatalf("bevel stroke failed: %v", err)
+	}
+
+	round := NewStroker()
+	round.SetJoins(LineJoinRound)
+	roundResult, err := round.Stroke(outline, 10<<6)
+	if err != nil {
+		t.Fatalf("round stroke failed: %v", err)
+	}
+
+	miter := NewStroker()
+	miter.SetJoins(LineJoinMiter)
+	miterResult, err := miter.Stroke(outline, 10<<6)
+	if err != nil {
+		t.Fatalf("miter stroke failed: %v", err)
+	}
+
+	if len(roundResult.Points) <= len(bevelResult.Points) {
+		t.Fatalf("round join points = %d, want more than bevel %d", len(roundResult.Points), len(bevelResult.Points))
+	}
+	if len(miterResult.Points) <= len(bevelResult.Points) {
+		t.Fatalf("miter join points = %d, want more than bevel %d", len(miterResult.Points), len(bevelResult.Points))
+	}
+}
+
 func TestOutlineTransforms(t *testing.T) {
 	outline := &Outline{
 		Points: []api.Vector{
@@ -79,6 +163,40 @@ func TestOutlineTransforms(t *testing.T) {
 			t.Fatalf("nil transform point %d: got %+v, want %+v", i, got, want)
 		}
 	}
+}
+
+func horizontalLine() *Outline {
+	return &Outline{
+		Points: []api.Vector{
+			{X: 0, Y: 0},
+			{X: 100 << 6, Y: 0},
+		},
+		Tags:     []byte{1, 1},
+		Contours: []int{1},
+	}
+}
+
+func bounds(points []api.Vector) (minX, maxX, minY, maxY int32) {
+	if len(points) == 0 {
+		return 0, 0, 0, 0
+	}
+	minX, maxX = points[0].X, points[0].X
+	minY, maxY = points[0].Y, points[0].Y
+	for _, p := range points[1:] {
+		if p.X < minX {
+			minX = p.X
+		}
+		if p.X > maxX {
+			maxX = p.X
+		}
+		if p.Y < minY {
+			minY = p.Y
+		}
+		if p.Y > maxY {
+			maxY = p.Y
+		}
+	}
+	return minX, maxX, minY, maxY
 }
 
 func TestStrokeSharpV(t *testing.T) {

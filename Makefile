@@ -23,6 +23,10 @@ CONFORMANCE_REQUESTS ?= $(CONFORMANCE_REQUEST)
 CONFORMANCE_OUT ?= conformance-go.json
 CONFORMANCE_REF_OUT ?= conformance-freetype.json
 CONFORMANCE_OUT_DIR ?= conformance-out
+CONFORMANCE_SMOKE_OUT_DIR ?= conformance-smoke
+CONFORMANCE_SMOKE_LIMIT ?= 4
+CONFORMANCE_SMOKE_FLAGS ?=
+CONFORMANCE_SMOKE_STRICT ?= 0
 CONFORMANCE_REF_DIR ?= $(CONFORMANCE_OUT_DIR)
 CONFORMANCE_CANDIDATE_DIR ?= $(CONFORMANCE_OUT_DIR)
 CONFORMANCE_REF_SUFFIX ?= .freetype.json
@@ -40,6 +44,7 @@ CONFORMANCE_METRIC_TOLERANCE ?= 0
 CONFORMANCE_POINT_TOLERANCE ?= 0
 CONFORMANCE_ALLOW_MISSING_BITMAP ?= 0
 CONFORMANCE_ALLOW_MISSING_SLOT_METRICS ?= 0
+CONFORMANCE_ACCEPT_EXPECTED_GAPS ?= 0
 
 # collect all go files recursively for dependency tracking
 rwildcard = $(wildcard $(1)/$(2)) $(foreach d,$(wildcard $(1)/*),$(call rwildcard,$d,$(2)))
@@ -90,7 +95,7 @@ define all_for_arch_variant
 $(foreach os,$(OS_LIST),$(call artifact,$(os),$(1),$(2)))
 endef
 
-.PHONY: all clean help fmt vet bench benchmem test test-race fuzz-smoke coverage test-harness conformance-help conformance-dump conformance-ftdump conformance-corpus conformance-batch conformance-ftbatch conformance-compare conformance-batch-compare run $(OS_LIST) $(ARCH_LIST) $(BUILD_VARIANTS) $(OS_ARCH_PAIRS) $(OS_VARIANT_PAIRS) $(ARCH_VARIANT_PAIRS) $(FULL_SELECTORS)
+.PHONY: all clean help fmt vet bench benchmem test test-race fuzz-smoke coverage test-harness conformance-help conformance-dump conformance-ftdump conformance-corpus conformance-smoke conformance-batch conformance-ftbatch conformance-compare conformance-batch-compare run $(OS_LIST) $(ARCH_LIST) $(BUILD_VARIANTS) $(OS_ARCH_PAIRS) $(OS_VARIANT_PAIRS) $(ARCH_VARIANT_PAIRS) $(FULL_SELECTORS)
 
 all: $(FULL_TARGETS)
 
@@ -177,6 +182,15 @@ conformance-corpus:
 			$(if $(CONFORMANCE_REQUEST),,-render-mode "$(CONFORMANCE_RENDER_MODE)"); \
 	done
 
+conformance-smoke:
+	$(GO) run $(CONFORMANCE_TOOL) smoke \
+		-out-dir "$(CONFORMANCE_SMOKE_OUT_DIR)" \
+		-limit "$(CONFORMANCE_SMOKE_LIMIT)" \
+		$(if $(CONFORMANCE_REQUEST),-request "$(CONFORMANCE_REQUEST)",) \
+		$(if $(CONFORMANCE_FONTDIR),-font-dir "$(CONFORMANCE_FONTDIR)",) \
+		$(if $(filter 1 true yes,$(CONFORMANCE_SMOKE_STRICT)),-strict,) \
+		$(CONFORMANCE_SMOKE_FLAGS)
+
 conformance-batch:
 	@test -n "$(CONFORMANCE_REQUESTS)" || { echo "CONFORMANCE_REQUESTS is required"; exit 2; }
 	$(GO) run $(CONFORMANCE_TOOL) batch \
@@ -204,7 +218,8 @@ conformance-compare:
 		-metric-tolerance "$(CONFORMANCE_METRIC_TOLERANCE)" \
 		-point-tolerance "$(CONFORMANCE_POINT_TOLERANCE)" \
 		$(if $(filter 1 true yes,$(CONFORMANCE_ALLOW_MISSING_BITMAP)),-allow-missing-bitmap,) \
-		$(if $(filter 1 true yes,$(CONFORMANCE_ALLOW_MISSING_SLOT_METRICS)),-allow-missing-slot-metrics,)
+		$(if $(filter 1 true yes,$(CONFORMANCE_ALLOW_MISSING_SLOT_METRICS)),-allow-missing-slot-metrics,) \
+		$(if $(filter 1 true yes,$(CONFORMANCE_ACCEPT_EXPECTED_GAPS)),-accept-expected-gaps,)
 
 conformance-batch-compare:
 	@test -n "$(CONFORMANCE_REQUESTS)" || { echo "CONFORMANCE_REQUESTS is required"; exit 2; }
@@ -218,6 +233,7 @@ conformance-batch-compare:
 		-point-tolerance "$(CONFORMANCE_POINT_TOLERANCE)" \
 		$(if $(filter 1 true yes,$(CONFORMANCE_ALLOW_MISSING_BITMAP)),-allow-missing-bitmap,) \
 		$(if $(filter 1 true yes,$(CONFORMANCE_ALLOW_MISSING_SLOT_METRICS)),-allow-missing-slot-metrics,) \
+		$(if $(filter 1 true yes,$(CONFORMANCE_ACCEPT_EXPECTED_GAPS)),-accept-expected-gaps,) \
 		$(CONFORMANCE_COMPARE_FLAGS)
 
 run:
@@ -262,6 +278,7 @@ help:
 	@echo "make conformance-dump CONFORMANCE_FONT=font.ttf: write Go JSON dump to $(CONFORMANCE_OUT)"
 	@echo "make conformance-ftdump CONFORMANCE_FONT=font.ttf: write FreeType JSON dump to $(CONFORMANCE_REF_OUT)"
 	@echo "make conformance-corpus CONFORMANCE_FONTDIR=fonts/: dump every TTF/OTF/TTC/OTC in a directory"
+	@echo "make conformance-smoke: best-effort Go dumps for auto-discovered local system fonts"
 	@echo "make conformance-batch CONFORMANCE_REQUESTS='testdata/conformance/*.json' CONFORMANCE_FONT=font.ttf: dump request corpus with Go"
 	@echo "make conformance-ftbatch CONFORMANCE_REQUESTS='testdata/conformance/*.json' CONFORMANCE_FONT=font.ttf: dump request corpus with FreeType"
 	@echo "make conformance-compare CONFORMANCE_REF=ref.json CONFORMANCE_CANDIDATE=go.json: compare dumps"

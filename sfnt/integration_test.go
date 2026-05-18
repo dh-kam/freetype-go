@@ -104,7 +104,7 @@ func TestHintingIntegration(t *testing.T) {
 	}
 	f := loadHintingFixture(t, instr)
 
-	slot, err := f.LoadGlyph(1, 0)
+	slot, err := f.LoadGlyph(1, api.LoadTargetMono)
 	if err != nil {
 		t.Fatalf("LoadGlyph failed: %v", err)
 	}

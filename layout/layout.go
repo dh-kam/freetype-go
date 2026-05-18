@@ -178,12 +178,13 @@ type LookupList struct {
 }
 
 type LookupTable struct {
-	Type            uint16
-	Flag            uint16
-	SubtableOffsets []uint16 // Absolute offsets from table start
+	Type             uint16
+	Flag             uint16
+	SubtableOffsets  []uint16 // Absolute offsets from table start
+	MarkFilteringSet uint16
 }
 
-func parseExtensionLookup(data []byte, offset uint16, parentFlag uint16, disallowedType uint16) (*LookupTable, bool) {
+func parseExtensionLookup(data []byte, offset uint16, parentFlag uint16, parentMarkFilteringSet uint16, disallowedType uint16) (*LookupTable, bool) {
 	if !hasTableBytes(data, offset, 8) {
 		return nil, false
 	}
@@ -205,9 +206,10 @@ func parseExtensionLookup(data []byte, offset uint16, parentFlag uint16, disallo
 	}
 
 	return &LookupTable{
-		Type:            lookupType,
-		Flag:            parentFlag,
-		SubtableOffsets: []uint16{uint16(subtableOffset)},
+		Type:             lookupType,
+		Flag:             parentFlag,
+		SubtableOffsets:  []uint16{uint16(subtableOffset)},
+		MarkFilteringSet: parentMarkFilteringSet,
 	}, true
 }
 
@@ -400,21 +402,32 @@ func ParseLookupTable(data []byte, offset uint16) (*LookupTable, error) {
 		}
 		lt.SubtableOffsets[i] = uint16(resolvedOffset)
 	}
+	if lt.Flag&lookupFlagUseMarkFilteringSet != 0 {
+		markFilteringSetOffset := 6 + int(count)*2
+		if !hasTableBytes(data, offset, markFilteringSetOffset+2) {
+			return nil, fmt.Errorf("lookup table too short for mark filtering set")
+		}
+		lt.MarkFilteringSet = binary.BigEndian.Uint16(d[markFilteringSetOffset : markFilteringSetOffset+2])
+	}
 	return lt, nil
 }
 
 func ParseCoverage(data []byte, offset uint16) (CoverageTable, error) {
-	if !hasTableBytes(data, offset, 2) {
+	return parseCoverage(data, int(offset))
+}
+
+func parseCoverage(data []byte, offset int) (CoverageTable, error) {
+	if !hasBytesAt(data, offset, 2) {
 		return nil, fmt.Errorf("coverage table too short")
 	}
 	d := data[offset:]
 	format := binary.BigEndian.Uint16(d[0:2])
 	if format == 1 {
-		if !hasTableBytes(data, offset, 4) {
+		if !hasBytesAt(data, offset, 4) {
 			return nil, fmt.Errorf("coverage table too short")
 		}
 		count := binary.BigEndian.Uint16(d[2:4])
-		if !hasTableBytes(data, offset, 4+int(count)*2) {
+		if !hasBytesAt(data, offset, 4+int(count)*2) {
 			return nil, fmt.Errorf("coverage format 1 too short")
 		}
 		glyphs := make([]uint16, int(count))
@@ -423,11 +436,11 @@ func ParseCoverage(data []byte, offset uint16) (CoverageTable, error) {
 		}
 		return &CoverageFormat1{Glyphs: glyphs}, nil
 	} else if format == 2 {
-		if !hasTableBytes(data, offset, 4) {
+		if !hasBytesAt(data, offset, 4) {
 			return nil, fmt.Errorf("coverage table too short")
 		}
 		count := binary.BigEndian.Uint16(d[2:4])
-		if !hasTableBytes(data, offset, 4+int(count)*6) {
+		if !hasBytesAt(data, offset, 4+int(count)*6) {
 			return nil, fmt.Errorf("coverage format 2 too short")
 		}
 		ranges := make([]RangeRecord, int(count))

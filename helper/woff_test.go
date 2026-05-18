@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/zlib"
 	"encoding/binary"
+	"errors"
 	"strings"
 	"testing"
 
@@ -289,6 +290,31 @@ func TestWOFF2RejectsOversizeCompressedData(t *testing.T) {
 	}
 }
 
+func TestWOFF2LimitsBrotliDecodeToExpectedTransformSize(t *testing.T) {
+	var directory bytes.Buffer
+	directory.WriteByte(byte(5)) // name, transform version 0
+	directory.Write(testBase128(1))
+	woff2Data := testWOFF2WithDirectoryAndPayload(t, 1, directory.Bytes(), []byte{1, 2})
+
+	_, err := DecodeWOFF2(core.NewMemoryStream(woff2Data))
+	if !errors.Is(err, errDecompressedDataTooLarge) {
+		t.Fatalf("error = %v, want decompressed data size limit", err)
+	}
+}
+
+func TestWOFF2RejectsCompressedDataPastFile(t *testing.T) {
+	woff2Data := testWOFF2NoTablesWithMetadataAndPrivate(t, nil, nil)
+	binary.BigEndian.PutUint32(woff2Data[20:24], uint32(len(woff2Data)))
+
+	_, err := DecodeWOFF2(core.NewMemoryStream(woff2Data))
+	if err == nil {
+		t.Fatal("expected compressed data bounds error")
+	}
+	if !strings.Contains(err.Error(), "invalid WOFF2 compressed size") {
+		t.Fatalf("error = %q, want invalid compressed size", err)
+	}
+}
+
 func TestWOFF2RejectsNonZeroReservedField(t *testing.T) {
 	headerData := make([]byte, 48)
 	binary.BigEndian.PutUint32(headerData[0:4], 0x774F4632) // wOF2
@@ -385,6 +411,24 @@ func TestWOFF2RejectsMalformedMetadataAndPrivateBlocks(t *testing.T) {
 	}
 }
 
+func TestWOFF2RejectsNonZeroMetadataPadding(t *testing.T) {
+	woff2Data := testWOFF2NoTablesWithMetadataAndPrivate(t, []byte(`<metadata version="1.0"></metadata>`), nil)
+	totalCompressedSize := binary.BigEndian.Uint32(woff2Data[20:24])
+	metaOffset := binary.BigEndian.Uint32(woff2Data[28:32])
+	if metaOffset <= 48+totalCompressedSize {
+		t.Fatalf("metadata fixture has no pre-metadata padding: compressed=%d metaOffset=%d", totalCompressedSize, metaOffset)
+	}
+	woff2Data[metaOffset-1] = 0xff
+
+	_, err := DecodeWOFF2(core.NewMemoryStream(woff2Data))
+	if err == nil {
+		t.Fatal("expected non-zero metadata padding to fail")
+	}
+	if !strings.Contains(err.Error(), "invalid WOFF block padding") {
+		t.Fatalf("error = %q, want padding error", err)
+	}
+}
+
 func TestWOFF2ReconstructsTransformedGlyfLoca(t *testing.T) {
 	transformedGlyf := testWOFF2TransformedSimpleGlyf()
 	woff2Data := testWOFF2WithTransformedGlyfLoca(t, transformedGlyf)
@@ -423,6 +467,27 @@ func TestWOFF2AllowsSingleFontTransformedGlyfLocaSeparated(t *testing.T) {
 	loca := sfntTable(t, outData, tagLoca)
 	if binary.BigEndian.Uint16(loca[0:2]) != 0 || binary.BigEndian.Uint16(loca[2:4]) != 10 {
 		t.Fatalf("unexpected short loca offsets: % x", loca)
+	}
+}
+
+func TestWOFF2RejectsTransformedLocaBeforeGlyf(t *testing.T) {
+	transformedGlyf := testWOFF2TransformedSimpleGlyf()
+
+	var directory bytes.Buffer
+	directory.WriteByte(byte(11)) // loca, transform version 0
+	directory.Write(testBase128(4))
+	directory.Write(testBase128(0))
+	directory.WriteByte(byte(10)) // glyf, transform version 0
+	directory.Write(testBase128(20))
+	directory.Write(testBase128(uint32(len(transformedGlyf))))
+
+	woff2Data := testWOFF2WithDirectoryAndPayload(t, 2, directory.Bytes(), transformedGlyf)
+	_, err := DecodeWOFF2(core.NewMemoryStream(woff2Data))
+	if err == nil {
+		t.Fatal("expected transformed loca before glyf to fail")
+	}
+	if !strings.Contains(err.Error(), "WOFF2 transformed glyf table requires transformed loca table") {
+		t.Fatalf("error = %q, want transformed loca ordering error", err)
 	}
 }
 
@@ -578,10 +643,293 @@ func TestWOFF2RejectsCollectionMismatchedTransformedGlyfLoca(t *testing.T) {
 	}
 }
 
+func TestWOFF2RejectsCollectionTableIndexOutOfRange(t *testing.T) {
+	head := testHeadTable(0)
+
+	var directory bytes.Buffer
+	directory.WriteByte(byte(1)) // head
+	directory.Write(testBase128(uint32(len(head))))
+	appendUint32(&directory, 0x00010000)
+	directory.Write(testUInt255(1)) // numFonts
+	directory.Write(testUInt255(1)) // numTables
+	appendUint32(&directory, 0x00010000)
+	directory.Write(testUInt255(1)) // only table index 0 exists
+
+	woff2Data := testWOFF2CollectionWithDirectoryAndPayload(t, 1, directory.Bytes(), head)
+	_, err := DecodeWOFF2(core.NewMemoryStream(woff2Data))
+	if err == nil {
+		t.Fatal("expected collection table index bounds error")
+	}
+	if !strings.Contains(err.Error(), "WOFF2 collection table index out of range") {
+		t.Fatalf("error = %q, want collection table index out of range", err)
+	}
+}
+
+func TestWOFF2RejectsCollectionGlyfLocaMetadataMismatch(t *testing.T) {
+	head := testHeadTable(1)
+	maxp := testMaxpTable(1)
+	transformedGlyf := testWOFF2TransformedSimpleGlyf()
+
+	var directory bytes.Buffer
+	directory.WriteByte(byte(1)) // head
+	directory.Write(testBase128(uint32(len(head))))
+	directory.WriteByte(byte(4)) // maxp
+	directory.Write(testBase128(uint32(len(maxp))))
+	directory.WriteByte(byte(10)) // transformed glyf
+	directory.Write(testBase128(20))
+	directory.Write(testBase128(uint32(len(transformedGlyf))))
+	directory.WriteByte(byte(11)) // transformed loca
+	directory.Write(testBase128(4))
+	directory.Write(testBase128(0))
+
+	appendUint32(&directory, 0x00010000)
+	directory.Write(testUInt255(1)) // numFonts
+	directory.Write(testUInt255(4)) // numTables
+	appendUint32(&directory, 0x00010000)
+	for i := 0; i < 4; i++ {
+		directory.Write(testUInt255(uint16(i)))
+	}
+
+	var payload bytes.Buffer
+	payload.Write(head)
+	payload.Write(maxp)
+	payload.Write(transformedGlyf)
+	compressed := testBrotliData(t, payload.Bytes())
+
+	header := make([]byte, 48)
+	binary.BigEndian.PutUint32(header[0:4], 0x774F4632) // wOF2
+	binary.BigEndian.PutUint32(header[4:8], tagTTCF)
+	binary.BigEndian.PutUint32(header[8:12], uint32(48+directory.Len()+len(compressed)))
+	binary.BigEndian.PutUint16(header[12:14], 4)
+	binary.BigEndian.PutUint32(header[16:20], 216)
+	binary.BigEndian.PutUint32(header[20:24], uint32(len(compressed)))
+
+	woff2Data := append(header, directory.Bytes()...)
+	woff2Data = append(woff2Data, compressed...)
+	_, err := DecodeWOFF2(core.NewMemoryStream(woff2Data))
+	if err == nil {
+		t.Fatal("expected collection glyf/loca metadata mismatch to fail")
+	}
+	if !strings.Contains(err.Error(), "WOFF2 glyf/loca metadata mismatch") {
+		t.Fatalf("error = %q, want glyf/loca metadata mismatch", err)
+	}
+}
+
+func TestWOFF2RejectsCollectionRawLocaBeyondGlyf(t *testing.T) {
+	head := testHeadTable(1)
+	maxp := testMaxpTable(1)
+	glyf := make([]byte, 10)
+	loca := make([]byte, 8)
+	binary.BigEndian.PutUint32(loca[4:8], uint32(len(glyf)+2))
+
+	var directory bytes.Buffer
+	directory.WriteByte(byte(1)) // head
+	directory.Write(testBase128(uint32(len(head))))
+	directory.WriteByte(byte(4)) // maxp
+	directory.Write(testBase128(uint32(len(maxp))))
+	directory.WriteByte(byte(0xc0 | 10)) // raw glyf
+	directory.Write(testBase128(uint32(len(glyf))))
+	directory.WriteByte(byte(0xc0 | 11)) // raw loca
+	directory.Write(testBase128(uint32(len(loca))))
+
+	appendUint32(&directory, 0x00010000)
+	directory.Write(testUInt255(1)) // numFonts
+	directory.Write(testUInt255(4)) // numTables
+	appendUint32(&directory, 0x00010000)
+	for i := 0; i < 4; i++ {
+		directory.Write(testUInt255(uint16(i)))
+	}
+
+	var payload bytes.Buffer
+	payload.Write(head)
+	payload.Write(maxp)
+	payload.Write(glyf)
+	payload.Write(loca)
+	woff2Data := testWOFF2CollectionWithDirectoryAndPayload(t, 4, directory.Bytes(), payload.Bytes())
+
+	_, err := DecodeWOFF2(core.NewMemoryStream(woff2Data))
+	if err == nil {
+		t.Fatal("expected collection loca/glyf bounds error")
+	}
+	if !strings.Contains(err.Error(), "invalid WOFF2 glyf bounds") {
+		t.Fatalf("error = %q, want glyf bounds", err)
+	}
+}
+
 func TestWOFF2RejectsInvalidTransformedLocaLength(t *testing.T) {
 	_, _, err := reconstructWOFF2GlyfLoca(testWOFF2TransformedSimpleGlyf(), 6)
 	if err == nil {
 		t.Fatal("expected invalid transformed loca length error")
+	}
+}
+
+func TestWOFF2RejectsGlyfLocaMetadataMismatch(t *testing.T) {
+	head := testHeadTable(0)
+	maxp := testMaxpTable(1)
+	transformed := append([]byte(nil), testWOFF2TransformedSimpleGlyf()...)
+	binary.BigEndian.PutUint16(transformed[6:8], 1)
+
+	var directory bytes.Buffer
+	directory.WriteByte(byte(1)) // head
+	directory.Write(testBase128(uint32(len(head))))
+	directory.WriteByte(byte(4)) // maxp
+	directory.Write(testBase128(uint32(len(maxp))))
+	directory.WriteByte(byte(10)) // glyf, transform version 0
+	directory.Write(testBase128(20))
+	directory.Write(testBase128(uint32(len(transformed))))
+	directory.WriteByte(byte(11)) // loca, transform version 0
+	directory.Write(testBase128(8))
+	directory.Write(testBase128(0))
+
+	var payload bytes.Buffer
+	payload.Write(head)
+	payload.Write(maxp)
+	payload.Write(transformed)
+	woff2Data := testWOFF2WithDirectoryAndPayload(t, 4, directory.Bytes(), payload.Bytes())
+
+	_, err := DecodeWOFF2(core.NewMemoryStream(woff2Data))
+	if err == nil {
+		t.Fatal("expected glyf/loca metadata mismatch to fail")
+	}
+	if !strings.Contains(err.Error(), "WOFF2 glyf/loca metadata mismatch") {
+		t.Fatalf("error = %q, want glyf/loca metadata mismatch", err)
+	}
+}
+
+func TestWOFF2RejectsRawCompositeGlyphIndexOutOfRange(t *testing.T) {
+	head := testHeadTable(0)
+	maxp := testMaxpTable(1)
+
+	var glyf bytes.Buffer
+	appendUint16(&glyf, 0xffff) // numberOfContours = composite
+	appendUint16(&glyf, 0)      // xMin
+	appendUint16(&glyf, 0)      // yMin
+	appendUint16(&glyf, 0)      // xMax
+	appendUint16(&glyf, 0)      // yMax
+	appendUint16(&glyf, 0x0002) // args are x/y byte offsets
+	appendUint16(&glyf, 1)      // component glyph index, out of range for numGlyphs=1
+	glyf.Write([]byte{0, 0})
+	glyfData := glyf.Bytes()
+
+	loca := make([]byte, 4)
+	binary.BigEndian.PutUint16(loca[2:4], uint16(len(glyfData)/2))
+
+	var directory bytes.Buffer
+	directory.WriteByte(byte(1)) // head
+	directory.Write(testBase128(uint32(len(head))))
+	directory.WriteByte(byte(4)) // maxp
+	directory.Write(testBase128(uint32(len(maxp))))
+	directory.WriteByte(byte(0xc0 | 10)) // raw glyf
+	directory.Write(testBase128(uint32(len(glyfData))))
+	directory.WriteByte(byte(0xc0 | 11)) // raw loca
+	directory.Write(testBase128(uint32(len(loca))))
+
+	var payload bytes.Buffer
+	payload.Write(head)
+	payload.Write(maxp)
+	payload.Write(glyfData)
+	payload.Write(loca)
+	woff2Data := testWOFF2WithDirectoryAndPayload(t, 4, directory.Bytes(), payload.Bytes())
+
+	_, err := DecodeWOFF2(core.NewMemoryStream(woff2Data))
+	if err == nil {
+		t.Fatal("expected raw composite glyph index bounds error")
+	}
+	if !strings.Contains(err.Error(), "invalid WOFF2 composite glyph index") {
+		t.Fatalf("error = %q, want composite glyph index error", err)
+	}
+}
+
+func TestWOFF2RejectsTransformedCompositeGlyphIndexOutOfRange(t *testing.T) {
+	var compositeStream bytes.Buffer
+	appendUint16(&compositeStream, 0x0002) // args are x/y byte offsets
+	appendUint16(&compositeStream, 1)      // component glyph index, out of range for numGlyphs=1
+	compositeStream.Write([]byte{0, 0})
+
+	transformed := testWOFF2TransformedCompositeGlyf(
+		compositeStream.Bytes(),
+		nil,
+		[]byte{
+			0x80, 0, 0, 0, // bbox bitmap: glyph 0 has explicit bbox
+			0, 0, 0, 0, 0, 0, 0, 0,
+		},
+		nil,
+	)
+
+	_, _, err := reconstructWOFF2GlyfLoca(transformed, 4)
+	if err == nil {
+		t.Fatal("expected transformed composite glyph index bounds error")
+	}
+	if !strings.Contains(err.Error(), "invalid WOFF2 composite glyph index") {
+		t.Fatalf("error = %q, want composite glyph index error", err)
+	}
+}
+
+func TestWOFF2RejectsLocaFinalOffsetBeforeGlyfEnd(t *testing.T) {
+	head := testHeadTable(0)
+	maxp := testMaxpTable(1)
+	glyf := make([]byte, 12)
+	loca := make([]byte, 4)
+	binary.BigEndian.PutUint16(loca[2:4], 5) // final offset is 10, leaving unreferenced glyf bytes
+
+	woff2Data := testWOFF2WithRawOutlineTables(t, head, maxp, glyf, loca)
+	_, err := DecodeWOFF2(core.NewMemoryStream(woff2Data))
+	if err == nil {
+		t.Fatal("expected final loca/glyf length mismatch")
+	}
+	if !strings.Contains(err.Error(), "WOFF2 loca/glyf length mismatch") {
+		t.Fatalf("error = %q, want loca/glyf length mismatch", err)
+	}
+}
+
+func TestWOFF2RejectsSimpleGlyphNonMonotonicEndpoints(t *testing.T) {
+	head := testHeadTable(0)
+	maxp := testMaxpTable(1)
+	glyf := []byte{
+		0, 2, // numberOfContours
+		0, 0, 0, 0, 0, 10, 0, 0, // bbox
+		0, 1, 0, 1, // endPtsOfContours must be strictly increasing
+		0, 0, // instructionLength
+		0x31, 0x33, 10, 0, // point data plus padding
+	}
+	loca := []byte{0, 0, 0, 10}
+
+	woff2Data := testWOFF2WithRawOutlineTables(t, head, maxp, glyf, loca)
+	_, err := DecodeWOFF2(core.NewMemoryStream(woff2Data))
+	if err == nil {
+		t.Fatal("expected non-monotonic simple glyph endpoints to fail")
+	}
+	if !strings.Contains(err.Error(), "invalid WOFF2 simple glyph contour endpoints") {
+		t.Fatalf("error = %q, want simple glyph endpoint error", err)
+	}
+}
+
+func TestWOFF2RejectsRawCompositeNonZeroPadding(t *testing.T) {
+	head := testHeadTable(1)
+	maxp := testMaxpTable(2)
+
+	var glyf bytes.Buffer
+	appendUint16(&glyf, 0xffff) // numberOfContours = composite
+	appendUint16(&glyf, 0)      // xMin
+	appendUint16(&glyf, 0)      // yMin
+	appendUint16(&glyf, 0)      // xMax
+	appendUint16(&glyf, 0)      // yMax
+	appendUint16(&glyf, 0x0002) // args are x/y byte offsets
+	appendUint16(&glyf, 1)      // component glyph index
+	glyf.Write([]byte{0, 0, 0xff})
+	glyfData := glyf.Bytes()
+
+	loca := make([]byte, 12)
+	binary.BigEndian.PutUint32(loca[4:8], uint32(len(glyfData)))
+	binary.BigEndian.PutUint32(loca[8:12], uint32(len(glyfData)))
+
+	woff2Data := testWOFF2WithRawOutlineTables(t, head, maxp, glyfData, loca)
+	_, err := DecodeWOFF2(core.NewMemoryStream(woff2Data))
+	if err == nil {
+		t.Fatal("expected non-zero composite glyph padding to fail")
+	}
+	if !strings.Contains(err.Error(), "invalid WOFF2 glyf padding") {
+		t.Fatalf("error = %q, want glyf padding error", err)
 	}
 }
 
@@ -593,17 +941,27 @@ func TestWOFF2RejectsInvalidTransformedHmtxFlags(t *testing.T) {
 	}
 }
 
+func TestWOFF2HmtxRejectsTransformLengthMismatch(t *testing.T) {
+	tables, reconstructed := testWOFF2HmtxDependencies()
+
+	_, err := reconstructWOFF2Hmtx([]byte{1, 0x01, 0xf4, 0}, 4, tables, reconstructed)
+	if err == nil {
+		t.Fatal("expected hmtx transform length mismatch")
+	}
+	if !strings.Contains(err.Error(), "WOFF2 hmtx transform length mismatch") {
+		t.Fatalf("error = %q, want hmtx transform length mismatch", err)
+	}
+}
+
 func TestWOFF2HmtxReconstructsMonospaceBearings(t *testing.T) {
 	glyf0, _, err := reconstructWOFF2GlyfLoca(testWOFF2TransformedSimpleGlyf(), 4)
 	if err != nil {
 		t.Fatalf("reconstructWOFF2GlyfLoca failed: %v", err)
 	}
-	glyph1 := make([]byte, 12)
-	binary.BigEndian.PutUint16(glyph1[0:2], 1)
-	binary.BigEndian.PutUint16(glyph1[2:4], 10) // xMin
+	glyph1 := testWOFF2OnePointGlyphAtX10()
 
 	glyf := append(append([]byte(nil), glyf0...), glyph1...)
-	loca := []byte{0, 0, 0, 10, 0, 16}
+	loca := []byte{0, 0, 0, 10, 0, 18}
 	tables := []woff2TableEntry{
 		{tag: tagHead},
 		{tag: tagHhea},
@@ -653,6 +1011,19 @@ func TestWOFF2HmtxRejectsInvalidLocaBounds(t *testing.T) {
 	}
 }
 
+func TestWOFF2HmtxRejectsInvalidLocaBoundsWithExplicitBearings(t *testing.T) {
+	tables, reconstructed := testWOFF2HmtxDependencies()
+	reconstructed[4] = []byte{0, 0, 0, 100}
+
+	_, err := reconstructWOFF2Hmtx([]byte{2, 0x01, 0xf4, 0, 0}, 4, tables, reconstructed)
+	if err == nil {
+		t.Fatal("expected invalid loca bounds to fail")
+	}
+	if !strings.Contains(err.Error(), "invalid WOFF2 glyf bounds") {
+		t.Fatalf("error = %q, want invalid WOFF2 glyf bounds", err)
+	}
+}
+
 func TestWOFF2ReconstructsLongLocaTransformedGlyf(t *testing.T) {
 	transformed := append([]byte(nil), testWOFF2TransformedSimpleGlyf()...)
 	binary.BigEndian.PutUint16(transformed[6:8], 1)
@@ -666,6 +1037,82 @@ func TestWOFF2ReconstructsLongLocaTransformedGlyf(t *testing.T) {
 	}
 	if binary.BigEndian.Uint32(loca[0:4]) != 0 || binary.BigEndian.Uint32(loca[4:8]) != 20 {
 		t.Fatalf("unexpected long loca offsets: % x", loca)
+	}
+}
+
+func TestWOFF2ReconstructsEmptyGlyphAndInstructionStream(t *testing.T) {
+	transformed := testWOFF2TransformedGlyfFromStreams(
+		3,
+		[]byte{0, 1, 0, 0, 0, 1},
+		[]byte{3, 3},
+		[]byte{0, 11, 1, 0, 11, 1},
+		[]byte{0, 10, 20, 0, 0, 10, 20, 2},
+		nil,
+		[]byte{0, 0, 0, 0},
+		[]byte{0xde, 0xad},
+	)
+
+	glyf, loca, err := reconstructWOFF2GlyfLoca(transformed, 8)
+	if err != nil {
+		t.Fatalf("reconstructWOFF2GlyfLoca failed: %v", err)
+	}
+	if len(glyf) != 44 {
+		t.Fatalf("glyf length = %d, want 44", len(glyf))
+	}
+	wantLoca := []uint16{0, 10, 10, 22}
+	for i, want := range wantLoca {
+		if got := binary.BigEndian.Uint16(loca[i*2 : i*2+2]); got != want {
+			t.Fatalf("loca[%d] = %d, want %d", i, got, want)
+		}
+	}
+	secondGlyph := 20
+	if got := binary.BigEndian.Uint16(glyf[secondGlyph+12 : secondGlyph+14]); got != 2 {
+		t.Fatalf("instructionLength = %d, want 2", got)
+	}
+	if got := glyf[secondGlyph+14 : secondGlyph+16]; !bytes.Equal(got, []byte{0xde, 0xad}) {
+		t.Fatalf("instructions = % x, want de ad", got)
+	}
+}
+
+func TestWOFF2RejectsTransformedSimpleInstructionStreamBounds(t *testing.T) {
+	transformed := testWOFF2TransformedGlyfFromStreams(
+		1,
+		[]byte{0, 1},
+		[]byte{1},
+		[]byte{0},
+		[]byte{0, 2},
+		nil,
+		[]byte{0, 0, 0, 0},
+		[]byte{0xde},
+	)
+
+	_, _, err := reconstructWOFF2GlyfLoca(transformed, 4)
+	if err == nil {
+		t.Fatal("expected simple glyph instruction stream bounds error")
+	}
+	if !strings.Contains(err.Error(), "invalid WOFF2 simple glyph instructions") {
+		t.Fatalf("error = %q, want simple glyph instruction error", err)
+	}
+}
+
+func TestWOFF2RejectsInvalidNegativeContourCount(t *testing.T) {
+	transformed := testWOFF2TransformedGlyfFromStreams(
+		1,
+		[]byte{0x80, 0},
+		nil,
+		nil,
+		nil,
+		nil,
+		[]byte{0, 0, 0, 0},
+		nil,
+	)
+
+	_, _, err := reconstructWOFF2GlyfLoca(transformed, 4)
+	if err == nil {
+		t.Fatal("expected invalid contour count to fail")
+	}
+	if !strings.Contains(err.Error(), "invalid WOFF2 glyph contour count") {
+		t.Fatalf("error = %q, want invalid contour count", err)
 	}
 }
 
@@ -708,6 +1155,26 @@ func TestWOFF2SimpleGlyphExplicitBBoxOverridesComputed(t *testing.T) {
 	}
 }
 
+func TestWOFF2RejectsInvalidExplicitBBox(t *testing.T) {
+	transformed := append([]byte(nil), testWOFF2TransformedSimpleGlyf()...)
+	binary.BigEndian.PutUint32(transformed[28:32], 12)
+	transformed[46] = 0x80
+	transformed = append(transformed,
+		0, 20, // xMin
+		0, 0, // yMin
+		0, 10, // xMax
+		0, 20, // yMax
+	)
+
+	_, _, err := reconstructWOFF2GlyfLoca(transformed, 4)
+	if err == nil {
+		t.Fatal("expected invalid explicit bbox to fail")
+	}
+	if !strings.Contains(err.Error(), "invalid WOFF2 glyph bbox") {
+		t.Fatalf("error = %q, want invalid glyph bbox", err)
+	}
+}
+
 func TestWOFF2RejectsExplicitBBoxOnEmptyGlyph(t *testing.T) {
 	data := make([]byte, 36)
 	binary.BigEndian.PutUint16(data[4:6], 1) // numGlyphs
@@ -725,12 +1192,12 @@ func TestWOFF2RejectsExplicitBBoxOnEmptyGlyph(t *testing.T) {
 func TestWOFF2ReconstructsCompositeGlyph(t *testing.T) {
 	var compositeStream bytes.Buffer
 	appendUint16(&compositeStream, 0x0e2b) // words, xy, scale, more, metrics, overlap, scaled offset
-	appendUint16(&compositeStream, 3)      // glyphIndex
+	appendUint16(&compositeStream, 0)      // glyphIndex
 	appendUint16(&compositeStream, 0xfff6) // arg1 = -10
 	appendUint16(&compositeStream, 20)     // arg2 = 20
 	appendUint16(&compositeStream, 0x4000) // scale = 1.0
 	appendUint16(&compositeStream, 0x1142) // byte args, xy scale, instructions, unscaled offset
-	appendUint16(&compositeStream, 4)      // glyphIndex
+	appendUint16(&compositeStream, 0)      // glyphIndex
 	compositeStream.Write([]byte{5, 0xfb}) // arg1 = 5, arg2 = -5
 	appendUint16(&compositeStream, 0x4000) // xscale = 1.0
 	appendUint16(&compositeStream, 0x2000) // yscale = 0.5
@@ -762,8 +1229,8 @@ func TestWOFF2ReconstructsCompositeGlyph(t *testing.T) {
 	want := []byte{
 		0xff, 0xff, // numberOfContours = -1
 		0xff, 0xf6, 0xff, 0xfb, 0, 0x78, 0, 0x8c, // bbox
-		0x0e, 0x2b, 0, 3, 0xff, 0xf6, 0, 20, 0x40, 0,
-		0x11, 0x42, 0, 4, 5, 0xfb, 0x40, 0, 0x20, 0,
+		0x0e, 0x2b, 0, 0, 0xff, 0xf6, 0, 20, 0x40, 0,
+		0x11, 0x42, 0, 0, 5, 0xfb, 0x40, 0, 0x20, 0,
 		0, 3, 0xb0, 0x01, 0x2b,
 	}
 	if !bytes.Equal(glyf[:len(want)], want) {
@@ -828,6 +1295,7 @@ func TestWOFF2RejectsMalformedCompositeTransformFlags(t *testing.T) {
 				newWOFF2ByteReader(compositeStream.Bytes()),
 				newWOFF2ByteReader(nil),
 				newWOFF2ByteReader(nil),
+				1,
 			)
 			if err == nil {
 				t.Fatal("expected malformed composite flags to fail")
@@ -853,12 +1321,72 @@ func TestWOFF2RejectsMalformedCompositeTransformBounds(t *testing.T) {
 		newWOFF2ByteReader(compositeStream.Bytes()),
 		newWOFF2ByteReader(nil),
 		newWOFF2ByteReader(nil),
+		2,
 	)
 	if err == nil {
 		t.Fatal("expected truncated two-by-two transform to fail")
 	}
 	if !strings.Contains(err.Error(), "unexpected EOF") {
 		t.Fatalf("error = %q, want unexpected EOF", err)
+	}
+}
+
+func TestWOFF2TripletDecodeCoversFlagClasses(t *testing.T) {
+	flags := []byte{0x80 | 9, 19, 83, 119, 123, 127}
+	glyphStream := []byte{
+		1,
+		2,
+		0,
+		1, 2,
+		1, 0x23, 4,
+		0, 5, 0, 6,
+	}
+	points, err := decodeWOFF2Triplets(flags, newWOFF2ByteReader(glyphStream))
+	if err != nil {
+		t.Fatalf("decodeWOFF2Triplets failed: %v", err)
+	}
+
+	want := []woff2Point{
+		{x: 0, y: 1025, onCurve: false},
+		{x: 1026, y: 1025, onCurve: true},
+		{x: 1075, y: 1074, onCurve: true},
+		{x: 1589, y: 1589, onCurve: true},
+		{x: 1607, y: 2361, onCurve: true},
+		{x: 1612, y: 2367, onCurve: true},
+	}
+	if len(points) != len(want) {
+		t.Fatalf("decoded %d points, want %d", len(points), len(want))
+	}
+	for i := range points {
+		if points[i] != want[i] {
+			t.Fatalf("point[%d] = %+v, want %+v", i, points[i], want[i])
+		}
+	}
+}
+
+func TestWOFF2RejectsUnencodableTrueTypePointDelta(t *testing.T) {
+	var buf bytes.Buffer
+	err := appendTrueTypePointData(&buf, []woff2Point{
+		{x: 32767, y: 0, onCurve: true},
+		{x: -32768, y: 0, onCurve: true},
+	}, false)
+	if err == nil {
+		t.Fatal("expected unencodable x delta to fail")
+	}
+	if !strings.Contains(err.Error(), "WOFF2 glyph coordinate delta out of range") {
+		t.Fatalf("error = %q, want coordinate delta out of range", err)
+	}
+
+	buf.Reset()
+	err = appendTrueTypePointData(&buf, []woff2Point{
+		{x: 0, y: -32768, onCurve: true},
+		{x: 0, y: 32767, onCurve: true},
+	}, false)
+	if err == nil {
+		t.Fatal("expected unencodable y delta to fail")
+	}
+	if !strings.Contains(err.Error(), "WOFF2 glyph coordinate delta out of range") {
+		t.Fatalf("error = %q, want coordinate delta out of range", err)
 	}
 }
 
@@ -906,6 +1434,37 @@ func testWOFF2TransformedSimpleGlyf() []byte {
 	}
 	data := make([]byte, 36)
 	binary.BigEndian.PutUint16(data[4:6], 1) // numGlyphs
+	for i, stream := range streams {
+		binary.BigEndian.PutUint32(data[8+i*4:12+i*4], uint32(len(stream)))
+	}
+	for _, stream := range streams {
+		data = append(data, stream...)
+	}
+	return data
+}
+
+func testWOFF2OnePointGlyphAtX10() []byte {
+	return []byte{
+		0, 1, // numberOfContours
+		0, 10, 0, 0, 0, 10, 0, 0, // bbox
+		0, 0, // endPtsOfContours[0]
+		0, 0, // instructionLength
+		0x33, 10, // one on-curve point at x=10, y=0
+	}
+}
+
+func testWOFF2TransformedGlyfFromStreams(numGlyphs uint16, nContourStream, nPointsStream, flagStream, glyphStream, compositeStream, bboxStream, instructionStream []byte) []byte {
+	streams := [][]byte{
+		nContourStream,
+		nPointsStream,
+		flagStream,
+		glyphStream,
+		compositeStream,
+		bboxStream,
+		instructionStream,
+	}
+	data := make([]byte, 36)
+	binary.BigEndian.PutUint16(data[4:6], numGlyphs)
 	for i, stream := range streams {
 		binary.BigEndian.PutUint32(data[8+i*4:12+i*4], uint32(len(stream)))
 	}
@@ -1114,6 +1673,23 @@ func testWOFF2WithDirectoryAndPayload(t *testing.T, numTables uint16, directory,
 	return out
 }
 
+func testWOFF2CollectionWithDirectoryAndPayload(t *testing.T, numTables uint16, directory, payload []byte) []byte {
+	t.Helper()
+
+	compressed := testBrotliData(t, payload)
+	header := make([]byte, 48)
+	binary.BigEndian.PutUint32(header[0:4], 0x774F4632) // wOF2
+	binary.BigEndian.PutUint32(header[4:8], tagTTCF)
+	binary.BigEndian.PutUint32(header[8:12], uint32(48+len(directory)+len(compressed)))
+	binary.BigEndian.PutUint16(header[12:14], numTables)
+	binary.BigEndian.PutUint32(header[16:20], 12+uint32(numTables)*16+align4(uint32(len(payload))))
+	binary.BigEndian.PutUint32(header[20:24], uint32(len(compressed)))
+
+	out := append(header, directory...)
+	out = append(out, compressed...)
+	return out
+}
+
 func testWOFF2WithRawGlyfLoca(t *testing.T, glyf, loca []byte) []byte {
 	t.Helper()
 
@@ -1127,6 +1703,27 @@ func testWOFF2WithRawGlyfLoca(t *testing.T, glyf, loca []byte) []byte {
 	payload.Write(glyf)
 	payload.Write(loca)
 	return testWOFF2WithDirectoryAndPayload(t, 2, directory.Bytes(), payload.Bytes())
+}
+
+func testWOFF2WithRawOutlineTables(t *testing.T, head, maxp, glyf, loca []byte) []byte {
+	t.Helper()
+
+	var directory bytes.Buffer
+	directory.WriteByte(byte(1)) // head
+	directory.Write(testBase128(uint32(len(head))))
+	directory.WriteByte(byte(4)) // maxp
+	directory.Write(testBase128(uint32(len(maxp))))
+	directory.WriteByte(byte(0xc0 | 10)) // glyf, transform version 3 (null)
+	directory.Write(testBase128(uint32(len(glyf))))
+	directory.WriteByte(byte(0xc0 | 11)) // loca, transform version 3 (null)
+	directory.Write(testBase128(uint32(len(loca))))
+
+	var payload bytes.Buffer
+	payload.Write(head)
+	payload.Write(maxp)
+	payload.Write(glyf)
+	payload.Write(loca)
+	return testWOFF2WithDirectoryAndPayload(t, 4, directory.Bytes(), payload.Bytes())
 }
 
 func testBrotliData(t testing.TB, data []byte) []byte {
@@ -1326,9 +1923,7 @@ func testWOFF2TwoGlyphHmtxDependencies(t *testing.T) ([]woff2TableEntry, [][]byt
 	if err != nil {
 		t.Fatalf("reconstructWOFF2GlyfLoca failed: %v", err)
 	}
-	glyph1 := make([]byte, 12)
-	binary.BigEndian.PutUint16(glyph1[0:2], 1)
-	binary.BigEndian.PutUint16(glyph1[2:4], 10) // xMin
+	glyph1 := testWOFF2OnePointGlyphAtX10()
 
 	tables := []woff2TableEntry{
 		{tag: tagHead},
@@ -1342,7 +1937,7 @@ func testWOFF2TwoGlyphHmtxDependencies(t *testing.T) ([]woff2TableEntry, [][]byt
 		testHheaTable(1),
 		testMaxpTable(2),
 		append(append([]byte(nil), glyf0...), glyph1...),
-		[]byte{0, 0, 0, 10, 0, 16},
+		[]byte{0, 0, 0, 10, 0, 18},
 	}
 	return tables, reconstructed
 }

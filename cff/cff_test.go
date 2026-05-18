@@ -2,9 +2,11 @@ package cff
 
 import (
 	"bytes"
+	"encoding/binary"
 	"math"
 	"testing"
 
+	"github.com/dh-kam/freetype-go/api"
 	"github.com/dh-kam/freetype-go/core"
 )
 
@@ -31,6 +33,251 @@ func testIndex(objects ...[]byte) *Index {
 		Offsets: offsets,
 		Data:    data,
 	}
+}
+
+func testIndex16Bytes(objects ...[]byte) []byte {
+	total := 0
+	for _, obj := range objects {
+		total += len(obj)
+	}
+	if total > 254 {
+		panic("test INDEX data too large for offSize 1")
+	}
+
+	data := make([]byte, 2, 2+1+len(objects)+1+total)
+	binary.BigEndian.PutUint16(data, uint16(len(objects)))
+	if len(objects) == 0 {
+		return data
+	}
+	data = append(data, 1)
+	next := 1
+	data = append(data, byte(next))
+	for _, obj := range objects {
+		next += len(obj)
+		data = append(data, byte(next))
+	}
+	for _, obj := range objects {
+		data = append(data, obj...)
+	}
+	return data
+}
+
+func testIndex32Bytes(objects ...[]byte) []byte {
+	total := 0
+	for _, obj := range objects {
+		total += len(obj)
+	}
+	if total > 254 {
+		panic("test INDEX data too large for offSize 1")
+	}
+
+	data := make([]byte, 4, 4+1+len(objects)+1+total)
+	binary.BigEndian.PutUint32(data, uint32(len(objects)))
+	if len(objects) == 0 {
+		return data
+	}
+	data = append(data, 1)
+	next := 1
+	data = append(data, byte(next))
+	for _, obj := range objects {
+		next += len(obj)
+		data = append(data, byte(next))
+	}
+	for _, obj := range objects {
+		data = append(data, obj...)
+	}
+	return data
+}
+
+func dictInt32(v int) []byte {
+	return []byte{
+		29,
+		byte(v >> 24),
+		byte(v >> 16),
+		byte(v >> 8),
+		byte(v),
+	}
+}
+
+func dictOperator(op int) []byte {
+	if op >= 12<<8 {
+		return []byte{12, byte(op - (12 << 8))}
+	}
+	return []byte{byte(op)}
+}
+
+func dictEntry(op int, values ...int) []byte {
+	data := make([]byte, 0, len(values)*5+2)
+	for _, v := range values {
+		data = append(data, dictInt32(v)...)
+	}
+	return append(data, dictOperator(op)...)
+}
+
+func appendUint16(data []byte, v uint16) []byte {
+	return append(data, byte(v>>8), byte(v))
+}
+
+func appendUint32(data []byte, v uint32) []byte {
+	return append(data, byte(v>>24), byte(v>>16), byte(v>>8), byte(v))
+}
+
+func appendInt16(data []byte, v int16) []byte {
+	return appendUint16(data, uint16(v))
+}
+
+func appendF2Dot14(data []byte, values ...float64) []byte {
+	for _, v := range values {
+		raw := int16(math.Round(v * 16384))
+		data = append(data, byte(raw>>8), byte(raw))
+	}
+	return data
+}
+
+func testVariationStoreBytes() []byte {
+	itemStore := make([]byte, 0, 50)
+	itemStore = append(itemStore, 0, 1)        // format
+	itemStore = append(itemStore, 0, 0, 0, 16) // variationRegionListOffset
+	itemStore = append(itemStore, 0, 2)        // itemVariationDataCount
+	itemStore = append(itemStore, 0, 0, 0, 32) // itemVariationData[0] offset
+	itemStore = append(itemStore, 0, 0, 0, 40) // itemVariationData[1] offset
+
+	itemStore = append(itemStore, 0, 1)             // axisCount
+	itemStore = append(itemStore, 0, 2)             // regionCount
+	itemStore = appendF2Dot14(itemStore, 0, 1, 1)   // region 0
+	itemStore = appendF2Dot14(itemStore, 0, 0.5, 1) // region 1
+
+	itemStore = append(itemStore, 0, 0) // itemCount
+	itemStore = append(itemStore, 0, 0) // wordDeltaCount
+	itemStore = append(itemStore, 0, 1) // regionIndexCount
+	itemStore = append(itemStore, 0, 0) // regionIndexes[0]
+
+	itemStore = append(itemStore, 0, 0) // itemCount
+	itemStore = append(itemStore, 0, 0) // wordDeltaCount
+	itemStore = append(itemStore, 0, 2) // regionIndexCount
+	itemStore = append(itemStore, 0, 0) // regionIndexes[0]
+	itemStore = append(itemStore, 0, 1) // regionIndexes[1]
+
+	data := make([]byte, 2, 2+len(itemStore))
+	binary.BigEndian.PutUint16(data, uint16(len(itemStore)))
+	return append(data, itemStore...)
+}
+
+type testCFF2Offsets struct {
+	charStrings int
+	fdSelect    int
+	fdArray     int
+	private1    int
+	vstore      int
+}
+
+func testCFF2Fixture() ([]byte, testCFF2Offsets) {
+	n := csNumber
+	globalSubrs := testIndex32Bytes()
+	charStrings := testIndex32Bytes(
+		[]byte{n(0), n(0), 21, 14},
+		[]byte{n(10), n(20), n(5), n(7), n(-3), n(11), n(2), 16, 21, 14},
+	)
+	fdSelect := []byte{0, 0, 1}
+	private1 := append(dictInt32(1), byte(opPrivateVSIndex))
+	vstore := testVariationStoreBytes()
+
+	const topDictSize = 26
+	charStringsOffset := 5 + topDictSize + len(globalSubrs)
+	fdSelectOffset := charStringsOffset + len(charStrings)
+	fdArrayOffset := fdSelectOffset + len(fdSelect)
+
+	fd0 := dictEntry(opPrivate, 0, 0)
+	fd1Placeholder := dictEntry(opPrivate, len(private1), 0)
+	fdArrayLen := len(testIndex32Bytes(fd0, fd1Placeholder))
+	private1Offset := fdArrayOffset + fdArrayLen
+	fd1 := dictEntry(opPrivate, len(private1), private1Offset)
+	fdArray := testIndex32Bytes(fd0, fd1)
+	if len(fdArray) != fdArrayLen {
+		panic("test FDArray length changed")
+	}
+	vstoreOffset := private1Offset + len(private1)
+
+	topDict := make([]byte, 0, topDictSize)
+	topDict = append(topDict, dictEntry(opCharStrings, charStringsOffset)...)
+	topDict = append(topDict, dictEntry(opVariationStore, vstoreOffset)...)
+	topDict = append(topDict, dictEntry(opFDArray, fdArrayOffset)...)
+	topDict = append(topDict, dictEntry(opFDSelect, fdSelectOffset)...)
+	if len(topDict) != topDictSize {
+		panic("test Top DICT size changed")
+	}
+
+	header := []byte{2, 0, 5, 0, topDictSize}
+	blob := append(header, topDict...)
+	blob = append(blob, globalSubrs...)
+	blob = append(blob, charStrings...)
+	blob = append(blob, fdSelect...)
+	blob = append(blob, fdArray...)
+	blob = append(blob, private1...)
+	blob = append(blob, vstore...)
+
+	return blob, testCFF2Offsets{
+		charStrings: charStringsOffset,
+		fdSelect:    fdSelectOffset,
+		fdArray:     fdArrayOffset,
+		private1:    private1Offset,
+		vstore:      vstoreOffset,
+	}
+}
+
+func testCFF1CIDFixture() []byte {
+	n := csNumber
+	header := []byte{1, 0, 4, 4}
+	nameIndex := testIndex16Bytes([]byte("CIDTest"))
+	stringIndex := testIndex16Bytes()
+	globalSubrs := testIndex16Bytes()
+	charStrings := testIndex16Bytes(
+		[]byte{n(0), n(0), 21, n(-107), 10, 14},
+		[]byte{n(0), n(0), 21, n(-107), 10, 14},
+	)
+	fdSelect := []byte{0, 0, 1}
+
+	private0Dict := dictEntry(opLocalSubrs, len(dictEntry(opLocalSubrs, 0)))
+	private1Dict := dictEntry(opLocalSubrs, len(dictEntry(opLocalSubrs, 0)))
+	local0 := testIndex16Bytes([]byte{n(10), n(0), 5, 11})
+	local1 := testIndex16Bytes([]byte{n(0), n(20), 5, 11})
+
+	const topDictSize = 20
+	topDictIndexLen := len(testIndex16Bytes(make([]byte, topDictSize)))
+	charStringsOffset := len(header) + len(nameIndex) + topDictIndexLen + len(stringIndex) + len(globalSubrs)
+	fdSelectOffset := charStringsOffset + len(charStrings)
+	fdArrayOffset := fdSelectOffset + len(fdSelect)
+
+	fd0Placeholder := dictEntry(opPrivate, len(private0Dict), 0)
+	fd1Placeholder := dictEntry(opPrivate, len(private1Dict), 0)
+	fdArrayLen := len(testIndex16Bytes(fd0Placeholder, fd1Placeholder))
+	private0Offset := fdArrayOffset + fdArrayLen
+	private1Offset := private0Offset + len(private0Dict) + len(local0)
+
+	fd0 := dictEntry(opPrivate, len(private0Dict), private0Offset)
+	fd1 := dictEntry(opPrivate, len(private1Dict), private1Offset)
+	fdArray := testIndex16Bytes(fd0, fd1)
+
+	topDict := make([]byte, 0, topDictSize)
+	topDict = append(topDict, dictEntry(opCharStrings, charStringsOffset)...)
+	topDict = append(topDict, dictEntry(opFDArray, fdArrayOffset)...)
+	topDict = append(topDict, dictEntry(opFDSelect, fdSelectOffset)...)
+	if len(topDict) != topDictSize {
+		panic("test CFF1 CID Top DICT size changed")
+	}
+
+	blob := append(header, nameIndex...)
+	blob = append(blob, testIndex16Bytes(topDict)...)
+	blob = append(blob, stringIndex...)
+	blob = append(blob, globalSubrs...)
+	blob = append(blob, charStrings...)
+	blob = append(blob, fdSelect...)
+	blob = append(blob, fdArray...)
+	blob = append(blob, private0Dict...)
+	blob = append(blob, local0...)
+	blob = append(blob, private1Dict...)
+	blob = append(blob, local1...)
+	return blob
 }
 
 func assertPoint(t *testing.T, outline *core.Outline, idx int, x, y int32) {
@@ -62,6 +309,33 @@ func assertStack(t *testing.T, got, want []float64) {
 			t.Fatalf("stack[%d]: got %v, want %v; full stack %v", i, got[i], want[i], got)
 		}
 	}
+}
+
+func assertVector(t *testing.T, got api.Vector, wantX, wantY int32) {
+	t.Helper()
+	if got.X != wantX*64 || got.Y != wantY*64 {
+		t.Fatalf("expected vector (%d, %d), got (%d, %d)", wantX*64, wantY*64, got.X, got.Y)
+	}
+}
+
+func assertLineSegment(t *testing.T, got charStringSegment, fromX, fromY, toX, toY int32) {
+	t.Helper()
+	if got.kind != charStringLineSegment {
+		t.Fatalf("segment kind = %d, want line", got.kind)
+	}
+	assertVector(t, got.from, fromX, fromY)
+	assertVector(t, got.to, toX, toY)
+}
+
+func assertCubicSegment(t *testing.T, got charStringSegment, fromX, fromY, ctrl1X, ctrl1Y, ctrl2X, ctrl2Y, toX, toY int32) {
+	t.Helper()
+	if got.kind != charStringCubicSegment {
+		t.Fatalf("segment kind = %d, want cubic", got.kind)
+	}
+	assertVector(t, got.from, fromX, fromY)
+	assertVector(t, got.ctrl1, ctrl1X, ctrl1Y)
+	assertVector(t, got.ctrl2, ctrl2X, ctrl2Y)
+	assertVector(t, got.to, toX, toY)
 }
 
 func TestParseIndex(t *testing.T) {
@@ -223,6 +497,329 @@ func TestParseCFF(t *testing.T) {
 	}
 }
 
+func TestParseCFFCIDFDArrayFDSelectLocalSubrs(t *testing.T) {
+	blob := testCFF1CIDFixture()
+	face, err := ParseCFF(core.NewMemoryStream(blob), 0)
+	if err != nil {
+		t.Fatalf("ParseCFF CID fixture failed: %v", err)
+	}
+
+	if face.FDArrayIndex.Count != 2 || len(face.FontDicts) != 2 {
+		t.Fatalf("FDArray count = %d, FontDicts = %d; want 2", face.FDArrayIndex.Count, len(face.FontDicts))
+	}
+	if face.FDSelect == nil || face.FDSelect.Format != 0 {
+		t.Fatalf("expected format 0 FDSelect, got %#v", face.FDSelect)
+	}
+	if got, err := face.FDSelect.FDIndex(1); err != nil || got != 1 {
+		t.Fatalf("FDSelect glyph 1 = %d, %v; want 1", got, err)
+	}
+
+	outline, err := face.LoadGlyphOutline(0)
+	if err != nil {
+		t.Fatalf("LoadGlyphOutline glyph 0 failed: %v", err)
+	}
+	assertPoint(t, outline, 1, 10, 0)
+
+	outline, err = face.LoadGlyphOutline(1)
+	if err != nil {
+		t.Fatalf("LoadGlyphOutline glyph 1 failed: %v", err)
+	}
+	assertPoint(t, outline, 1, 0, 20)
+}
+
+func TestParseCFF2FDArrayPrivateVariationStore(t *testing.T) {
+	blob, offsets := testCFF2Fixture()
+	stream := core.NewMemoryStream(blob)
+	face, err := ParseCFF(stream, 0)
+	if err != nil {
+		t.Fatalf("ParseCFF CFF2 failed: %v", err)
+	}
+
+	if face.Major != 2 || face.Minor != 0 {
+		t.Fatalf("wrong CFF2 version: %d.%d", face.Major, face.Minor)
+	}
+	if face.TopDictSize != 26 {
+		t.Fatalf("TopDictSize = %d, want 26", face.TopDictSize)
+	}
+	if got := int(face.TopDict[opCharStrings][0]); got != offsets.charStrings {
+		t.Fatalf("CharStrings offset = %d, want %d", got, offsets.charStrings)
+	}
+	if face.CharStringsIndex.Count != 2 {
+		t.Fatalf("CharStrings count = %d, want 2", face.CharStringsIndex.Count)
+	}
+	if face.FDArrayIndex.Count != 2 || len(face.FontDicts) != 2 {
+		t.Fatalf("FDArray count = %d, FontDicts = %d; want 2", face.FDArrayIndex.Count, len(face.FontDicts))
+	}
+	if face.FDSelect == nil || face.FDSelect.Format != 0 {
+		t.Fatalf("expected format 0 FDSelect, got %#v", face.FDSelect)
+	}
+	if got, err := face.FDSelect.FDIndex(1); err != nil || got != 1 {
+		t.Fatalf("FDSelect glyph 1 = %d, %v; want 1", got, err)
+	}
+	if face.FontDicts[1].PrivateDict.VSIndex != 1 {
+		t.Fatalf("Private DICT vsindex = %d, want 1", face.FontDicts[1].PrivateDict.VSIndex)
+	}
+	if face.VariationStore == nil {
+		t.Fatalf("expected VariationStore")
+	}
+	if face.VariationStore.Offset != int64(offsets.vstore) {
+		t.Fatalf("VariationStore offset = %d, want %d", face.VariationStore.Offset, offsets.vstore)
+	}
+	if face.VariationStore.AxisCount != 1 || face.VariationStore.RegionCount != 2 {
+		t.Fatalf("VariationStore axis/region counts = %d/%d, want 1/2", face.VariationStore.AxisCount, face.VariationStore.RegionCount)
+	}
+	if got, ok := face.VariationStore.ActiveRegionCount(1); !ok || got != 2 {
+		t.Fatalf("ActiveRegionCount(1) = %d, %v; want 2, true", got, ok)
+	}
+	if len(face.VariationStore.Regions) != 2 {
+		t.Fatalf("regions = %d, want 2", len(face.VariationStore.Regions))
+	}
+	if got := face.VariationStore.Regions[1].Axes[0].Peak; got != 0.5 {
+		t.Fatalf("region 1 peak = %v, want 0.5", got)
+	}
+	vector, ok := face.VariationStore.BlendVector(1, []float64{1})
+	if !ok {
+		t.Fatalf("BlendVector(1) failed")
+	}
+	assertStack(t, vector, []float64{1, 0})
+
+	outline, err := face.LoadGlyphOutline(1)
+	if err != nil {
+		t.Fatalf("LoadGlyphOutline CFF2 failed: %v", err)
+	}
+	if len(outline.Points) != 1 {
+		t.Fatalf("expected one point, got %d", len(outline.Points))
+	}
+	assertPoint(t, outline, 0, 10, 20)
+
+	outline, err = face.LoadGlyphOutlineAt(1, []float64{1})
+	if err != nil {
+		t.Fatalf("LoadGlyphOutlineAt CFF2 failed: %v", err)
+	}
+	assertPoint(t, outline, 0, 15, 17)
+
+	face.SetVariationCoordinates([]float64{1})
+	outline, err = face.LoadGlyphOutline(1)
+	if err != nil {
+		t.Fatalf("LoadGlyphOutline with stored CFF2 coordinates failed: %v", err)
+	}
+	assertPoint(t, outline, 0, 15, 17)
+}
+
+func TestParseCFF2RejectsMalformedBounds(t *testing.T) {
+	valid, offsets := testCFF2Fixture()
+
+	tests := []struct {
+		name string
+		data []byte
+	}{
+		{
+			name: "truncated top dict",
+			data: []byte{2, 0, 5, 0, 10, 139},
+		},
+		{
+			name: "truncated variation store",
+			data: valid[:len(valid)-1],
+		},
+		{
+			name: "FDSelect index out of range",
+			data: func() []byte {
+				data := append([]byte(nil), valid...)
+				data[offsets.fdSelect+2] = 2
+				return data
+			}(),
+		},
+		{
+			name: "FDSelect truncated",
+			data: valid[:offsets.fdSelect+2],
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := ParseCFF(core.NewMemoryStream(tt.data), 0); err == nil {
+				t.Fatalf("ParseCFF succeeded for malformed CFF2")
+			}
+		})
+	}
+}
+
+func TestParseFDSelectRangeFormats(t *testing.T) {
+	tests := []struct {
+		name string
+		data []byte
+		want []int
+	}{
+		{
+			name: "format 3",
+			data: []byte{
+				3,
+				0, 3,
+				0, 0, 0,
+				0, 2, 1,
+				0, 5, 2,
+				0, 6,
+			},
+			want: []int{0, 0, 1, 1, 1, 2},
+		},
+		{
+			name: "format 4",
+			data: func() []byte {
+				data := []byte{4}
+				data = appendUint32(data, 3)
+				data = appendUint32(data, 0)
+				data = appendUint16(data, 0)
+				data = appendUint32(data, 1)
+				data = appendUint16(data, 2)
+				data = appendUint32(data, 4)
+				data = appendUint16(data, 1)
+				data = appendUint32(data, 6)
+				return data
+			}(),
+			want: []int{0, 2, 2, 2, 1, 1},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fdSelect, err := parseFDSelect(core.NewMemoryStream(tt.data), 0, len(tt.want), 3)
+			if err != nil {
+				t.Fatalf("parseFDSelect failed: %v", err)
+			}
+			for glyphID, want := range tt.want {
+				got, err := fdSelect.FDIndex(glyphID)
+				if err != nil {
+					t.Fatalf("FDIndex(%d) failed: %v", glyphID, err)
+				}
+				if got != want {
+					t.Fatalf("FDIndex(%d) = %d, want %d", glyphID, got, want)
+				}
+			}
+			if _, err := fdSelect.FDIndex(len(tt.want)); err == nil {
+				t.Fatalf("FDIndex accepted out-of-range glyph")
+			}
+		})
+	}
+}
+
+func TestParseFDSelectRejectsMalformedRanges(t *testing.T) {
+	tests := []struct {
+		name string
+		data []byte
+	}{
+		{
+			name: "first range not zero",
+			data: []byte{3, 0, 1, 0, 1, 0, 0, 3},
+		},
+		{
+			name: "ranges not increasing",
+			data: []byte{3, 0, 2, 0, 0, 0, 0, 0, 1, 0, 3},
+		},
+		{
+			name: "sentinel mismatch",
+			data: []byte{3, 0, 1, 0, 0, 0, 0, 4},
+		},
+		{
+			name: "fd index out of range",
+			data: []byte{3, 0, 1, 0, 0, 3, 0, 3},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := parseFDSelect(core.NewMemoryStream(tt.data), 0, 3, 3); err == nil {
+				t.Fatalf("parseFDSelect succeeded for %s", tt.name)
+			}
+		})
+	}
+}
+
+func TestLoadGlyphOutlineUsesFDSelectLocalSubrs(t *testing.T) {
+	n := csNumber
+	face := &CFF{
+		Major: 2,
+		CharStringsIndex: *testIndex(
+			[]byte{n(0), n(0), 21, n(-107), 10, 14},
+			[]byte{n(0), n(0), 21, n(-107), 10, 14},
+		),
+		FDSelect: &FDSelect{Format: 3, GlyphFD: []uint16{0, 1}},
+		FontDicts: []FontDict{
+			{PrivateDict: PrivateDict{LocalSubrIndex: *testIndex([]byte{n(10), n(0), 5, 11})}},
+			{PrivateDict: PrivateDict{LocalSubrIndex: *testIndex([]byte{n(0), n(20), 5, 11})}},
+		},
+	}
+
+	outline, err := face.LoadGlyphOutline(0)
+	if err != nil {
+		t.Fatalf("LoadGlyphOutline glyph 0 failed: %v", err)
+	}
+	assertPoint(t, outline, 1, 10, 0)
+
+	outline, err = face.LoadGlyphOutline(1)
+	if err != nil {
+		t.Fatalf("LoadGlyphOutline glyph 1 failed: %v", err)
+	}
+	assertPoint(t, outline, 1, 0, 20)
+}
+
+func TestVariationStoreParsesRegionsItemDataAndScalars(t *testing.T) {
+	itemStore := make([]byte, 0, 44)
+	itemStore = appendUint16(itemStore, 1)  // format
+	itemStore = appendUint32(itemStore, 12) // variationRegionListOffset
+	itemStore = appendUint16(itemStore, 1)  // itemVariationDataCount
+	itemStore = appendUint32(itemStore, 28) // itemVariationData[0] offset
+
+	itemStore = appendUint16(itemStore, 1)        // axisCount
+	itemStore = appendUint16(itemStore, 2)        // regionCount
+	itemStore = appendF2Dot14(itemStore, 0, 1, 1) // region 0
+	itemStore = appendF2Dot14(itemStore, -1, -0.5, 0)
+
+	itemStore = appendUint16(itemStore, 2)    // itemCount
+	itemStore = appendUint16(itemStore, 1)    // wordDeltaCount
+	itemStore = appendUint16(itemStore, 2)    // regionIndexCount
+	itemStore = appendUint16(itemStore, 0)    // regionIndexes[0]
+	itemStore = appendUint16(itemStore, 1)    // regionIndexes[1]
+	itemStore = appendInt16(itemStore, 100)   // row 0, word delta
+	itemStore = append(itemStore, byte(0xfb)) // row 0, int8 delta -5
+	itemStore = appendInt16(itemStore, -200)  // row 1, word delta
+	itemStore = append(itemStore, byte(7))    // row 1, int8 delta
+
+	vs := &VariationStore{Data: itemStore}
+	if err := parseItemVariationStore(vs); err != nil {
+		t.Fatalf("parseItemVariationStore failed: %v", err)
+	}
+	if vs.AxisCount != 1 || vs.RegionCount != 2 {
+		t.Fatalf("axis/region counts = %d/%d, want 1/2", vs.AxisCount, vs.RegionCount)
+	}
+	if got, ok := vs.ActiveRegionCount(0); !ok || got != 2 {
+		t.Fatalf("ActiveRegionCount(0) = %d, %v; want 2, true", got, ok)
+	}
+	scalar, ok := vs.RegionScalar(0, []float64{0.5})
+	if !ok || math.Abs(scalar-0.5) > 1e-9 {
+		t.Fatalf("RegionScalar(0, 0.5) = %v, %v; want 0.5, true", scalar, ok)
+	}
+	scalar, ok = vs.RegionScalar(1, []float64{-0.25})
+	if !ok || math.Abs(scalar-0.5) > 1e-9 {
+		t.Fatalf("RegionScalar(1, -0.25) = %v, %v; want 0.5, true", scalar, ok)
+	}
+	vector, ok := vs.BlendVector(0, []float64{0.5})
+	if !ok {
+		t.Fatalf("BlendVector failed")
+	}
+	assertStack(t, vector, []float64{0.5, 0})
+
+	itemData := vs.ItemVariationData[0]
+	if itemData.ItemCount != 2 || itemData.WordDeltaCount != 1 || itemData.LongWords {
+		t.Fatalf("unexpected ItemVariationData header: %#v", itemData)
+	}
+	if len(itemData.DeltaSets) != 2 || itemData.DeltaSets[0][0] != 100 || itemData.DeltaSets[0][1] != -5 {
+		t.Fatalf("unexpected delta sets: %#v", itemData.DeltaSets)
+	}
+	if itemData.DeltaSets[1][0] != -200 || itemData.DeltaSets[1][1] != 7 {
+		t.Fatalf("unexpected second delta set: %#v", itemData.DeltaSets)
+	}
+}
+
 func TestParseDict(t *testing.T) {
 	data := []byte{
 		0x8b,       // 0
@@ -328,6 +925,128 @@ func TestDecodeCharStringLineAndCurveOperators(t *testing.T) {
 	assertPoint(t, outline, 35, 157, 155)
 }
 
+func TestDecodeCharStringPreservesNativeCubicSegments(t *testing.T) {
+	n := csNumber
+	data := []byte{
+		n(0), n(0), 21,
+		n(10), n(20), n(30), n(40), n(50), n(60), 8,
+		14,
+	}
+
+	result, err := decodeCharString(data, charStringDecodeOptions{})
+	if err != nil {
+		t.Fatalf("decodeCharString failed: %v", err)
+	}
+	if len(result.outline.Points) != 11 {
+		t.Fatalf("flattened outline points = %d, want 11", len(result.outline.Points))
+	}
+	if len(result.segments) != 2 {
+		t.Fatalf("segments = %d, want 2", len(result.segments))
+	}
+	if result.segments[0].kind != charStringMoveSegment {
+		t.Fatalf("segment 0 kind = %d, want move", result.segments[0].kind)
+	}
+	if result.segments[1].kind != charStringCubicSegment {
+		t.Fatalf("segment 1 kind = %d, want cubic", result.segments[1].kind)
+	}
+
+	cubic := result.segments[1]
+	assertVector(t, cubic.from, 0, 0)
+	assertVector(t, cubic.ctrl1, 10, 20)
+	assertVector(t, cubic.ctrl2, 40, 60)
+	assertVector(t, cubic.to, 90, 120)
+	assertPoint(t, result.outline, 10, 90, 120)
+}
+
+func TestDecodeCharStringCurveOperatorSegments(t *testing.T) {
+	n := csNumber
+
+	t.Run("rcurveline", func(t *testing.T) {
+		data := []byte{
+			n(0), n(0), 21,
+			n(10), n(0), n(0), n(10), n(20), n(0),
+			n(5), n(5), n(5), n(-5), n(10), n(0),
+			n(7), n(8), 24,
+			14,
+		}
+
+		result, err := decodeCharString(data, charStringDecodeOptions{})
+		if err != nil {
+			t.Fatalf("decodeCharString failed: %v", err)
+		}
+		if len(result.segments) != 4 {
+			t.Fatalf("segments = %d, want 4", len(result.segments))
+		}
+		assertCubicSegment(t, result.segments[1], 0, 0, 10, 0, 10, 10, 30, 10)
+		assertCubicSegment(t, result.segments[2], 30, 10, 35, 15, 40, 10, 50, 10)
+		assertLineSegment(t, result.segments[3], 50, 10, 57, 18)
+		assertPoint(t, result.outline, len(result.outline.Points)-1, 57, 18)
+	})
+
+	t.Run("rlinecurve", func(t *testing.T) {
+		data := []byte{
+			n(0), n(0), 21,
+			n(10), n(0), n(0), n(5),
+			n(5), n(0), n(0), n(5), n(10), n(0), 25,
+			14,
+		}
+
+		result, err := decodeCharString(data, charStringDecodeOptions{})
+		if err != nil {
+			t.Fatalf("decodeCharString failed: %v", err)
+		}
+		if len(result.segments) != 4 {
+			t.Fatalf("segments = %d, want 4", len(result.segments))
+		}
+		assertLineSegment(t, result.segments[1], 0, 0, 10, 0)
+		assertLineSegment(t, result.segments[2], 10, 0, 10, 5)
+		assertCubicSegment(t, result.segments[3], 10, 5, 15, 5, 15, 10, 25, 10)
+		assertPoint(t, result.outline, len(result.outline.Points)-1, 25, 10)
+	})
+
+	t.Run("vvcurveto optional dx1", func(t *testing.T) {
+		data := []byte{
+			n(0), n(0), 21,
+			n(3),
+			n(10), n(5), n(6), n(20),
+			n(7), n(8), n(9), n(10), 26,
+			14,
+		}
+
+		result, err := decodeCharString(data, charStringDecodeOptions{})
+		if err != nil {
+			t.Fatalf("decodeCharString failed: %v", err)
+		}
+		if len(result.segments) != 3 {
+			t.Fatalf("segments = %d, want 3", len(result.segments))
+		}
+		assertCubicSegment(t, result.segments[1], 0, 0, 3, 10, 8, 16, 8, 36)
+		assertCubicSegment(t, result.segments[2], 8, 36, 8, 43, 16, 52, 16, 62)
+		assertPoint(t, result.outline, len(result.outline.Points)-1, 16, 62)
+	})
+
+	t.Run("hhcurveto optional dy1", func(t *testing.T) {
+		data := []byte{
+			n(0), n(0), 21,
+			n(4),
+			n(10), n(5), n(6), n(20),
+			n(7), n(8), n(9), n(10), 27,
+			14,
+		}
+
+		result, err := decodeCharString(data, charStringDecodeOptions{})
+		if err != nil {
+			t.Fatalf("decodeCharString failed: %v", err)
+		}
+		if len(result.segments) != 3 {
+			t.Fatalf("segments = %d, want 3", len(result.segments))
+		}
+		assertCubicSegment(t, result.segments[1], 0, 0, 10, 4, 15, 10, 35, 10)
+		assertCubicSegment(t, result.segments[2], 35, 10, 42, 10, 50, 19, 60, 19)
+		assertPoint(t, result.outline, len(result.outline.Points)-1, 60, 19)
+	})
+}
+
 func TestDecodeCharStringFlexOperators(t *testing.T) {
 	n := csNumber
 	data := []byte{
@@ -346,6 +1065,51 @@ func TestDecodeCharStringFlexOperators(t *testing.T) {
 	}
 	assertPoint(t, outline, 20, 210, 0)
 	assertPoint(t, outline, 40, 367, 0)
+}
+
+func TestDecodeCharStringFlexOperatorSegments(t *testing.T) {
+	n := csNumber
+
+	t.Run("flex", func(t *testing.T) {
+		data := []byte{
+			n(0), n(0), 21,
+			n(1), n(2), n(3), n(4), n(5), n(6),
+			n(7), n(8), n(9), n(10), n(11), n(12),
+			n(99), 12, 35,
+			14,
+		}
+
+		result, err := decodeCharString(data, charStringDecodeOptions{})
+		if err != nil {
+			t.Fatalf("decodeCharString failed: %v", err)
+		}
+		if len(result.segments) != 3 {
+			t.Fatalf("segments = %d, want 3", len(result.segments))
+		}
+		assertCubicSegment(t, result.segments[1], 0, 0, 1, 2, 4, 6, 9, 12)
+		assertCubicSegment(t, result.segments[2], 9, 12, 16, 20, 25, 30, 36, 42)
+		assertPoint(t, result.outline, len(result.outline.Points)-1, 36, 42)
+	})
+
+	t.Run("hflex1", func(t *testing.T) {
+		data := []byte{
+			n(0), n(0), 21,
+			n(10), n(2), n(20), n(3), n(30),
+			n(40), n(50), n(4), n(60), 12, 36,
+			14,
+		}
+
+		result, err := decodeCharString(data, charStringDecodeOptions{})
+		if err != nil {
+			t.Fatalf("decodeCharString failed: %v", err)
+		}
+		if len(result.segments) != 3 {
+			t.Fatalf("segments = %d, want 3", len(result.segments))
+		}
+		assertCubicSegment(t, result.segments[1], 0, 0, 10, 2, 30, 5, 60, 5)
+		assertCubicSegment(t, result.segments[2], 60, 5, 100, 5, 150, 9, 210, 0)
+		assertPoint(t, result.outline, len(result.outline.Points)-1, 210, 0)
+	})
 }
 
 func TestDecodeCharStringSubrBias(t *testing.T) {
@@ -599,4 +1363,65 @@ func TestDecodeCharStringRejectsOperandUnderflow(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestDecodeCharStringRejectsMalformedBounds(t *testing.T) {
+	n := csNumber
+
+	t.Run("unsupported single-byte operator", func(t *testing.T) {
+		if _, err := DecodeCharString([]byte{0}, nil, nil, nil); err == nil {
+			t.Fatalf("DecodeCharString succeeded for unsupported operator")
+		}
+	})
+
+	t.Run("unsupported escaped operator", func(t *testing.T) {
+		if _, err := DecodeCharString([]byte{12, 0}, nil, nil, nil); err == nil {
+			t.Fatalf("DecodeCharString succeeded for unsupported escaped operator")
+		}
+	})
+
+	t.Run("local subr index out of range", func(t *testing.T) {
+		localSubrs := testIndex([]byte{11})
+		if _, err := DecodeCharString([]byte{n(-106), 10}, nil, localSubrs, nil); err == nil {
+			t.Fatalf("DecodeCharString succeeded for out-of-range local subr")
+		}
+	})
+
+	t.Run("global subr index out of range", func(t *testing.T) {
+		globalSubrs := testIndex([]byte{11})
+		if _, err := DecodeCharString([]byte{n(-106), 29}, globalSubrs, nil, nil); err == nil {
+			t.Fatalf("DecodeCharString succeeded for out-of-range global subr")
+		}
+	})
+
+	t.Run("recursive local subr nesting", func(t *testing.T) {
+		localSubrs := testIndex([]byte{n(-107), 10, 11})
+		if _, err := DecodeCharString([]byte{n(-107), 10}, nil, localSubrs, nil); err == nil {
+			t.Fatalf("DecodeCharString succeeded for recursive local subr")
+		}
+	})
+
+	t.Run("vsindex out of variation store range", func(t *testing.T) {
+		_, err := decodeCharString([]byte{n(2), 15}, charStringDecodeOptions{
+			variationStore: &VariationStore{ItemVariationRegionCounts: []uint16{1}},
+		})
+		if err == nil {
+			t.Fatalf("decodeCharString succeeded for out-of-range vsindex")
+		}
+	})
+
+	t.Run("blend uses variation store region count for bounds", func(t *testing.T) {
+		_, err := decodeCharString([]byte{n(10), n(1), 16}, charStringDecodeOptions{
+			variationStore: &VariationStore{ItemVariationRegionCounts: []uint16{2}},
+		})
+		if err == nil {
+			t.Fatalf("decodeCharString succeeded for undersized blend stack")
+		}
+	})
+
+	t.Run("transient array put index out of range", func(t *testing.T) {
+		if _, err := DecodeCharString([]byte{n(1), n(32), 12, 20}, nil, nil, nil); err == nil {
+			t.Fatalf("DecodeCharString succeeded for out-of-range put")
+		}
+	})
 }

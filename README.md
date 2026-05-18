@@ -11,6 +11,7 @@ A work-in-progress, pure Go port inspired by the **FreeType 2.13.2** font engine
 - **Experimental API**: Import the subpackages you need. The root package currently provides documentation only so `go list .` and pkg.go.dev can discover the module.
 - **Partial FreeType coverage**: The project includes implementations for SFNT/OpenType parsing, TrueType/CFF-related code, rasterization, selected bitmap/color/variation tables, and early layout support. It is not yet a drop-in replacement for FreeType.
 - **Conformance is evolving**: Tests exist for many packages, and `tools/conformance` can compare Go dumps against optional C FreeType dumps. The project does not currently claim bit-for-bit rendering parity or full specification coverage.
+- **Porting status is tracked by area**: See [Porting Status and Remaining Gaps](docs/porting-status.md) for current implemented areas, parity criteria, and expected gaps.
 - **FreeType-like API concepts**: `api` exposes load flag names, render modes, and optional glyph slot metrics plumbing. Drivers may implement only a subset while conformance tracks the remaining semantic gaps.
 
 ## Quick Start
@@ -58,6 +59,7 @@ func main() {
 
 ## Documentation
 - [Full Feature List](docs/features.md)
+- [Porting Status and Remaining Gaps](docs/porting-status.md)
 - [Architecture Guide](docs/architecture.md)
 - [Conformance Workflow](docs/conformance.md)
 - [CLI ASCII Renderer](cmd/ftgo)

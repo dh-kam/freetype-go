@@ -3,6 +3,7 @@ package api
 import (
 	"errors"
 	"io"
+	"os"
 )
 
 // FT_Err is the error code type matching FreeType's FT_Error.
@@ -50,10 +51,64 @@ const (
 	FT_Err_Missing_Property          FT_Err = 0x6B
 )
 
+// CodedError is implemented by errors that carry a FreeType-compatible
+// FT_Error code.
+type CodedError interface {
+	error
+	FTErrorCode() FT_Err
+}
+
+// Error wraps an underlying Go error with a FreeType-compatible FT_Error code.
+type Error struct {
+	Code FT_Err
+	Err  error
+}
+
+// NewError returns an error carrying a FreeType-compatible FT_Error code.
+func NewError(code FT_Err, err error) error {
+	if err == nil && code == FT_Err_Ok {
+		return nil
+	}
+	return &Error{Code: code, Err: err}
+}
+
+func (e *Error) Error() string {
+	if e == nil {
+		return "<nil>"
+	}
+	if e.Err != nil {
+		return e.Err.Error()
+	}
+	return "freetype error"
+}
+
+func (e *Error) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+func (e *Error) FTErrorCode() FT_Err {
+	if e == nil {
+		return FT_Err_Ok
+	}
+	return e.Code
+}
+
 // ErrorToCode maps a standard Go error to an FT_Err code.
 func ErrorToCode(err error) FT_Err {
 	if err == nil {
 		return FT_Err_Ok
+	}
+
+	var coded CodedError
+	if errors.As(err, &coded) {
+		return coded.FTErrorCode()
+	}
+
+	if errors.Is(err, os.ErrNotExist) || errors.Is(err, os.ErrPermission) {
+		return FT_Err_Cannot_Open_Resource
 	}
 
 	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {

@@ -264,6 +264,116 @@ func TestMSIRPMovesPointAndUpdatesReferencePoints(t *testing.T) {
 	}
 }
 
+func TestTwilightDirectInstructionsSetOriginalPoints(t *testing.T) {
+	sys := core.NewSystem()
+
+	t.Run("MIAP", func(t *testing.T) {
+		ctx := NewContext(sys)
+		ctx.CVT = []int32{100}
+		ctx.Zones[0].Points = []api.Vector{{}}
+		ctx.Zones[0].OriginalPoints = []api.Vector{{}}
+		ctx.Zones[0].TouchedX = make([]bool, 1)
+		ctx.Zones[0].TouchedY = make([]bool, 1)
+		ctx.ZP0 = 0
+
+		ctx.Code = []byte{
+			0x01,       // SVTCA[x]
+			0xB0, 0x00, // point 0
+			0xB0, 0x00, // CVT 0
+			0x3F, // MIAP[1]
+		}
+		if err := ctx.Run(); err != nil {
+			t.Fatalf("Run failed: %v", err)
+		}
+		if got := ctx.Zones[0].OriginalPoints[0].X; got != 100 {
+			t.Fatalf("MIAP twilight original X = %d, want 100", got)
+		}
+		if got := ctx.Zones[0].Points[0].X; got != 128 {
+			t.Fatalf("MIAP twilight current X = %d, want rounded 128", got)
+		}
+	})
+
+	t.Run("MIRP", func(t *testing.T) {
+		ctx := NewContext(sys)
+		ctx.CVT = []int32{100}
+		ctx.Zones[0].Points = []api.Vector{{X: 20}, {}}
+		ctx.Zones[0].OriginalPoints = []api.Vector{{X: 20}, {}}
+		ctx.Zones[0].TouchedX = make([]bool, 2)
+		ctx.Zones[0].TouchedY = make([]bool, 2)
+		ctx.ZP0 = 0
+		ctx.ZP1 = 0
+		ctx.RP0 = 0
+
+		ctx.Code = []byte{
+			0x01,       // SVTCA[x]
+			0xB0, 0x01, // point 1
+			0xB0, 0x00, // CVT 0
+			0xE0, // MIRP without round/min-distance
+		}
+		if err := ctx.Run(); err != nil {
+			t.Fatalf("Run failed: %v", err)
+		}
+		if got := ctx.Zones[0].OriginalPoints[1].X; got != 120 {
+			t.Fatalf("MIRP twilight original X = %d, want 120", got)
+		}
+		if got := ctx.Zones[0].Points[1].X; got != 120 {
+			t.Fatalf("MIRP twilight current X = %d, want 120", got)
+		}
+	})
+
+	t.Run("MSIRP", func(t *testing.T) {
+		ctx := NewContext(sys)
+		ctx.Zones[0].Points = []api.Vector{{X: 20}, {}}
+		ctx.Zones[0].OriginalPoints = []api.Vector{{X: 20}, {}}
+		ctx.Zones[0].TouchedX = make([]bool, 2)
+		ctx.Zones[0].TouchedY = make([]bool, 2)
+		ctx.ZP0 = 0
+		ctx.ZP1 = 0
+		ctx.RP0 = 0
+
+		ctx.Code = []byte{
+			0x01,       // SVTCA[x]
+			0xB0, 0x01, // point 1
+			0xB0, 0x50, // distance 80
+			0x3A, // MSIRP[0]
+		}
+		if err := ctx.Run(); err != nil {
+			t.Fatalf("Run failed: %v", err)
+		}
+		if got := ctx.Zones[0].OriginalPoints[1].X; got != 100 {
+			t.Fatalf("MSIRP twilight original X = %d, want 100", got)
+		}
+		if got := ctx.Zones[0].Points[1].X; got != 100 {
+			t.Fatalf("MSIRP twilight current X = %d, want 100", got)
+		}
+	})
+
+	t.Run("SCFS", func(t *testing.T) {
+		ctx := NewContext(sys)
+		ctx.Zones[0].Points = []api.Vector{{X: 40}}
+		ctx.Zones[0].OriginalPoints = []api.Vector{{}}
+		ctx.Zones[0].TouchedX = make([]bool, 1)
+		ctx.Zones[0].TouchedY = make([]bool, 1)
+		ctx.ZP2 = 0
+
+		ctx.Code = []byte{
+			0x01,       // SVTCA[x]
+			0xB0, 0x00, // point 0
+			0xB0, 0x78, // target x = 120
+			0x48, // SCFS
+		}
+		if err := ctx.Run(); err != nil {
+			t.Fatalf("Run failed: %v", err)
+		}
+		if got := ctx.Zones[0].OriginalPoints[0].X; got != 120 {
+			t.Fatalf("SCFS twilight original X = %d, want 120", got)
+		}
+		if got := ctx.Zones[0].Points[0].X; got != 120 {
+			t.Fatalf("SCFS twilight current X = %d, want 120", got)
+		}
+	})
+}
+
 func TestSHPShiftsByReferencePointDelta(t *testing.T) {
 	sys := core.NewSystem()
 	ctx := NewContext(sys)
@@ -293,6 +403,61 @@ func TestSHPShiftsByReferencePointDelta(t *testing.T) {
 	if ctx.GS.Loop != 1 {
 		t.Fatalf("SHP should reset loop to 1, got %d", ctx.GS.Loop)
 	}
+}
+
+func TestShiftInstructionsMeasureReferenceOriginalWithDualVector(t *testing.T) {
+	sys := core.NewSystem()
+
+	t.Run("SHP", func(t *testing.T) {
+		ctx := NewContext(sys)
+		ctx.GS.ProjVector = api.Vector{X: 0x4000, Y: 0}
+		ctx.GS.FreeVector = api.Vector{X: 0x4000, Y: 0}
+		ctx.GS.DualVector = api.Vector{X: 0, Y: 0x4000}
+		ctx.Zones[1].Points = []api.Vector{{X: 200, Y: 0}, {X: 10, Y: 0}}
+		ctx.Zones[1].OriginalPoints = []api.Vector{{X: 0, Y: 100}, {X: 0, Y: 0}}
+		ctx.Zones[1].TouchedX = make([]bool, 2)
+		ctx.Zones[1].TouchedY = make([]bool, 2)
+		ctx.ZP1 = 1
+		ctx.ZP2 = 1
+		ctx.RP2 = 0
+
+		ctx.Code = []byte{
+			0xB0, 0x01, // point 1
+			0x32, // SHP[0]
+		}
+		if err := ctx.Run(); err != nil {
+			t.Fatalf("Run failed: %v", err)
+		}
+		if got := ctx.Zones[1].Points[1].X; got != 110 {
+			t.Fatalf("SHP moved point 1 X to %d, want 110", got)
+		}
+	})
+
+	t.Run("SHC", func(t *testing.T) {
+		ctx := NewContext(sys)
+		ctx.GS.ProjVector = api.Vector{X: 0x4000, Y: 0}
+		ctx.GS.FreeVector = api.Vector{X: 0x4000, Y: 0}
+		ctx.GS.DualVector = api.Vector{X: 0, Y: 0x4000}
+		ctx.Zones[1].Points = []api.Vector{{X: 200, Y: 0}, {X: 10, Y: 0}}
+		ctx.Zones[1].OriginalPoints = []api.Vector{{X: 0, Y: 100}, {X: 0, Y: 0}}
+		ctx.Zones[1].TouchedX = make([]bool, 2)
+		ctx.Zones[1].TouchedY = make([]bool, 2)
+		ctx.Zones[1].Contours = []int{1}
+		ctx.ZP1 = 1
+		ctx.ZP2 = 1
+		ctx.RP2 = 0
+
+		ctx.Code = []byte{
+			0xB0, 0x00, // contour 0
+			0x34, // SHC[0]
+		}
+		if err := ctx.Run(); err != nil {
+			t.Fatalf("Run failed: %v", err)
+		}
+		if got := ctx.Zones[1].Points[1].X; got != 110 {
+			t.Fatalf("SHC moved point 1 X to %d, want 110", got)
+		}
+	})
 }
 
 func TestStackDepthDebugAndStateOpcodes(t *testing.T) {
@@ -601,6 +766,80 @@ func TestSuperRoundOpcodesAffectRoundInstruction(t *testing.T) {
 	}
 }
 
+func TestEngineCompensationAffectsRoundAndRelativeMoves(t *testing.T) {
+	sys := core.NewSystem()
+
+	t.Run("ROUND_and_NROUND", func(t *testing.T) {
+		ctx := NewContext(sys)
+		ctx.GS.Compensations[1] = 16
+		ctx.GS.Compensations[2] = -8
+		ctx.Code = []byte{
+			0xB0, 0x51, 0x69, // ROUND[black] 81 -> round(97) = 128
+			0xB0, 0x14, 0x6E, // NROUND[white] 20 -> 12
+			0xB8, 0xFF, 0xEC, 0x6D, // NROUND[black] -20 -> -36
+		}
+		if err := ctx.Run(); err != nil {
+			t.Fatalf("Run failed: %v", err)
+		}
+		want := []int32{128, 12, -36}
+		if ctx.StackTop != len(want) {
+			t.Fatalf("StackTop = %d, want %d", ctx.StackTop, len(want))
+		}
+		for i, v := range want {
+			if ctx.Stack[i] != v {
+				t.Fatalf("stack[%d] = %d, want %d; stack=%v", i, ctx.Stack[i], v, ctx.Stack[:ctx.StackTop])
+			}
+		}
+	})
+
+	t.Run("MDRP_without_round_still_compensates", func(t *testing.T) {
+		ctx := NewContext(sys)
+		ctx.GS.Compensations[1] = 16
+		ctx.Zones[1].Points = []api.Vector{{X: 0, Y: 0}, {X: 100, Y: 0}}
+		ctx.Zones[1].OriginalPoints = []api.Vector{{X: 0, Y: 0}, {X: 100, Y: 0}}
+		ctx.Zones[1].TouchedX = make([]bool, 2)
+		ctx.Zones[1].TouchedY = make([]bool, 2)
+		ctx.ZP0 = 1
+		ctx.ZP1 = 1
+		ctx.RP0 = 0
+		ctx.Code = []byte{
+			0x01,       // SVTCA[x]
+			0xB0, 0x01, // point 1
+			0xC1, // MDRP[black], no round/min distance
+		}
+		if err := ctx.Run(); err != nil {
+			t.Fatalf("Run failed: %v", err)
+		}
+		if got := ctx.Zones[1].Points[1].X; got != 116 {
+			t.Fatalf("MDRP compensated X = %d, want 116", got)
+		}
+	})
+
+	t.Run("MIRP_round_uses_distance_type", func(t *testing.T) {
+		ctx := NewContext(sys)
+		ctx.GS.Compensations[2] = -16
+		ctx.CVT = []int32{100}
+		ctx.Zones[1].Points = []api.Vector{{X: 0, Y: 0}, {X: 100, Y: 0}}
+		ctx.Zones[1].OriginalPoints = []api.Vector{{X: 0, Y: 0}, {X: 100, Y: 0}}
+		ctx.Zones[1].TouchedX = make([]bool, 2)
+		ctx.Zones[1].TouchedY = make([]bool, 2)
+		ctx.ZP0 = 1
+		ctx.ZP1 = 1
+		ctx.RP0 = 0
+		ctx.Code = []byte{
+			0x01,             // SVTCA[x]
+			0xB1, 0x01, 0x00, // point, CVT
+			0xE6, // MIRP[white, round], no minimum distance
+		}
+		if err := ctx.Run(); err != nil {
+			t.Fatalf("Run failed: %v", err)
+		}
+		if got := ctx.Zones[1].Points[1].X; got != 64 {
+			t.Fatalf("MIRP white compensated X = %d, want 64", got)
+		}
+	})
+}
+
 func TestSingleWidthCutInAffectsRelativeMoves(t *testing.T) {
 	sys := core.NewSystem()
 
@@ -628,6 +867,30 @@ func TestSingleWidthCutInAffectsRelativeMoves(t *testing.T) {
 		}
 	})
 
+	t.Run("MDRP_negative", func(t *testing.T) {
+		ctx := NewContext(sys)
+		ctx.GS.SingleWidthCutIn = 10
+		ctx.GS.SingleWidthValue = 128
+		ctx.Zones[1].Points = []api.Vector{{X: 0, Y: 0}, {X: -124, Y: 0}}
+		ctx.Zones[1].OriginalPoints = []api.Vector{{X: 0, Y: 0}, {X: -124, Y: 0}}
+		ctx.Zones[1].TouchedX = make([]bool, 2)
+		ctx.Zones[1].TouchedY = make([]bool, 2)
+		ctx.ZP0 = 1
+		ctx.ZP1 = 1
+		ctx.RP0 = 0
+		ctx.Code = []byte{
+			0x01,       // SVTCA[x]
+			0xB0, 0x01, // point 1
+			0xC0, // MDRP without round/min distance
+		}
+		if err := ctx.Run(); err != nil {
+			t.Fatalf("Run failed: %v", err)
+		}
+		if got := ctx.Zones[1].Points[1].X; got != -128 {
+			t.Fatalf("MDRP negative single-width X = %d, want -128", got)
+		}
+	})
+
 	t.Run("MIRP", func(t *testing.T) {
 		ctx := NewContext(sys)
 		ctx.GS.SingleWidthCutIn = 10
@@ -650,6 +913,31 @@ func TestSingleWidthCutInAffectsRelativeMoves(t *testing.T) {
 		}
 		if got := ctx.Zones[1].Points[1].X; got != 128 {
 			t.Fatalf("MIRP single-width X = %d, want 128", got)
+		}
+	})
+
+	t.Run("MIRP_negative", func(t *testing.T) {
+		ctx := NewContext(sys)
+		ctx.GS.SingleWidthCutIn = 10
+		ctx.GS.SingleWidthValue = 128
+		ctx.CVT = []int32{124}
+		ctx.Zones[1].Points = []api.Vector{{X: 0, Y: 0}, {X: -100, Y: 0}}
+		ctx.Zones[1].OriginalPoints = []api.Vector{{X: 0, Y: 0}, {X: -100, Y: 0}}
+		ctx.Zones[1].TouchedX = make([]bool, 2)
+		ctx.Zones[1].TouchedY = make([]bool, 2)
+		ctx.ZP0 = 1
+		ctx.ZP1 = 1
+		ctx.RP0 = 0
+		ctx.Code = []byte{
+			0x01,             // SVTCA[x]
+			0xB1, 0x01, 0x00, // point, CVT
+			0xE0, // MIRP without round/min distance
+		}
+		if err := ctx.Run(); err != nil {
+			t.Fatalf("Run failed: %v", err)
+		}
+		if got := ctx.Zones[1].Points[1].X; got != -128 {
+			t.Fatalf("MIRP negative single-width X = %d, want -128", got)
 		}
 	})
 }
@@ -820,12 +1108,12 @@ func TestObsoleteNoopOpcodesAndUnknownFallback(t *testing.T) {
 		}
 	})
 
-	t.Run("UNKNOWN", func(t *testing.T) {
-		for _, opcode := range []byte{0x83, 0x91} {
+	t.Run("reserved or undefined", func(t *testing.T) {
+		for _, opcode := range []byte{0x28, 0x84, 0x91} {
 			ctx := NewContext(sys)
 			ctx.Code = []byte{opcode}
 			if err := ctx.Run(); err == nil {
-				t.Fatalf("unknown opcode 0x%02x should fail", opcode)
+				t.Fatalf("reserved or undefined opcode 0x%02x should fail", opcode)
 			}
 		}
 	})
@@ -971,6 +1259,136 @@ func TestSDPVTLUsesOriginalForDualAndCurrentForProjection(t *testing.T) {
 	}
 }
 
+func TestOriginalMeasurementsUseDualProjectionVector(t *testing.T) {
+	sys := core.NewSystem()
+
+	t.Run("SVTCA_updates_dual_vector", func(t *testing.T) {
+		ctx := NewContext(sys)
+		ctx.Zones[1].Points = []api.Vector{{X: 0, Y: 200}}
+		ctx.Zones[1].OriginalPoints = []api.Vector{{X: 0, Y: 100}}
+		ctx.Zones[1].TouchedX = make([]bool, 1)
+		ctx.Zones[1].TouchedY = make([]bool, 1)
+		ctx.ZP2 = 1
+
+		ctx.Code = []byte{
+			0x00,       // SVTCA[y]
+			0xB0, 0x00, // point 0
+			0x47, // GC[1], original along updated dual vector
+		}
+		if err := ctx.Run(); err != nil {
+			t.Fatalf("Run failed: %v", err)
+		}
+		if ctx.StackTop != 1 || ctx.Stack[0] != 100 {
+			t.Fatalf("stack = %v top=%d, want [100]", ctx.Stack[:ctx.StackTop], ctx.StackTop)
+		}
+	})
+
+	t.Run("GC_and_MD", func(t *testing.T) {
+		ctx := NewContext(sys)
+		ctx.GS.ProjVector = api.Vector{X: 0x4000, Y: 0}
+		ctx.GS.DualVector = api.Vector{X: 0, Y: 0x4000}
+		ctx.Zones[1].Points = []api.Vector{{X: 0, Y: 0}, {X: 200, Y: 0}}
+		ctx.Zones[1].OriginalPoints = []api.Vector{{X: 0, Y: 0}, {X: 0, Y: 100}}
+		ctx.Zones[1].TouchedX = make([]bool, 2)
+		ctx.Zones[1].TouchedY = make([]bool, 2)
+		ctx.ZP0 = 1
+		ctx.ZP1 = 1
+		ctx.ZP2 = 1
+
+		ctx.Code = []byte{
+			0xB0, 0x01, 0x47, // GC[1] point 1, original along dual vector
+			0xB1, 0x00, 0x01, // p2=0, p1=1
+			0x49, // MD[0], original distance along dual vector
+		}
+		if err := ctx.Run(); err != nil {
+			t.Fatalf("Run failed: %v", err)
+		}
+		if ctx.StackTop != 2 || ctx.Stack[0] != 100 || ctx.Stack[1] != 100 {
+			t.Fatalf("stack = %v top=%d, want [100 100]", ctx.Stack[:ctx.StackTop], ctx.StackTop)
+		}
+	})
+
+	t.Run("MD_uses_scaled_unscaled_original_points", func(t *testing.T) {
+		ctx := NewContext(sys)
+		ctx.GS.ProjVector = api.Vector{X: 0x4000, Y: 0}
+		ctx.GS.DualVector = api.Vector{X: 0x4000, Y: 0}
+		ctx.XScale = 1 << 16
+		ctx.YScale = 1 << 16
+		ctx.Zones[1].Points = []api.Vector{{X: 0}, {X: 640}}
+		ctx.Zones[1].OriginalPoints = []api.Vector{{X: 0}, {X: 640}}
+		ctx.Zones[1].UnscaledOriginalPoints = []api.Vector{{X: 0}, {X: 10}}
+		ctx.Zones[1].TouchedX = make([]bool, 2)
+		ctx.Zones[1].TouchedY = make([]bool, 2)
+		ctx.ZP0 = 1
+		ctx.ZP1 = 1
+
+		ctx.Code = []byte{
+			0xB1, 0x00, 0x01, // p2=0, p1=1
+			0x49, // MD[0], original distance along dual vector
+		}
+		if err := ctx.Run(); err != nil {
+			t.Fatalf("Run failed: %v", err)
+		}
+		if ctx.StackTop != 1 || ctx.Stack[0] != 640 {
+			t.Fatalf("stack = %v top=%d, want [640]", ctx.Stack[:ctx.StackTop], ctx.StackTop)
+		}
+	})
+
+	t.Run("IP", func(t *testing.T) {
+		ctx := NewContext(sys)
+		ctx.GS.ProjVector = api.Vector{X: 0x4000, Y: 0}
+		ctx.GS.FreeVector = api.Vector{X: 0x4000, Y: 0}
+		ctx.GS.DualVector = api.Vector{X: 0, Y: 0x4000}
+		ctx.Zones[1].Points = []api.Vector{{X: 0, Y: 0}, {X: 200, Y: 0}, {X: 0, Y: 0}}
+		ctx.Zones[1].OriginalPoints = []api.Vector{{X: 0, Y: 0}, {X: 0, Y: 100}, {X: 0, Y: 50}}
+		ctx.Zones[1].TouchedX = make([]bool, 3)
+		ctx.Zones[1].TouchedY = make([]bool, 3)
+		ctx.ZP0 = 1
+		ctx.ZP1 = 1
+		ctx.ZP2 = 1
+		ctx.RP1 = 0
+		ctx.RP2 = 1
+
+		ctx.Code = []byte{
+			0xB0, 0x02, // point 2
+			0x39, // IP
+		}
+		if err := ctx.Run(); err != nil {
+			t.Fatalf("Run failed: %v", err)
+		}
+		if got := ctx.Zones[1].Points[2].X; got != 100 {
+			t.Fatalf("IP moved point 2 X to %d, want 100", got)
+		}
+	})
+
+	t.Run("IP_rounds_interpolation", func(t *testing.T) {
+		ctx := NewContext(sys)
+		ctx.GS.ProjVector = api.Vector{X: 0x4000, Y: 0}
+		ctx.GS.FreeVector = api.Vector{X: 0x4000, Y: 0}
+		ctx.GS.DualVector = api.Vector{X: 0x4000, Y: 0}
+		ctx.Zones[1].Points = []api.Vector{{X: 0}, {X: 4}, {X: 0}}
+		ctx.Zones[1].OriginalPoints = []api.Vector{{X: 0}, {X: 3}, {X: 2}}
+		ctx.Zones[1].TouchedX = make([]bool, 3)
+		ctx.Zones[1].TouchedY = make([]bool, 3)
+		ctx.ZP0 = 1
+		ctx.ZP1 = 1
+		ctx.ZP2 = 1
+		ctx.RP1 = 0
+		ctx.RP2 = 1
+
+		ctx.Code = []byte{
+			0xB0, 0x02, // point 2
+			0x39, // IP
+		}
+		if err := ctx.Run(); err != nil {
+			t.Fatalf("Run failed: %v", err)
+		}
+		if got := ctx.Zones[1].Points[2].X; got != 3 {
+			t.Fatalf("IP rounded point 2 X to %d, want 3", got)
+		}
+	})
+}
+
 func TestZonePointerOps(t *testing.T) {
 	sys := core.NewSystem()
 	ctx := NewContext(sys)
@@ -1099,6 +1517,132 @@ func TestWCVTFScalesFontUnitsWhenUnitsPerEmIsKnown(t *testing.T) {
 	}
 }
 
+func TestSizePrepRerunRecomputesPPEMDependentCVT(t *testing.T) {
+	sys := core.NewSystem()
+	rawCVT := []int32{0, 0, 50}
+	prep := []byte{
+		0xB0, 0x00, // CVT index 0
+		0xB0, 0x64, // 100 font units
+		0x70,       // WCVTF: CVT[0] = scale(100)
+		0xB0, 0x01, // CVT index 1
+		0x4B,       // MPPEM
+		0x44,       // WCVTP: CVT[1] = current PPEM
+		0xB0, 0x02, // CVT index 2
+		0x45,       // RCVT
+		0xB0, 0x01, // increment
+		0x60,       // ADD
+		0xB0, 0x02, // CVT index 2
+		0x23, // SWAP: index, value
+		0x44, // WCVTP
+	}
+
+	runSize := func(ppem int) []int32 {
+		t.Helper()
+		ctx := NewContext(sys)
+		defer ctx.Free()
+		ctx.Prepare(0, 0, 32, ppem, int32(ppem))
+		ctx.UnitsPerEm = 1000
+		ctx.CVT = make([]int32, len(rawCVT))
+		for i, v := range rawCVT {
+			ctx.CVT[i] = ctx.scaleFUnits(v)
+		}
+		ctx.Code = prep
+		if err := ctx.Run(); err != nil {
+			t.Fatalf("Run failed at ppem %d: %v", ppem, err)
+		}
+		return append([]int32(nil), ctx.CVT...)
+	}
+
+	if got, want := runSize(20), []int32{128, 20, 65}; !equalInt32s(got, want) {
+		t.Fatalf("20 PPEM CVT = %v, want %v", got, want)
+	}
+	if got, want := runSize(10), []int32{64, 10, 33}; !equalInt32s(got, want) {
+		t.Fatalf("10 PPEM CVT = %v, want %v", got, want)
+	}
+}
+
+func TestSizePrepResetClearsGraphicsStorageAndTwilightState(t *testing.T) {
+	sys := core.NewSystem()
+	ctx := NewContext(sys)
+	defer ctx.Free()
+
+	ctx.Prepare(1, 1, 32, 20, 20)
+	ctx.CVT = []int32{64}
+	ctx.Code = []byte{
+		0x00,       // SVTCA[y]
+		0xB0, 0x00, // storage index 0
+		0xB0, 0x2A, // value 42
+		0x42,       // WS
+		0xB0, 0x00, // twilight zone
+		0x13,       // SZP0
+		0xB0, 0x00, // point 0
+		0xB0, 0x00, // CVT index 0
+		0x3E, // MIAP[0]
+	}
+	if err := ctx.Run(); err != nil {
+		t.Fatalf("first prep Run failed: %v", err)
+	}
+	if got := ctx.Storage[0]; got != 42 {
+		t.Fatalf("first prep storage[0] = %d, want 42", got)
+	}
+	if got := ctx.Zones[0].Points[0]; got != (api.Vector{Y: 64}) {
+		t.Fatalf("first prep twilight point = %#v, want Y-only move", got)
+	}
+	if !ctx.Zones[0].TouchedY[0] || ctx.Zones[0].TouchedX[0] {
+		t.Fatalf("first prep twilight touches X=%v Y=%v, want Y only", ctx.Zones[0].TouchedX[0], ctx.Zones[0].TouchedY[0])
+	}
+
+	ctx.Reset(sys)
+	ctx.Prepare(1, 1, 32, 10, 10)
+	if ctx.PPEM != 10 || ctx.PointSize != 10 {
+		t.Fatalf("size state after reset/prepare = ppem %d pointSize %d, want 10/10", ctx.PPEM, ctx.PointSize)
+	}
+	if got := ctx.GS.ProjVector; got != (api.Vector{X: 0x4000}) {
+		t.Fatalf("projection vector after reset = %#v, want x-axis", got)
+	}
+	if got := ctx.Storage[0]; got != 0 {
+		t.Fatalf("storage[0] after reset/prepare = %d, want 0", got)
+	}
+	if got := ctx.Zones[0].Points[0]; got != (api.Vector{}) {
+		t.Fatalf("twilight point after reset = %#v, want zero", got)
+	}
+	if ctx.Zones[0].TouchedX[0] || ctx.Zones[0].TouchedY[0] {
+		t.Fatalf("twilight touches after reset X=%v Y=%v, want clear", ctx.Zones[0].TouchedX[0], ctx.Zones[0].TouchedY[0])
+	}
+
+	ctx.CVT = []int32{64}
+	ctx.Code = []byte{
+		0xB0, 0x00, // twilight zone
+		0x13,       // SZP0
+		0xB0, 0x00, // point 0
+		0xB0, 0x00, // CVT index 0
+		0x3E,       // MIAP[0], using reset x-axis graphics state
+		0xB0, 0x00, // storage index 0
+		0x43, // RS
+	}
+	if err := ctx.Run(); err != nil {
+		t.Fatalf("second prep Run failed: %v", err)
+	}
+	if got := ctx.Zones[0].Points[0]; got != (api.Vector{X: 64}) {
+		t.Fatalf("second prep twilight point = %#v, want X-only move", got)
+	}
+	if ctx.StackTop != 1 || ctx.Stack[0] != 0 {
+		t.Fatalf("second prep storage read stack = %v top=%d, want [0]", ctx.Stack[:ctx.StackTop], ctx.StackTop)
+	}
+}
+
+func equalInt32s(a, b []int32) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 func TestIUP(t *testing.T) {
 	sys := core.NewSystem()
 	ctx := NewContext(sys)
@@ -1134,6 +1678,79 @@ func TestIUP(t *testing.T) {
 	expectedX := int32(64)
 	if ctx.Zones[1].Points[1].X != expectedX {
 		t.Fatalf("Expected X %d, got %d", expectedX, ctx.Zones[1].Points[1].X)
+	}
+}
+
+func TestIUPInterpolatesContourWrapSegment(t *testing.T) {
+	sys := core.NewSystem()
+	ctx := NewContext(sys)
+
+	ctx.Zones[1].Points = []api.Vector{{X: 50}, {X: 50}, {X: 75}, {X: 120}}
+	ctx.Zones[1].OriginalPoints = []api.Vector{{X: 50}, {X: 25}, {X: 75}, {X: 100}}
+	ctx.Zones[1].TouchedX = []bool{false, true, false, true}
+	ctx.Zones[1].TouchedY = make([]bool, 4)
+	ctx.Zones[1].Contours = []int{3}
+	ctx.ZP2 = 1
+	ctx.Code = []byte{0x31} // IUP[x]
+
+	if err := ctx.Run(); err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+	if got := ctx.Zones[1].Points[0].X; got != 73 {
+		t.Fatalf("IUP wrap point 0 X = %d, want 73", got)
+	}
+	if got := ctx.Zones[1].Points[2].X; got != 97 {
+		t.Fatalf("IUP inner point 2 X = %d, want 97", got)
+	}
+}
+
+func TestIUPUsesUnscaledOriginalPoints(t *testing.T) {
+	ctx := NewContext(core.NewSystem())
+	ctx.Zones[1].Points = []api.Vector{{X: 0}, {X: 2}, {X: 4}}
+	ctx.Zones[1].OriginalPoints = []api.Vector{{X: 0}, {X: 2}, {X: 3}}
+	ctx.Zones[1].UnscaledOriginalPoints = []api.Vector{{X: 0}, {X: 5}, {X: 10}}
+	ctx.Zones[1].TouchedX = []bool{true, false, true}
+	ctx.Zones[1].TouchedY = make([]bool, 3)
+	ctx.Zones[1].Contours = []int{2}
+	ctx.ZP2 = 1
+	ctx.Code = []byte{0x31} // IUP[x]
+
+	if err := ctx.Run(); err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+	if got := ctx.Zones[1].Points[1].X; got != 2 {
+		t.Fatalf("IUP unscaled-original point 1 X = %d, want 2", got)
+	}
+}
+
+func TestBackwardCompatibilitySuppressesXMoveForDiagonalFreedom(t *testing.T) {
+	ctx := NewContext(core.NewSystem())
+	ctx.GS.BackwardCompatibility = true
+	ctx.GS.FreeVector = api.Vector{X: 0x2D41, Y: 0x2D41}
+
+	p := api.Vector{}
+	ctx.move(&p, 64)
+
+	if p.X != 0 {
+		t.Fatalf("backward compatibility diagonal X move = %d, want 0", p.X)
+	}
+	if p.Y == 0 {
+		t.Fatalf("backward compatibility diagonal Y move was suppressed before IUP")
+	}
+}
+
+func TestBackwardCompatibilitySuppressesYMoveAfterBothIUPAxes(t *testing.T) {
+	ctx := NewContext(core.NewSystem())
+	ctx.GS.BackwardCompatibility = true
+	ctx.GS.FreeVector = api.Vector{Y: 0x4000}
+	ctx.iupXCalled = true
+	ctx.iupYCalled = true
+
+	p := api.Vector{Y: 10}
+	ctx.move(&p, 64)
+
+	if p.Y != 10 {
+		t.Fatalf("backward compatibility post-IUP Y move = %d, want 10", p.Y)
 	}
 }
 
@@ -1203,8 +1820,8 @@ func TestMathOps(t *testing.T) {
 		expected int32
 	}{
 		{"SUB", []byte{0xB0, 0x1E, 0xB0, 0x0A, 0x61}, 20},        // 30 - 10 = 20
-		{"MUL", []byte{0xB0, 0x40, 0xB0, 0x40, 0x62}, 64},        // (64 * 64) / 64 = 64
-		{"DIV", []byte{0xB0, 0x80, 0xB0, 0x40, 0x63}, 128},       // (128 * 64) / 64 = 128
+		{"DIV", []byte{0xB0, 0x80, 0xB0, 0x40, 0x62}, 128},       // (128 * 64) / 64 = 128
+		{"MUL", []byte{0xB0, 0x40, 0xB0, 0x40, 0x63}, 64},        // (64 * 64) / 64 = 64
 		{"SWAP", []byte{0xB0, 0x0A, 0xB0, 0x14, 0x23, 0x61}, 10}, // 10, 20 -> 20, 10 -> 20 - 10 = 10
 		{"PUSHW", []byte{0xB8, 0xFF, 0xF6}, -10},                 // PUSHW[1] -10 (0xFFF6)
 	}
@@ -1343,6 +1960,56 @@ func TestLoopCall(t *testing.T) {
 	}
 }
 
+func TestInstructionDefinitions(t *testing.T) {
+	sys := core.NewSystem()
+
+	t.Run("executes custom opcode", func(t *testing.T) {
+		ctx := NewContext(sys)
+		ctx.Code = []byte{
+			0xB0, 0x83, 0x89, // IDEF 0x83
+			0xB0, 0x07, // body: PUSH 7
+			0x2D, // ENDF
+			0x83, // execute custom instruction
+		}
+
+		if err := ctx.Run(); err != nil {
+			t.Fatalf("Run failed: %v", err)
+		}
+		if ctx.StackTop != 1 || ctx.Stack[0] != 7 {
+			t.Fatalf("custom instruction stack = %v top=%d, want [7]", ctx.Stack[:ctx.StackTop], ctx.StackTop)
+		}
+	})
+
+	t.Run("uses call depth limit", func(t *testing.T) {
+		ctx := NewContext(sys)
+		ctx.MaxCallDepth = 2
+		ctx.Code = []byte{
+			0xB0, 0x83, 0x89, // IDEF 0x83
+			0x83, // body recursively executes 0x83
+			0x2D, // ENDF
+			0x83, // execute custom instruction
+		}
+
+		err := ctx.Run()
+		if !errors.Is(err, ErrCallDepthExceeded) {
+			t.Fatalf("Run error = %v, want %v", err, ErrCallDepthExceeded)
+		}
+	})
+
+	t.Run("rejects out of range opcode", func(t *testing.T) {
+		ctx := NewContext(sys)
+		ctx.Code = []byte{
+			0xB8, 0x01, 0x00, // PUSHW 256
+			0x89, // IDEF
+			0x2D, // ENDF
+		}
+
+		if err := ctx.Run(); err == nil {
+			t.Fatalf("IDEF with opcode 256 should fail")
+		}
+	})
+}
+
 func TestInstructionBudgetStopsInfiniteJump(t *testing.T) {
 	sys := core.NewSystem()
 	ctx := NewContext(sys)
@@ -1355,6 +2022,28 @@ func TestInstructionBudgetStopsInfiniteJump(t *testing.T) {
 	if !errors.Is(err, ErrInstructionBudgetExceeded) {
 		t.Fatalf("Run error = %v, want %v", err, ErrInstructionBudgetExceeded)
 	}
+}
+
+func TestJumpOutOfInstructionStreamFails(t *testing.T) {
+	sys := core.NewSystem()
+
+	t.Run("forward", func(t *testing.T) {
+		ctx := NewContext(sys)
+		ctx.Code = []byte{0xB0, 0x05, 0x1C} // JMPR past the end.
+
+		if err := ctx.Run(); err == nil {
+			t.Fatalf("forward jump outside instruction stream should fail")
+		}
+	})
+
+	t.Run("backward", func(t *testing.T) {
+		ctx := NewContext(sys)
+		ctx.Code = []byte{0xB8, 0xFF, 0xFC, 0x1C} // JMPR before the start.
+
+		if err := ctx.Run(); err == nil {
+			t.Fatalf("backward jump outside instruction stream should fail")
+		}
+	})
 }
 
 func TestCallDepthLimitStopsRecursiveCall(t *testing.T) {
@@ -1435,8 +2124,12 @@ func TestRelationalAndLogicalOps(t *testing.T) {
 	}{
 		{"LT_TRUE", []byte{0xB0, 0x0A, 0xB0, 0x14, 0x50}, 1},  // 10 < 20
 		{"LT_FALSE", []byte{0xB0, 0x14, 0xB0, 0x0A, 0x50}, 0}, // 20 < 10
-		{"GT_TRUE", []byte{0xB0, 0x14, 0xB0, 0x0A, 0x51}, 1},  // 20 > 10
-		{"EQ_TRUE", []byte{0xB0, 0x0A, 0xB0, 0x0A, 0x52}, 1},  // 10 == 10
+		{"LTEQ_TRUE", []byte{0xB0, 0x0A, 0xB0, 0x0A, 0x51}, 1},
+		{"LTEQ_FALSE", []byte{0xB0, 0x14, 0xB0, 0x0A, 0x51}, 0},
+		{"GT_TRUE", []byte{0xB0, 0x14, 0xB0, 0x0A, 0x52}, 1}, // 20 > 10
+		{"GTEQ_TRUE", []byte{0xB0, 0x14, 0xB0, 0x14, 0x53}, 1},
+		{"EQ_TRUE", []byte{0xB0, 0x0A, 0xB0, 0x0A, 0x54}, 1},  // 10 == 10
+		{"NEQ_TRUE", []byte{0xB0, 0x0A, 0xB0, 0x14, 0x55}, 1}, // 10 != 20
 		{"AND_TRUE", []byte{0xB0, 0x01, 0xB0, 0x01, 0x5A}, 1},
 		{"AND_FALSE", []byte{0xB0, 0x01, 0xB0, 0x00, 0x5A}, 0},
 		{"OR_TRUE", []byte{0xB0, 0x01, 0xB0, 0x00, 0x5B}, 1},

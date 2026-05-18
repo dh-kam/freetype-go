@@ -2,9 +2,15 @@ package cache
 
 import (
 	"container/list"
+	"errors"
 	"sync"
 
 	"github.com/dh-kam/freetype-go/api"
+)
+
+var (
+	ErrNilFace          = errors.New("nil face")
+	ErrNilFaceRequester = errors.New("nil face requester")
 )
 
 // FaceID is a unique identifier for a font face.
@@ -26,11 +32,24 @@ type GlyphRequest struct {
 	LoadFlags  int
 }
 
+// Size represents a cached face size selection.
+type Size struct {
+	Request SizeRequest
+	Face    api.Face
+}
+
 // Glyph represents a cached glyph object.
 type Glyph struct {
-	Outline api.Outline
-	Advance api.Vector
+	Outline    api.Outline
+	Bitmap     api.Bitmap
+	Image      *api.Image
+	Advance    api.Vector
+	Metrics    api.GlyphMetrics
+	HasMetrics bool
 }
+
+// FaceRequester lazily resolves a face for a cache manager.
+type FaceRequester func(id FaceID) (api.Face, error)
 
 // Cache is a generic LRU cache.
 type Cache struct {
@@ -67,6 +86,10 @@ func (c *Cache) Get(key interface{}) (interface{}, bool) {
 func (c *Cache) Add(key interface{}, value interface{}) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
+
+	if c.capacity <= 0 {
+		return
+	}
 
 	if elem, ok := c.items[key]; ok {
 		c.list.MoveToFront(elem)
@@ -134,6 +157,53 @@ func (m *Manager) AddFace(id FaceID, face api.Face) {
 	m.faceCache.Add(id, face)
 }
 
+// LookupFaceOrLoad returns a cached face or loads and caches it through requester.
+func (m *Manager) LookupFaceOrLoad(id FaceID, requester FaceRequester) (api.Face, error) {
+	if face, ok := m.LookupFace(id); ok {
+		return face, nil
+	}
+	if requester == nil {
+		return nil, ErrNilFaceRequester
+	}
+	face, err := requester(id)
+	if err != nil {
+		return nil, err
+	}
+	m.AddFace(id, face)
+	return face, nil
+}
+
+func (m *Manager) LookupSize(req SizeRequest) (*Size, bool) {
+	val, ok := m.sizeCache.Get(req)
+	if !ok {
+		return nil, false
+	}
+	return val.(*Size), true
+}
+
+func (m *Manager) AddSize(req SizeRequest, size *Size) {
+	m.sizeCache.Add(req, size)
+}
+
+// LookupSizeOrCreate selects a face size and caches the resulting request.
+func (m *Manager) LookupSizeOrCreate(req SizeRequest, face api.Face) (*Size, error) {
+	if size, ok := m.LookupSize(req); ok {
+		return size, nil
+	}
+	if face == nil {
+		return nil, ErrNilFace
+	}
+	if err := face.SetPixelSizes(req.Width, req.Height); err != nil {
+		return nil, err
+	}
+	size := &Size{
+		Request: req,
+		Face:    face,
+	}
+	m.AddSize(req, size)
+	return size, nil
+}
+
 func (m *Manager) LookupGlyph(req GlyphRequest) (*Glyph, bool) {
 	val, ok := m.glyphCache.Get(req)
 	if !ok {
@@ -144,4 +214,41 @@ func (m *Manager) LookupGlyph(req GlyphRequest) (*Glyph, bool) {
 
 func (m *Manager) AddGlyph(req GlyphRequest, glyph *Glyph) {
 	m.glyphCache.Add(req, glyph)
+}
+
+// LookupGlyphOrLoad returns a cached glyph or loads it from face and caches the slot data.
+func (m *Manager) LookupGlyphOrLoad(req GlyphRequest, face api.Face) (*Glyph, error) {
+	if glyph, ok := m.LookupGlyph(req); ok {
+		return glyph, nil
+	}
+	if face == nil {
+		return nil, ErrNilFace
+	}
+	slot, err := face.LoadGlyph(req.GlyphIndex, req.LoadFlags)
+	if err != nil {
+		return nil, err
+	}
+	glyph := glyphFromSlot(face, req.GlyphIndex, slot)
+	m.AddGlyph(req, glyph)
+	return glyph, nil
+}
+
+func glyphFromSlot(face api.Face, glyphIndex int, slot api.GlyphSlot) *Glyph {
+	glyph := &Glyph{}
+	if slot != nil {
+		glyph.Outline = slot.GetOutline()
+		glyph.Bitmap = slot.GetBitmap()
+		glyph.Image = slot.GetImage()
+		if metrics, ok := api.GetGlyphSlotMetrics(slot); ok {
+			glyph.Metrics = metrics
+			glyph.HasMetrics = true
+			glyph.Advance.X = metrics.HoriAdvance
+		}
+	}
+	if !glyph.HasMetrics && face != nil {
+		if advance, _, err := face.GetGlyphMetrics(glyphIndex); err == nil {
+			glyph.Advance.X = advance
+		}
+	}
+	return glyph
 }

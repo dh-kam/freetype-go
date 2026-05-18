@@ -611,7 +611,23 @@ func ParseFvar(s api.Stream) (*FvarTable, error) {
 	axisCount, _ := readUint16(s, 8)
 	axisSize, _ := readUint16(s, 10)
 	instanceCount, _ := readUint16(s, 12)
-	// instanceSize, _ := readUint16(s, 14)
+	instanceSize, _ := readUint16(s, 14)
+	if axisSize < 20 {
+		return nil, errors.New("fvar axis record size too small")
+	}
+	axisRecordsSize := int64(axisCount) * int64(axisSize)
+	if !hasRange(s, int64(axesOffset), axisRecordsSize) {
+		return nil, errors.New("fvar axis records truncated")
+	}
+	baseInstanceSize := int64(axisCount)*4 + 4
+	instanceSize64 := int64(instanceSize)
+	if instanceCount > 0 && instanceSize64 != baseInstanceSize && instanceSize64 != baseInstanceSize+2 {
+		return nil, errors.New("fvar invalid instance record size")
+	}
+	instancesOffset := int64(axesOffset) + axisRecordsSize
+	if instanceCount > 0 && !hasRange(s, instancesOffset, int64(instanceCount)*instanceSize64) {
+		return nil, errors.New("fvar instance records truncated")
+	}
 
 	fvar := &FvarTable{
 		Axes:      make([]AxisRecord, axisCount),
@@ -625,6 +641,23 @@ func ParseFvar(s api.Stream) (*FvarTable, error) {
 		fvar.Axes[i].MaxValue = Fixed(readInt32S(s, off+12))
 		fvar.Axes[i].Flags, _ = readUint16(s, off+16)
 		fvar.Axes[i].AxisNameID, _ = readUint16(s, off+18)
+		if fvar.Axes[i].MinValue > fvar.Axes[i].DefaultValue || fvar.Axes[i].DefaultValue > fvar.Axes[i].MaxValue {
+			return nil, fmt.Errorf("fvar axis %d has invalid min/default/max values", i)
+		}
+	}
+	for i := 0; i < int(instanceCount); i++ {
+		off := instancesOffset + int64(i)*instanceSize64
+		instance := &fvar.Instances[i]
+		instance.SubfamilyNameID, _ = readUint16(s, off)
+		instance.Flags, _ = readUint16(s, off+2)
+		instance.Coordinates = make([]Fixed, axisCount)
+		coordOff := off + 4
+		for j := 0; j < int(axisCount); j++ {
+			instance.Coordinates[j] = Fixed(readInt32S(s, coordOff+int64(j)*4))
+		}
+		if instanceSize64 >= baseInstanceSize+2 {
+			instance.PostScriptNameID, _ = readUint16(s, off+baseInstanceSize)
+		}
 	}
 	return fvar, nil
 }
@@ -861,7 +894,8 @@ type VariationData struct {
 	ItemCount       uint16
 	ShortDeltaCount uint16
 	RegionIndices   []uint16
-	Deltas          [][]int16
+	LongWords       bool
+	Deltas          [][]int32
 }
 
 type ItemVariationStore struct {
@@ -870,6 +904,12 @@ type ItemVariationStore struct {
 }
 
 func (ivs *ItemVariationStore) GetDelta(outerIndex, innerIndex int, coords []float32) float32 {
+	if ivs == nil || outerIndex < 0 || innerIndex < 0 {
+		return 0
+	}
+	if outerIndex == 0xFFFF && innerIndex == 0xFFFF {
+		return 0
+	}
 	if outerIndex >= len(ivs.Data) {
 		return 0
 	}
@@ -917,12 +957,18 @@ func calculateScalar(region []VariationRegion, coords []float32) float32 {
 }
 
 func ParseItemVariationStore(s api.Stream, offset int64) (*ItemVariationStore, error) {
+	if !hasRange(s, offset, 8) {
+		return nil, errors.New("ItemVariationStore header truncated")
+	}
 	format, _ := readUint16(s, offset)
 	if format != 1 {
 		return nil, fmt.Errorf("unsupported ItemVariationStore format: %d", format)
 	}
 	regionListOffset, _ := readUint32(s, offset+2)
 	dataCount, _ := readUint16(s, offset+6)
+	if !hasRange(s, offset+8, int64(dataCount)*4) {
+		return nil, errors.New("ItemVariationStore data offsets truncated")
+	}
 	dataOffsets := make([]uint32, dataCount)
 	for i := 0; i < int(dataCount); i++ {
 		dataOffsets[i], _ = readUint32(s, offset+8+int64(i*4))
@@ -934,8 +980,18 @@ func ParseItemVariationStore(s api.Stream, offset int64) (*ItemVariationStore, e
 
 	// Parse Region List
 	rlOff := offset + int64(regionListOffset)
+	if regionListOffset == 0 || !hasRange(s, rlOff, 4) {
+		return nil, errors.New("ItemVariationStore region list offset out of range")
+	}
 	axisCount, _ := readUint16(s, rlOff)
 	regionCount, _ := readUint16(s, rlOff+2)
+	if regionCount&0x8000 != 0 {
+		return nil, errors.New("ItemVariationStore region count reserved bit set")
+	}
+	regionListSize := int64(4) + int64(regionCount)*int64(axisCount)*6
+	if !hasRange(s, rlOff, regionListSize) {
+		return nil, errors.New("ItemVariationStore region list truncated")
+	}
 	ivs.RegionList.AxisCount = int(axisCount)
 	ivs.RegionList.Regions = make([][]VariationRegion, regionCount)
 	for i := 0; i < int(regionCount); i++ {
@@ -950,36 +1006,73 @@ func ParseItemVariationStore(s api.Stream, offset int64) (*ItemVariationStore, e
 				PeakCoord:  float32(v2) / 16384.0,
 				EndCoord:   float32(v3) / 16384.0,
 			}
+			if err := validateVariationRegion(ivs.RegionList.Regions[i][j]); err != nil {
+				return nil, fmt.Errorf("ItemVariationStore region %d axis %d: %w", i, j, err)
+			}
 		}
 	}
 
 	// Parse Variation Data
 	for i := 0; i < int(dataCount); i++ {
+		if dataOffsets[i] == 0 {
+			continue
+		}
 		dOff := offset + int64(dataOffsets[i])
+		if !hasRange(s, dOff, 6) {
+			return nil, errors.New("ItemVariationData header truncated")
+		}
 		itemCount, _ := readUint16(s, dOff)
-		shortDeltaCount, _ := readUint16(s, dOff+2)
+		wordDeltaCountField, _ := readUint16(s, dOff+2)
 		regionIndexCount, _ := readUint16(s, dOff+4)
+		longWords := wordDeltaCountField&0x8000 != 0
+		wordDeltaCount := wordDeltaCountField & 0x7FFF
+		if wordDeltaCount > regionIndexCount {
+			return nil, errors.New("ItemVariationData word delta count exceeds region index count")
+		}
+		regionIndicesSize := int64(regionIndexCount) * 2
+		if !hasRange(s, dOff+6, regionIndicesSize) {
+			return nil, errors.New("ItemVariationData region indices truncated")
+		}
+		rowSize := itemVariationDeltaRowSize(regionIndexCount, wordDeltaCount, longWords)
+		if !hasRange(s, dOff+6+regionIndicesSize, int64(itemCount)*rowSize) {
+			return nil, errors.New("ItemVariationData delta sets truncated")
+		}
 		data := &ivs.Data[i]
 		data.ItemCount = itemCount
-		data.ShortDeltaCount = shortDeltaCount
+		data.ShortDeltaCount = wordDeltaCount
+		data.LongWords = longWords
 		data.RegionIndices = make([]uint16, regionIndexCount)
 		for j := 0; j < int(regionIndexCount); j++ {
 			data.RegionIndices[j], _ = readUint16(s, dOff+6+int64(j*2))
+			if data.RegionIndices[j] >= regionCount {
+				return nil, errors.New("ItemVariationData region index out of range")
+			}
 		}
 
 		deltasOff := dOff + 6 + int64(regionIndexCount*2)
-		data.Deltas = make([][]int16, itemCount)
+		data.Deltas = make([][]int32, itemCount)
 		for j := 0; j < int(itemCount); j++ {
-			data.Deltas[j] = make([]int16, regionIndexCount)
+			data.Deltas[j] = make([]int32, regionIndexCount)
 			for k := 0; k < int(regionIndexCount); k++ {
-				if k < int(shortDeltaCount) {
-					v, _ := readInt16(s, deltasOff)
-					data.Deltas[j][k] = v
-					deltasOff += 2
+				if longWords {
+					if k < int(wordDeltaCount) {
+						data.Deltas[j][k] = readInt32S(s, deltasOff)
+						deltasOff += 4
+					} else {
+						v, _ := readInt16(s, deltasOff)
+						data.Deltas[j][k] = int32(v)
+						deltasOff += 2
+					}
 				} else {
-					v, _ := readByte(s, deltasOff)
-					data.Deltas[j][k] = int16(int8(v))
-					deltasOff++
+					if k < int(wordDeltaCount) {
+						v, _ := readInt16(s, deltasOff)
+						data.Deltas[j][k] = int32(v)
+						deltasOff += 2
+					} else {
+						v, _ := readByte(s, deltasOff)
+						data.Deltas[j][k] = int32(int8(v))
+						deltasOff++
+					}
 				}
 			}
 		}
@@ -993,20 +1086,47 @@ type DeltaSetIndexMap struct {
 }
 
 func ParseDeltaSetIndexMap(s api.Stream, offset int64) (*DeltaSetIndexMap, error) {
-	format, _ := readUint16(s, offset)
-	if format != 0 {
-		// Only format 0 is common for HVAR/VVAR
+	if !hasRange(s, offset, 2) {
+		return nil, errors.New("DeltaSetIndexMap header truncated")
 	}
-	entryFormat, _ := readUint16(s, offset+2)
-	mapCount, _ := readUint16(s, offset+4)
+	format, _ := readByte(s, offset)
+	entryFormatByte, _ := readByte(s, offset+1)
+	entryFormat := uint16(entryFormatByte)
+	var mapCount uint32
+	var dataOff int64
+	switch format {
+	case 0:
+		if !hasRange(s, offset, 4) {
+			return nil, errors.New("DeltaSetIndexMap format 0 header truncated")
+		}
+		v, _ := readUint16(s, offset+2)
+		mapCount = uint32(v)
+		dataOff = offset + 4
+	case 1:
+		if !hasRange(s, offset, 6) {
+			return nil, errors.New("DeltaSetIndexMap format 1 header truncated")
+		}
+		mapCount, _ = readUint32(s, offset+2)
+		dataOff = offset + 6
+	default:
+		return nil, fmt.Errorf("unsupported DeltaSetIndexMap format: %d", format)
+	}
+	if entryFormat&0x00C0 != 0 {
+		return nil, errors.New("DeltaSetIndexMap entry format reserved bits set")
+	}
+	if uint64(mapCount) > uint64(maxInt()) {
+		return nil, errors.New("DeltaSetIndexMap map count too large")
+	}
 
 	innerIndexBitCnt := int((entryFormat & 0x000F) + 1)
 	entrySize := int(((entryFormat & 0x0030) >> 4) + 1)
+	if !hasRange(s, dataOff, int64(mapCount)*int64(entrySize)) {
+		return nil, errors.New("DeltaSetIndexMap map data truncated")
+	}
 
 	m := &DeltaSetIndexMap{
 		Indices: make([]uint32, mapCount),
 	}
-	dataOff := offset + 6
 	for i := 0; i < int(mapCount); i++ {
 		var entry uint32
 		if entrySize == 1 {
@@ -1048,7 +1168,10 @@ func (t *HVARTable) GetAdvanceDelta(glyphIndex int, coords []float32) float32 {
 	if t == nil || t.ItemVariationStore == nil {
 		return 0
 	}
-	outer, inner := t.getIndices(glyphIndex, t.AdvanceWidthMapping)
+	outer, inner, ok := metricDeltaSetIndex(glyphIndex, t.AdvanceWidthMapping, true)
+	if !ok {
+		return 0
+	}
 	return t.ItemVariationStore.GetDelta(outer, inner, coords)
 }
 
@@ -1056,22 +1179,11 @@ func (t *HVARTable) GetLSBDelta(glyphIndex int, coords []float32) float32 {
 	if t == nil || t.ItemVariationStore == nil || t.LsbMapping == nil {
 		return 0
 	}
-	outer, inner := t.getIndices(glyphIndex, t.LsbMapping)
-	return t.ItemVariationStore.GetDelta(outer, inner, coords)
-}
-
-func (t *HVARTable) getIndices(glyphIndex int, m *DeltaSetIndexMap) (int, int) {
-	var index uint32
-	if m != nil && len(m.Indices) > 0 {
-		if glyphIndex >= len(m.Indices) {
-			index = m.Indices[len(m.Indices)-1]
-		} else {
-			index = m.Indices[glyphIndex]
-		}
-	} else {
-		index = uint32(glyphIndex) // Default: outer=0, inner=glyphIndex
+	outer, inner, ok := metricDeltaSetIndex(glyphIndex, t.LsbMapping, false)
+	if !ok {
+		return 0
 	}
-	return int(index >> 16), int(index & 0xFFFF)
+	return t.ItemVariationStore.GetDelta(outer, inner, coords)
 }
 
 func ParseHVAR(s api.Stream) (*HVARTable, error) {
@@ -1080,10 +1192,16 @@ func ParseHVAR(s api.Stream) (*HVARTable, error) {
 	}
 	major, _ := readUint16(s, 0)
 	minor, _ := readUint16(s, 2)
+	if major != 1 || minor != 0 {
+		return nil, fmt.Errorf("unsupported HVAR version: %d.%d", major, minor)
+	}
 	ivsOff, _ := readUint32(s, 4)
 	advMapOff, _ := readUint32(s, 8)
 	lsbMapOff, _ := readUint32(s, 12)
 	rsbMapOff, _ := readUint32(s, 16)
+	if ivsOff == 0 || int64(ivsOff) >= s.Size() {
+		return nil, errors.New("HVAR item variation store offset out of range")
+	}
 
 	t := &HVARTable{
 		MajorVersion: major,
@@ -1095,13 +1213,22 @@ func ParseHVAR(s api.Stream) (*HVARTable, error) {
 		return nil, err
 	}
 	if advMapOff != 0 {
-		t.AdvanceWidthMapping, _ = ParseDeltaSetIndexMap(s, int64(advMapOff))
+		t.AdvanceWidthMapping, err = ParseDeltaSetIndexMap(s, int64(advMapOff))
+		if err != nil {
+			return nil, err
+		}
 	}
 	if lsbMapOff != 0 {
-		t.LsbMapping, _ = ParseDeltaSetIndexMap(s, int64(lsbMapOff))
+		t.LsbMapping, err = ParseDeltaSetIndexMap(s, int64(lsbMapOff))
+		if err != nil {
+			return nil, err
+		}
 	}
 	if rsbMapOff != 0 {
-		t.RsbMapping, _ = ParseDeltaSetIndexMap(s, int64(rsbMapOff))
+		t.RsbMapping, err = ParseDeltaSetIndexMap(s, int64(rsbMapOff))
+		if err != nil {
+			return nil, err
+		}
 	}
 	return t, nil
 }
@@ -1122,7 +1249,10 @@ func (t *VVARTable) GetAdvanceHeightDelta(glyphIndex int, coords []float32) floa
 	if t == nil || t.ItemVariationStore == nil {
 		return 0
 	}
-	outer, inner := t.getIndices(glyphIndex, t.AdvanceHeightMapping)
+	outer, inner, ok := metricDeltaSetIndex(glyphIndex, t.AdvanceHeightMapping, true)
+	if !ok {
+		return 0
+	}
 	return t.ItemVariationStore.GetDelta(outer, inner, coords)
 }
 
@@ -1130,7 +1260,10 @@ func (t *VVARTable) GetTSBDelta(glyphIndex int, coords []float32) float32 {
 	if t == nil || t.ItemVariationStore == nil || t.TsbMapping == nil {
 		return 0
 	}
-	outer, inner := t.getIndices(glyphIndex, t.TsbMapping)
+	outer, inner, ok := metricDeltaSetIndex(glyphIndex, t.TsbMapping, false)
+	if !ok {
+		return 0
+	}
 	return t.ItemVariationStore.GetDelta(outer, inner, coords)
 }
 
@@ -1138,7 +1271,10 @@ func (t *VVARTable) GetBSBDelta(glyphIndex int, coords []float32) float32 {
 	if t == nil || t.ItemVariationStore == nil || t.BsbMapping == nil {
 		return 0
 	}
-	outer, inner := t.getIndices(glyphIndex, t.BsbMapping)
+	outer, inner, ok := metricDeltaSetIndex(glyphIndex, t.BsbMapping, false)
+	if !ok {
+		return 0
+	}
 	return t.ItemVariationStore.GetDelta(outer, inner, coords)
 }
 
@@ -1146,22 +1282,11 @@ func (t *VVARTable) GetVOrgDelta(glyphIndex int, coords []float32) float32 {
 	if t == nil || t.ItemVariationStore == nil || t.VOrgMapping == nil {
 		return 0
 	}
-	outer, inner := t.getIndices(glyphIndex, t.VOrgMapping)
-	return t.ItemVariationStore.GetDelta(outer, inner, coords)
-}
-
-func (t *VVARTable) getIndices(glyphIndex int, m *DeltaSetIndexMap) (int, int) {
-	var index uint32
-	if m != nil && len(m.Indices) > 0 {
-		if glyphIndex >= len(m.Indices) {
-			index = m.Indices[len(m.Indices)-1]
-		} else {
-			index = m.Indices[glyphIndex]
-		}
-	} else {
-		index = uint32(glyphIndex)
+	outer, inner, ok := metricDeltaSetIndex(glyphIndex, t.VOrgMapping, false)
+	if !ok {
+		return 0
 	}
-	return int(index >> 16), int(index & 0xFFFF)
+	return t.ItemVariationStore.GetDelta(outer, inner, coords)
 }
 
 func ParseVVAR(s api.Stream) (*VVARTable, error) {
@@ -1170,11 +1295,17 @@ func ParseVVAR(s api.Stream) (*VVARTable, error) {
 	}
 	major, _ := readUint16(s, 0)
 	minor, _ := readUint16(s, 2)
+	if major != 1 || minor != 0 {
+		return nil, fmt.Errorf("unsupported VVAR version: %d.%d", major, minor)
+	}
 	ivsOff, _ := readUint32(s, 4)
 	advMapOff, _ := readUint32(s, 8)
 	tsbMapOff, _ := readUint32(s, 12)
 	bsbMapOff, _ := readUint32(s, 16)
 	vorgMapOff, _ := readUint32(s, 20)
+	if ivsOff == 0 || int64(ivsOff) >= s.Size() {
+		return nil, errors.New("VVAR item variation store offset out of range")
+	}
 
 	t := &VVARTable{
 		MajorVersion: major,
@@ -1186,16 +1317,28 @@ func ParseVVAR(s api.Stream) (*VVARTable, error) {
 		return nil, err
 	}
 	if advMapOff != 0 {
-		t.AdvanceHeightMapping, _ = ParseDeltaSetIndexMap(s, int64(advMapOff))
+		t.AdvanceHeightMapping, err = ParseDeltaSetIndexMap(s, int64(advMapOff))
+		if err != nil {
+			return nil, err
+		}
 	}
 	if tsbMapOff != 0 {
-		t.TsbMapping, _ = ParseDeltaSetIndexMap(s, int64(tsbMapOff))
+		t.TsbMapping, err = ParseDeltaSetIndexMap(s, int64(tsbMapOff))
+		if err != nil {
+			return nil, err
+		}
 	}
 	if bsbMapOff != 0 {
-		t.BsbMapping, _ = ParseDeltaSetIndexMap(s, int64(bsbMapOff))
+		t.BsbMapping, err = ParseDeltaSetIndexMap(s, int64(bsbMapOff))
+		if err != nil {
+			return nil, err
+		}
 	}
 	if vorgMapOff != 0 {
-		t.VOrgMapping, _ = ParseDeltaSetIndexMap(s, int64(vorgMapOff))
+		t.VOrgMapping, err = ParseDeltaSetIndexMap(s, int64(vorgMapOff))
+		if err != nil {
+			return nil, err
+		}
 	}
 	return t, nil
 }
@@ -1227,8 +1370,14 @@ func ParseMVAR(s api.Stream) (*MVARTable, error) {
 	valueRecordSize, _ := readUint16(s, 6)
 	valueRecordCount, _ := readUint16(s, 8)
 	ivsOff, _ := readUint16(s, 10)
+	if valueRecordSize == 0 {
+		return nil, errors.New("MVAR value record size cannot be zero")
+	}
 	if valueRecordCount > 0 && valueRecordSize < 8 {
 		return nil, errors.New("MVAR value record size too small")
+	}
+	if valueRecordCount > 0 && ivsOff == 0 {
+		return nil, errors.New("MVAR item variation store offset missing")
 	}
 	recordsEnd := int64(12) + int64(valueRecordCount)*int64(valueRecordSize)
 	if recordsEnd > s.Size() {
@@ -1245,6 +1394,9 @@ func ParseMVAR(s api.Stream) (*MVARTable, error) {
 		t.ValueRecords[i].ValueTag, _ = readUint32(s, off)
 		t.ValueRecords[i].DeltaSetOuterIndex, _ = readUint16(s, off+4)
 		t.ValueRecords[i].DeltaSetInnerIndex, _ = readUint16(s, off+6)
+		if i > 0 && t.ValueRecords[i].ValueTag <= t.ValueRecords[i-1].ValueTag {
+			return nil, errors.New("MVAR value records out of order")
+		}
 	}
 	if ivsOff != 0 {
 		if int64(ivsOff) >= s.Size() {
@@ -1291,6 +1443,29 @@ func (t *MVARTable) ApplyMetricDelta(valueTag uint32, value int32, coords []floa
 }
 
 // Helpers
+
+func metricDeltaSetIndex(glyphIndex int, m *DeltaSetIndexMap, implicit bool) (int, int, bool) {
+	if glyphIndex < 0 {
+		return 0, 0, false
+	}
+	var index uint32
+	if m == nil {
+		if !implicit {
+			return 0, 0, false
+		}
+		index = uint32(glyphIndex)
+	} else {
+		if len(m.Indices) == 0 {
+			return 0, 0, false
+		}
+		if glyphIndex >= len(m.Indices) {
+			index = m.Indices[len(m.Indices)-1]
+		} else {
+			index = m.Indices[glyphIndex]
+		}
+	}
+	return int(index >> 16), int(index & 0xFFFF), true
+}
 
 func calculateTupleScalar(peak, start, end []float32, coords []float32) float32 {
 	if peak == nil {
@@ -1349,6 +1524,47 @@ func readF2Dot14Tuple(s api.Stream, offset int64, axisCount int) ([]float32, int
 		offset += 2
 	}
 	return tuple, offset, nil
+}
+
+func hasRange(s api.Stream, offset, length int64) bool {
+	if offset < 0 || length < 0 {
+		return false
+	}
+	size := s.Size()
+	return offset <= size && length <= size-offset
+}
+
+func maxInt() int {
+	return int(^uint(0) >> 1)
+}
+
+func validateVariationRegion(region VariationRegion) error {
+	if region.StartCoord < -1 || region.StartCoord > 1 || region.PeakCoord < -1 || region.PeakCoord > 1 || region.EndCoord < -1 || region.EndCoord > 1 {
+		return errors.New("coordinates out of normalized range")
+	}
+	if region.StartCoord > region.PeakCoord || region.PeakCoord > region.EndCoord {
+		return errors.New("coordinates are not ordered")
+	}
+	if region.PeakCoord == 0 {
+		if region.StartCoord > 0 || region.EndCoord < 0 {
+			return errors.New("zero peak must span zero")
+		}
+		return nil
+	}
+	if (region.StartCoord < 0 || region.PeakCoord < 0 || region.EndCoord < 0) &&
+		(region.StartCoord > 0 || region.PeakCoord > 0 || region.EndCoord > 0) {
+		return errors.New("coordinates must be all non-positive or all non-negative")
+	}
+	return nil
+}
+
+func itemVariationDeltaRowSize(regionIndexCount, wordDeltaCount uint16, longWords bool) int64 {
+	wordCount := int64(wordDeltaCount)
+	shortCount := int64(regionIndexCount - wordDeltaCount)
+	if longWords {
+		return wordCount*4 + shortCount*2
+	}
+	return wordCount*2 + shortCount
 }
 
 func f2Dot14ToFloat(v int16) float32 {

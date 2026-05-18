@@ -1,0 +1,9 @@
+{
+  "description": "Outline and metrics request for ASCII glyphs. Supply the font with CONFORMANCE_FONT or -font.",
+  "corpus": "ascii-outline",
+  "ppem": ["12", "16", "24"],
+  "glyphs": [0],
+  "chars": ["U+0020", "U+0030", "U+0041", "U+0061"],
+  "load_flags": ["default", "no-hinting", "no-hinting+target-light", "no-bitmap"],
+  "render_mode": "none"
+}

@@ -84,7 +84,9 @@ func (s *Stroker) Stroke(outline api.Outline, radius int32) (*Outline, error) {
 		return &Outline{}, nil
 	}
 
-	s.radius = radius
+	if radius > 0 {
+		s.radius = radius
+	}
 	points := outline.GetPoints()
 	contours := outline.GetContours()
 
@@ -365,10 +367,23 @@ func (s *Stroker) strokeContour(points []api.Vector, result *Outline) {
 		seg := segments[i]
 		offX, offY := int32(seg.nx*r), int32(seg.ny*r)
 
-		lp1 := api.Vector{X: seg.p1.X + offX, Y: seg.p1.Y + offY}
-		lp2 := api.Vector{X: seg.p2.X + offX, Y: seg.p2.Y + offY}
-		rp1 := api.Vector{X: seg.p1.X - offX, Y: seg.p1.Y - offY}
-		rp2 := api.Vector{X: seg.p2.X - offX, Y: seg.p2.Y - offY}
+		p1, p2 := seg.p1, seg.p2
+		if !isClosed && s.lineCap == LineCapSquare {
+			tx, ty := seg.ny, -seg.nx
+			if i == 0 {
+				p1.X -= int32(tx * r)
+				p1.Y -= int32(ty * r)
+			}
+			if i == len(segments)-1 {
+				p2.X += int32(tx * r)
+				p2.Y += int32(ty * r)
+			}
+		}
+
+		lp1 := api.Vector{X: p1.X + offX, Y: p1.Y + offY}
+		lp2 := api.Vector{X: p2.X + offX, Y: p2.Y + offY}
+		rp1 := api.Vector{X: p1.X - offX, Y: p1.Y - offY}
+		rp2 := api.Vector{X: p2.X - offX, Y: p2.Y - offY}
 
 		if i > 0 {
 			prev := segments[i-1]
@@ -414,6 +429,9 @@ func (s *Stroker) addJoin(pts *[]api.Vector, p api.Vector, nx1, ny1, nx2, ny2 fl
 	switch s.lineJoin {
 	case LineJoinBevel:
 	case LineJoinMiter:
+		if mp, ok := miterPoint(p, nx1, ny1, nx2, ny2, r, s.miterLimit); ok {
+			*pts = append(*pts, mp)
+		}
 	case LineJoinRound:
 		numSteps := 3
 		angle1 := math.Atan2(ny1, nx1)
@@ -434,6 +452,27 @@ func (s *Stroker) addJoin(pts *[]api.Vector, p api.Vector, nx1, ny1, nx2, ny2 fl
 			})
 		}
 	}
+}
+
+func miterPoint(p api.Vector, nx1, ny1, nx2, ny2, radius, miterLimit float64) (api.Vector, bool) {
+	tx1, ty1 := ny1, -nx1
+	tx2, ty2 := ny2, -nx2
+	x1 := float64(p.X) + nx1*radius
+	y1 := float64(p.Y) + ny1*radius
+	x2 := float64(p.X) + nx2*radius
+	y2 := float64(p.Y) + ny2*radius
+
+	denom := tx1*ty2 - ty1*tx2
+	if math.Abs(denom) < 1e-9 {
+		return api.Vector{}, false
+	}
+	t := ((x2-x1)*ty2 - (y2-y1)*tx2) / denom
+	mx := x1 + t*tx1
+	my := y1 + t*ty1
+	if math.Hypot(mx-float64(p.X), my-float64(p.Y)) > radius*miterLimit {
+		return api.Vector{}, false
+	}
+	return api.Vector{X: int32(math.Round(mx)), Y: int32(math.Round(my))}, true
 }
 
 func (s *Stroker) addCap(leftPts, rightPts *[]api.Vector, p api.Vector, nx, ny float64, start bool) {

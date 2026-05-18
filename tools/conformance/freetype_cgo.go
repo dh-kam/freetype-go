@@ -138,6 +138,7 @@ import "C"
 
 import (
 	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"unsafe"
 
@@ -190,7 +191,7 @@ func buildFreeTypeDump(opts dumpOptions) (*Dump, error) {
 					continue
 				}
 				for _, sel := range selections {
-					sizeDump.Glyphs = append(sizeDump.Glyphs, dumpFreeTypeGlyph(face, sel, loadFlags, renderMode))
+					sizeDump.Glyphs = append(sizeDump.Glyphs, dumpFreeTypeGlyph(face, sel, loadFlags, renderMode, opts.IncludeBitmapBuffer))
 				}
 				dump.Sizes = append(dump.Sizes, sizeDump)
 			}
@@ -240,7 +241,7 @@ func resolveFreeTypeSelections(face C.FT_Face, opts dumpOptions) ([]glyphSelecti
 	return selections, charmap
 }
 
-func dumpFreeTypeGlyph(face C.FT_Face, sel glyphSelection, loadFlags loadFlagSpec, renderMode renderModeSpec) GlyphRecord {
+func dumpFreeTypeGlyph(face C.FT_Face, sel glyphSelection, loadFlags loadFlagSpec, renderMode renderModeSpec, includeBitmapBuffer bool) GlyphRecord {
 	record := GlyphRecord{
 		GlyphIndex: sel.GlyphIndex,
 		Chars:      sel.Chars,
@@ -271,7 +272,7 @@ func dumpFreeTypeGlyph(face C.FT_Face, sel glyphSelection, loadFlags loadFlagSpe
 		}
 	}
 	record.RenderedFormat = freeTypeGlyphFormatName(face)
-	record.Bitmap = dumpFreeTypeBitmap(face)
+	record.Bitmap = dumpFreeTypeBitmap(face, includeBitmapBuffer)
 	if record.RenderError != "" && !record.Bitmap.Available {
 		record.Bitmap.Error = record.RenderError
 	}
@@ -324,7 +325,7 @@ func dumpFreeTypeOutline(face C.FT_Face) OutlineRecord {
 	}
 }
 
-func dumpFreeTypeBitmap(face C.FT_Face) BitmapRecord {
+func dumpFreeTypeBitmap(face C.FT_Face, includeBuffer bool) BitmapRecord {
 	rows := int(C.ftgo_bitmap_rows(face))
 	width := int(C.ftgo_bitmap_width(face))
 	pitch := int(C.ftgo_bitmap_pitch(face))
@@ -341,7 +342,7 @@ func dumpFreeTypeBitmap(face C.FT_Face) BitmapRecord {
 	data := C.GoBytes(unsafe.Pointer(buffer), C.int(size))
 	sum := sha256.Sum256(data)
 	pixelMode := uint8(C.ftgo_bitmap_pixel_mode(face))
-	return BitmapRecord{
+	record := BitmapRecord{
 		Available:     true,
 		Rows:          rows,
 		Width:         width,
@@ -353,6 +354,10 @@ func dumpFreeTypeBitmap(face C.FT_Face) BitmapRecord {
 		BufferSize:    len(data),
 		SHA256:        fmt.Sprintf("%x", sum),
 	}
+	if includeBuffer {
+		record.BufferHex = hex.EncodeToString(data)
+	}
+	return record
 }
 
 func freeTypeGlyphFormatName(face C.FT_Face) string {

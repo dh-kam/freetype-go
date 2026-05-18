@@ -64,3 +64,39 @@ func TestRenderModeValuesAreStable(t *testing.T) {
 		}
 	}
 }
+
+type placementBitmap struct{}
+
+func (placementBitmap) GetRows() int            { return 0 }
+func (placementBitmap) GetWidth() int           { return 0 }
+func (placementBitmap) GetPitch() int           { return 0 }
+func (placementBitmap) GetBuffer() []byte       { return nil }
+func (placementBitmap) GetPixelMode() uint8     { return MODE_NONE }
+func (placementBitmap) SetPixelMode(mode uint8) {}
+func (placementBitmap) GetLeft() int            { return -3 }
+func (placementBitmap) GetTop() int             { return 9 }
+
+func TestGetBitmapPlacementUsesOptionalProvider(t *testing.T) {
+	left, top, ok := GetBitmapPlacement(placementBitmap{})
+	if !ok || left != -3 || top != 9 {
+		t.Fatalf("placement = %d,%d ok=%v, want -3,9 true", left, top, ok)
+	}
+}
+
+func TestGetBitmapPlacementMissingProvider(t *testing.T) {
+	if _, _, ok := GetBitmapPlacement(nil); ok {
+		t.Fatal("nil bitmap returned placement")
+	}
+	if _, _, ok := GetBitmapPlacement(bitmapWithoutPlacement{}); ok {
+		t.Fatal("bitmap without placement provider returned placement")
+	}
+}
+
+type bitmapWithoutPlacement struct{}
+
+func (bitmapWithoutPlacement) GetRows() int            { return 0 }
+func (bitmapWithoutPlacement) GetWidth() int           { return 0 }
+func (bitmapWithoutPlacement) GetPitch() int           { return 0 }
+func (bitmapWithoutPlacement) GetBuffer() []byte       { return nil }
+func (bitmapWithoutPlacement) GetPixelMode() uint8     { return MODE_NONE }
+func (bitmapWithoutPlacement) SetPixelMode(mode uint8) {}

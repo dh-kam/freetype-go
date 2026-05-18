@@ -16,7 +16,7 @@ func ParseDict(data []byte) (map[int][]float64, error) {
 		b0 := data[i]
 		i++
 
-		if b0 <= 21 {
+		if b0 <= 24 {
 			// Operator
 			var op int
 			if b0 == 12 {

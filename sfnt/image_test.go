@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/dh-kam/freetype-go/api"
+	"github.com/dh-kam/freetype-go/color"
 	"github.com/dh-kam/freetype-go/core"
 )
 
@@ -342,5 +343,54 @@ func TestCBLCCBDTIndexFormat5SparseConstantMetrics(t *testing.T) {
 	}
 	if string(got) != "VWXYZ" {
 		t.Fatalf("unexpected image data: %q", got)
+	}
+}
+
+func TestFaceGetColorLayersForPalette(t *testing.T) {
+	face := &Face{
+		colr: &color.COLR{
+			BaseGlyphRecords: map[uint16]color.BaseGlyphRecord{
+				7: {GlyphID: 7, FirstLayerIndex: 1, NumLayers: 2},
+			},
+			LayerRecords: []color.LayerRecord{
+				{GlyphID: 99, PaletteIndex: 0},
+				{GlyphID: 10, PaletteIndex: 1},
+				{GlyphID: 11, PaletteIndex: 0xffff},
+			},
+		},
+		cpal: &color.CPAL{
+			NumPaletteEntries: 2,
+			NumPalettes:       2,
+			PaletteOffsets:    []uint16{0, 2},
+			ColorRecords: []color.RGBA{
+				{R: 1, G: 2, B: 3, A: 4},
+				{R: 5, G: 6, B: 7, A: 8},
+				{R: 9, G: 10, B: 11, A: 12},
+				{R: 13, G: 14, B: 15, A: 16},
+			},
+		},
+	}
+
+	layers, err := face.GetColorLayersForPalette(7, 1)
+	if err != nil {
+		t.Fatalf("GetColorLayersForPalette failed: %v", err)
+	}
+	if len(layers) != 2 {
+		t.Fatalf("expected 2 layers, got %d", len(layers))
+	}
+	if layers[0].GlyphID != 10 || layers[0].Color != (color.RGBA{R: 13, G: 14, B: 15, A: 16}) {
+		t.Fatalf("unexpected palette layer: %+v", layers[0])
+	}
+	if layers[1].GlyphID != 11 || layers[1].Color != (color.RGBA{R: 0, G: 0, B: 0, A: 255}) {
+		t.Fatalf("unexpected foreground fallback layer: %+v", layers[1])
+	}
+
+	face.cpal = nil
+	layers, err = face.GetColorLayers(7)
+	if err != nil {
+		t.Fatalf("GetColorLayers with nil CPAL failed: %v", err)
+	}
+	if layers[0].Color != (color.RGBA{R: 0, G: 0, B: 0, A: 255}) {
+		t.Fatalf("expected nil CPAL fallback color, got %+v", layers[0].Color)
 	}
 }

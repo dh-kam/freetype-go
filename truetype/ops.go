@@ -8,6 +8,11 @@ import (
 	ftmath "github.com/dh-kam/freetype-go/math"
 )
 
+const (
+	outlineTagTouchX = 0x08
+	outlineTagTouchY = 0x10
+)
+
 // push adds a value to the stack.
 func (e *ExecutionEnv) push(val int32) error {
 	if e.StackTop >= len(e.Stack) {
@@ -87,17 +92,25 @@ func (e *ExecutionEnv) skip(allowElse bool) error {
 
 // project returns the projection of a point onto the ProjVector.
 func (e *ExecutionEnv) project(p api.Vector) int32 {
-	res := (int64(p.X)*int64(e.GS.ProjVector.X) + int64(p.Y)*int64(e.GS.ProjVector.Y) + 0x2000) >> 14
-	return int32(res)
+	return projectWithVector(p, e.GS.ProjVector)
+}
+
+func (e *ExecutionEnv) dualProject(p api.Vector) int32 {
+	return projectWithVector(p, e.GS.DualVector)
+}
+
+func projectWithVector(p api.Vector, v api.Vector) int32 {
+	dot := int64(p.X)*int64(v.X) + int64(p.Y)*int64(v.Y)
+	return int32(divRound(dot, 0x4000))
 }
 
 // move moves a point by a distance along the FreeVector.
 func (e *ExecutionEnv) move(p *api.Vector, distance int32) {
-	if e.GS.FreeVector.X != 0 {
-		p.X += int32((int64(distance)*int64(e.GS.FreeVector.X) + 0x2000) >> 14)
+	if e.GS.FreeVector.X != 0 && !e.backwardSuppressesXMove() {
+		p.X += int32(divRound(int64(distance)*int64(e.GS.FreeVector.X), 0x4000))
 	}
-	if e.GS.FreeVector.Y != 0 {
-		p.Y += int32((int64(distance)*int64(e.GS.FreeVector.Y) + 0x2000) >> 14)
+	if e.GS.FreeVector.Y != 0 && !e.backwardSuppressesYMove() {
+		p.Y += int32(divRound(int64(distance)*int64(e.GS.FreeVector.Y), 0x4000))
 	}
 }
 
@@ -105,7 +118,20 @@ func (e *ExecutionEnv) getProjectedDistance(p1, p2 api.Vector) int32 {
 	return e.project(p2) - e.project(p1)
 }
 
+func (e *ExecutionEnv) getDualProjectedDistance(p1, p2 api.Vector) int32 {
+	return e.dualProject(p2) - e.dualProject(p1)
+}
+
+func (e *ExecutionEnv) pointAlongFreedom(base api.Vector, distance int32) api.Vector {
+	p := base
+	e.move(&p, distance)
+	return p
+}
+
 func (e *ExecutionEnv) moveProjected(p *api.Vector, distance int32) error {
+	if e.backwardSuppressesAllMove() {
+		return nil
+	}
 	denom := int64(e.GS.FreeVector.X)*int64(e.GS.ProjVector.X) + int64(e.GS.FreeVector.Y)*int64(e.GS.ProjVector.Y)
 	if denom == 0 {
 		return fmt.Errorf("freedom vector is perpendicular to projection vector")
@@ -117,6 +143,23 @@ func (e *ExecutionEnv) moveProjected(p *api.Vector, distance int32) error {
 	}
 	e.move(p, int32(freeDistance))
 	return nil
+}
+
+func (e *ExecutionEnv) backwardSuppressesXMove() bool {
+	return e.GS.BackwardCompatibility && e.GS.FreeVector.X != 0
+}
+
+func (e *ExecutionEnv) backwardSuppressesYMove() bool {
+	return e.GS.BackwardCompatibility && e.GS.FreeVector.Y != 0 && e.iupXCalled && e.iupYCalled
+}
+
+func (e *ExecutionEnv) backwardSuppressesAllMove() bool {
+	if !e.GS.BackwardCompatibility {
+		return false
+	}
+	xSuppressed := e.GS.FreeVector.X == 0 || e.backwardSuppressesXMove()
+	ySuppressed := e.GS.FreeVector.Y == 0 || e.backwardSuppressesYMove()
+	return xSuppressed && ySuppressed
 }
 
 func divRound(num, den int64) int64 {
@@ -216,6 +259,72 @@ func abs32(v int32) int32 {
 	return v
 }
 
+func (z *Zone) hasUnscaledOriginalPoint(idx int) bool {
+	return z != nil && idx >= 0 && idx < len(z.UnscaledOriginalPoints)
+}
+
+func (z *Zone) originalInterpolationPoints() []api.Vector {
+	if z != nil && len(z.UnscaledOriginalPoints) >= len(z.OriginalPoints) {
+		return z.UnscaledOriginalPoints
+	}
+	if z == nil {
+		return nil
+	}
+	return z.OriginalPoints
+}
+
+func axisCoord(points []api.Vector, idx, axis int) int32 {
+	if axis == 0 {
+		return points[idx].Y
+	}
+	return points[idx].X
+}
+
+func setAxisCoord(points []api.Vector, idx, axis int, value int32) {
+	if axis == 0 {
+		points[idx].Y = value
+		return
+	}
+	points[idx].X = value
+}
+
+func (e *ExecutionEnv) dualProjectUnscaledDistance(baseZone *Zone, baseIdx int, pointZone *Zone, pointIdx int, scale bool) int32 {
+	if baseZone == nil || pointZone == nil {
+		return 0
+	}
+	if !baseZone.hasUnscaledOriginalPoint(baseIdx) || !pointZone.hasUnscaledOriginalPoint(pointIdx) {
+		return e.getDualProjectedDistance(baseZone.OriginalPoints[baseIdx], pointZone.OriginalPoints[pointIdx])
+	}
+	delta := api.Vector{
+		X: pointZone.UnscaledOriginalPoints[pointIdx].X - baseZone.UnscaledOriginalPoints[baseIdx].X,
+		Y: pointZone.UnscaledOriginalPoints[pointIdx].Y - baseZone.UnscaledOriginalPoints[baseIdx].Y,
+	}
+	if !scale {
+		return projectWithVector(delta, e.GS.DualVector)
+	}
+	if e.XScale == e.YScale {
+		return scaleUnscaledFUnit(projectWithVector(delta, e.GS.DualVector), e.XScale)
+	}
+	delta.X = scaleUnscaledFUnit(delta.X, e.XScale)
+	delta.Y = scaleUnscaledFUnit(delta.Y, e.YScale)
+	return projectWithVector(delta, e.GS.DualVector)
+}
+
+func scaleUnscaledFUnit(value, scale int32) int32 {
+	return ftmath.MulFix(value<<6, scale)
+}
+
+func (e *ExecutionEnv) dualProjectHintDistance(baseZone *Zone, baseIdx int, pointZone *Zone, pointIdx int) int32 {
+	return e.dualProjectUnscaledDistance(baseZone, baseIdx, pointZone, pointIdx, true)
+}
+
+func (e *ExecutionEnv) dualProjectIPDistance(baseZone *Zone, baseIdx int, pointZone *Zone, pointIdx int, twilight bool) int32 {
+	if twilight {
+		return e.getDualProjectedDistance(baseZone.OriginalPoints[baseIdx], pointZone.OriginalPoints[pointIdx])
+	}
+	return e.dualProjectUnscaledDistance(baseZone, baseIdx, pointZone, pointIdx, e.XScale != e.YScale)
+}
+
 func (e *ExecutionEnv) shiftReference(opcode byte) (int, int, int32, error) {
 	refZoneIdx := e.ZP1
 	refIdx := e.RP2
@@ -227,8 +336,12 @@ func (e *ExecutionEnv) shiftReference(opcode byte) (int, int, int32, error) {
 	if refIdx < 0 || refIdx >= len(refZone.Points) || refIdx >= len(refZone.OriginalPoints) {
 		return 0, 0, 0, fmt.Errorf("reference point out of bounds: %d", refIdx)
 	}
-	shift := e.project(refZone.Points[refIdx]) - e.project(refZone.OriginalPoints[refIdx])
+	shift := e.referencePointShift(refZone, refIdx)
 	return refZoneIdx, refIdx, shift, nil
+}
+
+func (e *ExecutionEnv) referencePointShift(refZone *Zone, refIdx int) int32 {
+	return e.project(refZone.Points[refIdx]) - e.dualProject(refZone.OriginalPoints[refIdx])
 }
 
 func contourBounds(zone *Zone, contour int32) (int, int, error) {
@@ -393,8 +506,12 @@ func (e *ExecutionEnv) applySingleWidthDistance(distance int32, useOriginalBand 
 		return distance
 	}
 	width := int32(e.GS.SingleWidthValue)
+	magnitude := distance
+	if magnitude < 0 {
+		magnitude = -magnitude
+	}
 	if useOriginalBand {
-		if distance < width+cutIn && distance > width-cutIn {
+		if magnitude < width+cutIn && magnitude > width-cutIn {
 			if distance >= 0 {
 				return width
 			}
@@ -402,7 +519,7 @@ func (e *ExecutionEnv) applySingleWidthDistance(distance int32, useOriginalBand 
 		}
 		return distance
 	}
-	if abs32(distance-width) < cutIn {
+	if abs32(magnitude-width) < cutIn {
 		if distance >= 0 {
 			return width
 		}
@@ -477,9 +594,15 @@ func (e *ExecutionEnv) touch(pIdx int, axis int, zoneIdx int) {
 		if pIdx >= 0 && pIdx < len(zone.TouchedY) {
 			zone.TouchedY[pIdx] = true
 		}
+		if pIdx >= 0 && pIdx < len(zone.Tags) {
+			zone.Tags[pIdx] |= outlineTagTouchY
+		}
 	} else { // x
 		if pIdx >= 0 && pIdx < len(zone.TouchedX) {
 			zone.TouchedX[pIdx] = true
+		}
+		if pIdx >= 0 && pIdx < len(zone.Tags) {
+			zone.Tags[pIdx] |= outlineTagTouchX
 		}
 	}
 }
@@ -499,9 +622,15 @@ func (e *ExecutionEnv) untouch(pIdx int, axis int, zoneIdx int) {
 		if pIdx >= 0 && pIdx < len(zone.TouchedY) {
 			zone.TouchedY[pIdx] = false
 		}
+		if pIdx >= 0 && pIdx < len(zone.Tags) {
+			zone.Tags[pIdx] &^= outlineTagTouchY
+		}
 	} else { // x
 		if pIdx >= 0 && pIdx < len(zone.TouchedX) {
 			zone.TouchedX[pIdx] = false
+		}
+		if pIdx >= 0 && pIdx < len(zone.Tags) {
+			zone.Tags[pIdx] &^= outlineTagTouchX
 		}
 	}
 }
@@ -582,123 +711,197 @@ func (e *ExecutionEnv) interpolateContour(first, last int, axis int, zone *Zone)
 		return
 	}
 
-	firstTouched := touched[0]
-	lastTouched := touched[len(touched)-1]
-
-	if axis == 0 { // Y
-		_ = zone.Points[last]
-		_ = zone.OriginalPoints[last]
-		shiftFirst := zone.Points[firstTouched].Y - zone.OriginalPoints[firstTouched].Y
-		for i := first; i < firstTouched; i++ {
-			zone.Points[i].Y = zone.OriginalPoints[i].Y + shiftFirst
-		}
-		shiftLast := zone.Points[lastTouched].Y - zone.OriginalPoints[lastTouched].Y
-		for i := lastTouched + 1; i <= last; i++ {
-			zone.Points[i].Y = zone.OriginalPoints[i].Y + shiftLast
-		}
-	} else { // X
-		_ = zone.Points[last]
-		_ = zone.OriginalPoints[last]
-		shiftFirst := zone.Points[firstTouched].X - zone.OriginalPoints[firstTouched].X
-		for i := first; i < firstTouched; i++ {
-			zone.Points[i].X = zone.OriginalPoints[i].X + shiftFirst
-		}
-		shiftLast := zone.Points[lastTouched].X - zone.OriginalPoints[lastTouched].X
-		for i := lastTouched + 1; i <= last; i++ {
-			zone.Points[i].X = zone.OriginalPoints[i].X + shiftLast
-		}
+	for i := 0; i < len(touched)-1; i++ {
+		e.interpolateUntouchedRange(touched[i]+1, touched[i+1]-1, touched[i], touched[i+1], axis, zone)
 	}
 
-	for i := 0; i < len(touched)-1; i++ {
-		p1 := touched[i]
-		p2 := touched[i+1]
+	firstTouched := touched[0]
+	lastTouched := touched[len(touched)-1]
+	e.interpolateUntouchedRange(lastTouched+1, last, lastTouched, firstTouched, axis, zone)
+	e.interpolateUntouchedRange(first, firstTouched-1, lastTouched, firstTouched, axis, zone)
+}
 
-		if p2 <= p1+1 {
-			continue
+func (e *ExecutionEnv) interpolateUntouchedRange(first, last, ref1, ref2, axis int, zone *Zone) {
+	if first > last {
+		return
+	}
+
+	orus := zone.originalInterpolationPoints()
+	orus1 := axisCoord(orus, ref1, axis)
+	orus2 := axisCoord(orus, ref2, axis)
+	if orus1 > orus2 {
+		orus1, orus2 = orus2, orus1
+		ref1, ref2 = ref2, ref1
+	}
+
+	org1 := axisCoord(zone.OriginalPoints, ref1, axis)
+	org2 := axisCoord(zone.OriginalPoints, ref2, axis)
+	cur1 := axisCoord(zone.Points, ref1, axis)
+	cur2 := axisCoord(zone.Points, ref2, axis)
+	delta1 := cur1 - org1
+	delta2 := cur2 - org2
+	var scale int32
+	scaleValid := false
+
+	for i := first; i <= last; i++ {
+		orig := axisCoord(zone.OriginalPoints, i, axis)
+
+		var next int32
+		switch {
+		case orig <= org1:
+			next = orig + delta1
+		case orig >= org2:
+			next = orig + delta2
+		case cur1 == cur2 || orus1 == orus2:
+			next = cur1
+		default:
+			if !scaleValid {
+				scale = ftmath.DivFix(cur2-cur1, orus2-orus1)
+				scaleValid = true
+			}
+			next = cur1 + ftmath.MulFix(axisCoord(orus, i, axis)-orus1, scale)
 		}
 
-		if axis == 0 { // Y
-			_ = zone.Points[p2-1]
-			_ = zone.OriginalPoints[p2-1]
-			orig1 := zone.OriginalPoints[p1].Y
-			orig2 := zone.OriginalPoints[p2].Y
-			cur1 := zone.Points[p1].Y
-			cur2 := zone.Points[p2].Y
-
-			if orig1 == orig2 {
-				for j := p1 + 1; j < p2; j++ {
-					zone.Points[j].Y = cur1
-				}
-			} else {
-				for j := p1 + 1; j < p2; j++ {
-					origJ := zone.OriginalPoints[j].Y
-					ratio := int64(origJ-orig1) * int64(cur2-cur1)
-					zone.Points[j].Y = cur1 + int32(ratio/int64(orig2-orig1))
-				}
-			}
-		} else { // X
-			_ = zone.Points[p2-1]
-			_ = zone.OriginalPoints[p2-1]
-			orig1 := zone.OriginalPoints[p1].X
-			orig2 := zone.OriginalPoints[p2].X
-			cur1 := zone.Points[p1].X
-			cur2 := zone.Points[p2].X
-
-			if orig1 == orig2 {
-				for j := p1 + 1; j < p2; j++ {
-					zone.Points[j].X = cur1
-				}
-			} else {
-				for j := p1 + 1; j < p2; j++ {
-					origJ := zone.OriginalPoints[j].X
-					ratio := int64(origJ-orig1) * int64(cur2-cur1)
-					zone.Points[j].X = cur1 + int32(ratio/int64(orig2-orig1))
-				}
-			}
-		}
+		setAxisCoord(zone.Points, i, axis, next)
 	}
 }
 
 // round rounds a 26.6 value according to the current RoundState.
 func (e *ExecutionEnv) round(value int32) int32 {
+	return e.roundWithCompensation(value, 0)
+}
+
+func (e *ExecutionEnv) roundWithCompensation(value, compensation int32) int32 {
 	switch e.GS.RoundState {
 	case 0: // Round to Half Grid
 		if value >= 0 {
-			return (value & ^63) + 32
-		} else {
-			return -((-value & ^63) + 32)
+			rounded := ((value + compensation) & ^63) + 32
+			if rounded < 0 {
+				return 32
+			}
+			return rounded
 		}
+		rounded := -(((compensation - value) & ^63) + 32)
+		if rounded > 0 {
+			return -32
+		}
+		return rounded
 	case 1: // Round to Grid
 		if value >= 0 {
-			return (value + 32) & ^63
-		} else {
-			return -((-value + 32) & ^63)
+			rounded := (value + compensation + 32) & ^63
+			if rounded < 0 {
+				return 0
+			}
+			return rounded
 		}
+		rounded := -((compensation - value + 32) & ^63)
+		if rounded > 0 {
+			return 0
+		}
+		return rounded
 	case 2: // Round to Double Grid
 		if value >= 0 {
-			return (value + 16) & ^31
-		} else {
-			return -((-value + 16) & ^31)
+			rounded := (value + compensation + 16) & ^31
+			if rounded < 0 {
+				return 0
+			}
+			return rounded
 		}
+		rounded := -((compensation - value + 16) & ^31)
+		if rounded > 0 {
+			return 0
+		}
+		return rounded
 	case 3: // Round Up To Grid
 		if value >= 0 {
-			return (value + 63) & ^63
+			rounded := (value + compensation + 63) & ^63
+			if rounded < 0 {
+				return 0
+			}
+			return rounded
 		}
-		return -((-value + 63) & ^63)
+		rounded := -((compensation - value + 63) & ^63)
+		if rounded > 0 {
+			return 0
+		}
+		return rounded
 	case 4: // Round Down To Grid
 		if value >= 0 {
-			return value & ^63
+			rounded := (value + compensation) & ^63
+			if rounded < 0 {
+				return 0
+			}
+			return rounded
 		}
-		return -((-value) & ^63)
+		rounded := -((compensation - value) & ^63)
+		if rounded > 0 {
+			return 0
+		}
+		return rounded
 	case 5: // Round Off
-		return value
+		return compensateDistance(value, compensation)
 	case 6: // Super Round
-		return e.roundSuper(value, false)
+		return e.roundSuperWithCompensation(value, compensation, false)
 	case 7: // Super Round 45 degrees
-		return e.roundSuper(value, true)
+		return e.roundSuperWithCompensation(value, compensation, true)
 	default:
 		return value
 	}
+}
+
+func compensateDistance(value, compensation int32) int32 {
+	if value >= 0 {
+		next := value + compensation
+		if next < 0 {
+			return 0
+		}
+		return next
+	}
+	next := value - compensation
+	if next > 0 {
+		return 0
+	}
+	return next
+}
+
+func (e *ExecutionEnv) roundSuperWithCompensation(value, compensation int32, useDivision bool) int32 {
+	period := e.GS.SuperRoundPeriod
+	if period <= 0 {
+		return value
+	}
+	phase := e.GS.SuperRoundPhase
+	threshold := e.GS.SuperRoundThreshold
+	if value >= 0 {
+		base := value + threshold - phase + compensation
+		var rounded int32
+		if useDivision {
+			rounded = (base / period) * period
+		} else {
+			rounded = base & -period
+		}
+		rounded += phase
+		if rounded < 0 {
+			return phase
+		}
+		return rounded
+	}
+
+	base := threshold - phase + compensation - value
+	var rounded int32
+	if useDivision {
+		rounded = -((base / period) * period)
+	} else {
+		rounded = -(base & -period)
+	}
+	rounded -= phase
+	if rounded > 0 {
+		return -phase
+	}
+	return rounded
+}
+
+func (e *ExecutionEnv) engineCompensation(opcode byte) int32 {
+	return int32(e.GS.Compensations[opcode&0x03])
 }
 
 // Step executes a single opcode and updates the instruction pointer.
@@ -714,6 +917,7 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 		}
 		e.GS.ProjVector = vec
 		e.GS.FreeVector = vec
+		e.GS.DualVector = vec
 		e.IP++
 
 	case opcode == 0x02 || opcode == 0x03: // SPVTCA[y], SPVTCA[x]
@@ -723,6 +927,7 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 		} else { // x
 			e.GS.ProjVector = api.Vector{X: 0x4000, Y: 0}
 		}
+		e.GS.DualVector = e.GS.ProjVector
 		e.IP++
 
 	case opcode == 0x04 || opcode == 0x05: // SFVTCA[y], SFVTCA[x]
@@ -1173,7 +1378,7 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 			if pIdx < 0 || int(pIdx) >= len(zone.OriginalPoints) {
 				return fmt.Errorf("point index out of bounds in GC[1]: %d", pIdx)
 			}
-			if err := e.push(e.project(zone.OriginalPoints[pIdx])); err != nil {
+			if err := e.push(e.dualProject(zone.OriginalPoints[pIdx])); err != nil {
 				return err
 			}
 		}
@@ -1196,6 +1401,9 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 		if err := e.moveProjected(&zone.Points[pIdx], value-curDist); err != nil {
 			return err
 		}
+		if e.ZP2 == 0 && int(pIdx) < len(zone.OriginalPoints) {
+			zone.OriginalPoints[pIdx] = zone.Points[pIdx]
+		}
 		e.touchCurrent(int(pIdx), e.ZP2)
 		e.IP++
 
@@ -1215,7 +1423,12 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 			return fmt.Errorf("index out of bounds in MD[0]: p1=%d, p2=%d", p1Idx, p2Idx)
 		}
 
-		dist := e.getProjectedDistance(zone0.OriginalPoints[p2Idx], zone1.OriginalPoints[p1Idx])
+		var dist int32
+		if e.ZP0 == 0 || e.ZP1 == 0 {
+			dist = e.getDualProjectedDistance(zone0.OriginalPoints[p2Idx], zone1.OriginalPoints[p1Idx])
+		} else {
+			dist = e.dualProjectHintDistance(zone0, int(p2Idx), zone1, int(p1Idx))
+		}
 		e.push(dist)
 		e.IP++
 
@@ -1279,6 +1492,10 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 			return fmt.Errorf("point index out of bounds: %d", pIdx)
 		}
 		targetDist := e.CVT[cvtIdx]
+		if e.ZP0 == 0 {
+			zone.OriginalPoints[pIdx] = e.pointAlongFreedom(api.Vector{}, targetDist)
+			zone.Points[pIdx] = zone.OriginalPoints[pIdx]
+		}
 		originalDist := e.project(zone.OriginalPoints[pIdx])
 		if opcode&0x01 != 0 && abs32(targetDist-originalDist) > int32(e.GS.ControlValueCutIn) {
 			targetDist = originalDist
@@ -1313,13 +1530,20 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 			return fmt.Errorf("index out of bounds in MDRP: rp0=%d, p=%d", e.RP0, pIdx)
 		}
 
-		orgDist := e.getProjectedDistance(zone0.OriginalPoints[e.RP0], zone1.OriginalPoints[pIdx])
+		var orgDist int32
+		if e.ZP0 == 0 || e.ZP1 == 0 {
+			orgDist = e.getDualProjectedDistance(zone0.OriginalPoints[e.RP0], zone1.OriginalPoints[pIdx])
+		} else {
+			orgDist = e.dualProjectHintDistance(zone0, e.RP0, zone1, int(pIdx))
+		}
 		orgDist = e.applySingleWidthDistance(orgDist, true)
 		curDist := e.getProjectedDistance(zone0.Points[e.RP0], zone1.Points[pIdx])
 
 		targetDist := orgDist
 		if round {
-			targetDist = e.round(targetDist)
+			targetDist = e.roundWithCompensation(targetDist, e.engineCompensation(opcode))
+		} else {
+			targetDist = compensateDistance(targetDist, e.engineCompensation(opcode))
 		}
 		if minDist {
 			targetDist = applyMinimumDistanceForSign(targetDist, orgDist, e.GS.MinimumDistance)
@@ -1362,9 +1586,13 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 			return fmt.Errorf("index out of bounds in MIRP: rp0=%d, p=%d", e.RP0, pIdx)
 		}
 
-		orgDist := e.getProjectedDistance(zone0.OriginalPoints[e.RP0], zone1.OriginalPoints[pIdx])
 		targetDist := e.CVT[cvtIdx]
 		targetDist = e.applySingleWidthDistance(targetDist, false)
+		if e.ZP1 == 0 {
+			zone1.OriginalPoints[pIdx] = e.pointAlongFreedom(zone0.OriginalPoints[e.RP0], targetDist)
+			zone1.Points[pIdx] = zone1.OriginalPoints[pIdx]
+		}
+		orgDist := e.getDualProjectedDistance(zone0.OriginalPoints[e.RP0], zone1.OriginalPoints[pIdx])
 		if e.GS.AutoFlip && ((orgDist < 0 && targetDist > 0) || (orgDist > 0 && targetDist < 0)) {
 			targetDist = -targetDist
 		}
@@ -1372,7 +1600,9 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 			targetDist = orgDist
 		}
 		if round {
-			targetDist = e.round(targetDist)
+			targetDist = e.roundWithCompensation(targetDist, e.engineCompensation(opcode))
+		} else {
+			targetDist = compensateDistance(targetDist, e.engineCompensation(opcode))
 		}
 		if minDist {
 			targetDist = applyMinimumDistanceForSign(targetDist, orgDist, e.GS.MinimumDistance)
@@ -1497,7 +1727,7 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 		if refIdx < 0 || refIdx >= len(refZone.Points) || refIdx >= len(refZone.OriginalPoints) {
 			return fmt.Errorf("reference point out of bounds in SHP: %d", refIdx)
 		}
-		shift := e.project(refZone.Points[refIdx]) - e.project(refZone.OriginalPoints[refIdx])
+		shift := e.referencePointShift(refZone, refIdx)
 		zone := &e.Zones[e.ZP2]
 		for i := 0; i < int(e.GS.Loop); i++ {
 			pIdx, err := e.pop()
@@ -1593,26 +1823,26 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 		if err != nil {
 			return err
 		}
-		// If BackwardCompatibility is true and we're altering on the X-axis, skip SHPIX
-		// to prevent ruining subpixel rendering (ClearType/Infinality hack).
-		if e.GS.BackwardCompatibility && e.GS.FreeVector.X != 0 {
-			for i := 0; i < int(e.GS.Loop); i++ {
-				if _, err := e.pop(); err != nil {
-					return err
+		zone := &e.Zones[e.ZP2]
+		inTwilight := e.ZP0 == 0 || e.ZP1 == 0 || e.ZP2 == 0
+		for i := 0; i < int(e.GS.Loop); i++ {
+			pIdx, err := e.pop()
+			if err != nil {
+				return err
+			}
+			if pIdx < 0 || int(pIdx) >= len(zone.Points) {
+				continue
+			}
+			if e.GS.BackwardCompatibility {
+				if !inTwilight && (e.iupXCalled && e.iupYCalled ||
+					e.GS.FreeVector.Y == 0 ||
+					int(pIdx) >= len(zone.Tags) ||
+					zone.Tags[pIdx]&outlineTagTouchY == 0) {
+					continue
 				}
 			}
-		} else {
-			zone := &e.Zones[e.ZP2]
-			for i := 0; i < int(e.GS.Loop); i++ {
-				pIdx, err := e.pop()
-				if err != nil {
-					return err
-				}
-				if pIdx >= 0 && int(pIdx) < len(zone.Points) {
-					e.move(&zone.Points[pIdx], dist)
-					e.touchCurrent(int(pIdx), e.ZP2)
-				}
-			}
+			e.move(&zone.Points[pIdx], dist)
+			e.touchCurrent(int(pIdx), e.ZP2)
 		}
 		e.GS.Loop = 1
 		e.IP++
@@ -1630,6 +1860,10 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 		zone0 := &e.Zones[e.ZP0]
 		if e.RP0 < 0 || e.RP0 >= len(zone0.Points) || pIdx < 0 || int(pIdx) >= len(zone1.Points) {
 			return fmt.Errorf("index out of bounds in MSIRP: rp0=%d, p=%d", e.RP0, pIdx)
+		}
+		if e.ZP1 == 0 {
+			zone1.OriginalPoints[pIdx] = e.pointAlongFreedom(zone0.OriginalPoints[e.RP0], distance)
+			zone1.Points[pIdx] = zone1.OriginalPoints[pIdx]
 		}
 		curDist := e.getProjectedDistance(zone0.Points[e.RP0], zone1.Points[pIdx])
 		oldRP0 := e.RP0
@@ -1662,9 +1896,13 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 			if err != nil {
 				return err
 			}
-			// ClearType/Infinality hack for DELTAP
-			if e.GS.BackwardCompatibility && e.GS.FreeVector.X != 0 {
-				continue // Ignore delta on X-axis
+			if e.GS.BackwardCompatibility {
+				if e.iupXCalled && e.iupYCalled ||
+					e.GS.FreeVector.Y == 0 ||
+					int(pIdx) >= len(zone.Tags) ||
+					zone.Tags[pIdx]&outlineTagTouchY == 0 {
+					continue
+				}
 			}
 			amount, apply := e.deltaAmount(opcode, arg)
 			if !apply || amount == 0 || pIdx < 0 || int(pIdx) >= len(zone.Points) {
@@ -1701,6 +1939,16 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 		e.IP++
 
 	case opcode == 0x80: // FLIPPT
+		if e.GS.BackwardCompatibility && e.iupXCalled && e.iupYCalled {
+			for i := 0; i < int(e.GS.Loop); i++ {
+				if _, err := e.pop(); err != nil {
+					return err
+				}
+			}
+			e.GS.Loop = 1
+			e.IP++
+			break
+		}
 		zone := &e.Zones[e.ZP0]
 		for i := 0; i < int(e.GS.Loop); i++ {
 			pIdx, err := e.pop()
@@ -1726,6 +1974,10 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 		if err != nil {
 			return err
 		}
+		if e.GS.BackwardCompatibility && e.iupXCalled && e.iupYCalled {
+			e.IP++
+			break
+		}
 		zone := &e.Zones[e.ZP0]
 		if low < 0 || high < 0 || int(low) >= len(zone.Points) || int(high) >= len(zone.Points) {
 			return fmt.Errorf("point range out of bounds in FLIPRG: low=%d high=%d", low, high)
@@ -1745,39 +1997,39 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 		e.IP++
 
 	case opcode == 0x39: // IP
+		zone2 := &e.Zones[e.ZP2]
+		zone1 := &e.Zones[e.ZP1]
+		zone0 := &e.Zones[e.ZP0]
+		if e.RP1 < 0 || e.RP1 >= len(zone0.Points) || e.RP1 >= len(zone0.OriginalPoints) ||
+			e.RP2 < 0 || e.RP2 >= len(zone1.Points) || e.RP2 >= len(zone1.OriginalPoints) {
+			return fmt.Errorf("reference index out of bounds in IP: rp1=%d, rp2=%d", e.RP1, e.RP2)
+		}
+		twilight := e.ZP0 == 0 || e.ZP1 == 0 || e.ZP2 == 0
+		oldRange := e.dualProjectIPDistance(zone0, e.RP1, zone1, e.RP2, twilight)
+		curRange := e.getProjectedDistance(zone0.Points[e.RP1], zone1.Points[e.RP2])
+
 		for i := 0; i < int(e.GS.Loop); i++ {
 			pIdx, err := e.pop()
 			if err != nil {
 				return err
 			}
-			zone2 := &e.Zones[e.ZP2]
-			zone1 := &e.Zones[e.ZP1]
-			zone0 := &e.Zones[e.ZP0]
 
-			if e.RP1 < 0 || e.RP1 >= len(zone0.Points) || e.RP2 < 0 || e.RP2 >= len(zone1.Points) || pIdx < 0 || int(pIdx) >= len(zone2.Points) {
+			if pIdx < 0 || int(pIdx) >= len(zone2.Points) || int(pIdx) >= len(zone2.OriginalPoints) {
 				return fmt.Errorf("index out of bounds in IP: rp1=%d, rp2=%d, p=%d", e.RP1, e.RP2, pIdx)
 			}
 
-			// Original positions projected onto ProjVector
-			o1 := e.project(zone0.OriginalPoints[e.RP1])
-			o2 := e.project(zone1.OriginalPoints[e.RP2])
-			op := e.project(zone2.OriginalPoints[pIdx])
-
-			// Current positions projected onto ProjVector
-			c1 := e.project(zone0.Points[e.RP1])
-			c2 := e.project(zone1.Points[e.RP2])
-
-			var targetDist int32
-			if o1 == o2 {
-				targetDist = c1
+			orgDist := e.dualProjectIPDistance(zone0, e.RP1, zone2, int(pIdx), twilight)
+			curDist := e.getProjectedDistance(zone0.Points[e.RP1], zone2.Points[pIdx])
+			var newDist int32
+			if orgDist == 0 {
+				newDist = 0
+			} else if oldRange == 0 {
+				newDist = orgDist
 			} else {
-				// Linear interpolation: cp = c1 + (op - o1) * (c2 - c1) / (o2 - o1)
-				ratio := int64(op-o1) * int64(c2-c1)
-				targetDist = c1 + int32(ratio/int64(o2-o1))
+				newDist = int32(divRound(int64(orgDist)*int64(curRange), int64(oldRange)))
 			}
 
-			cp := e.project(zone2.Points[pIdx])
-			if err := e.moveProjected(&zone2.Points[pIdx], targetDist-cp); err != nil {
+			if err := e.moveProjected(&zone2.Points[pIdx], newDist-curDist); err != nil {
 				return err
 			}
 			e.touchCurrent(int(pIdx), e.ZP2)
@@ -1787,6 +2039,17 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 
 	case opcode == 0x30 || opcode == 0x31: // IUP[y], IUP[x]
 		axis := int(opcode & 0x01)
+		if e.GS.BackwardCompatibility {
+			if e.iupXCalled && e.iupYCalled {
+				e.IP++
+				return nil
+			}
+			if axis == 1 {
+				e.iupXCalled = true
+			} else {
+				e.iupYCalled = true
+			}
+		}
 		e.interpolateUntouched(axis)
 		e.IP++
 
@@ -1905,6 +2168,9 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 		opID, err := e.pop()
 		if err != nil {
 			return err
+		}
+		if opID < 0 || opID > 0xFF {
+			return fmt.Errorf("instruction opcode out of bounds in IDEF: %d", opID)
 		}
 		startIP := e.IP + 1
 		nesting := 1
@@ -2095,19 +2361,7 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 		e.push(a - b)
 		e.IP++
 
-	case opcode == 0x62: // MUL
-		b, err := e.pop()
-		if err != nil {
-			return err
-		}
-		a, err := e.pop()
-		if err != nil {
-			return err
-		}
-		e.push(ftmath.Mul26(a, b))
-		e.IP++
-
-	case opcode == 0x63: // DIV
+	case opcode == 0x62: // DIV
 		b, err := e.pop()
 		if err != nil {
 			return err
@@ -2120,6 +2374,18 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 			return fmt.Errorf("division by zero")
 		}
 		e.push(ftmath.Div26(a, b))
+		e.IP++
+
+	case opcode == 0x63: // MUL
+		b, err := e.pop()
+		if err != nil {
+			return err
+		}
+		a, err := e.pop()
+		if err != nil {
+			return err
+		}
+		e.push(ftmath.Mul26(a, b))
 		e.IP++
 
 	case opcode == 0x64: // ABS
@@ -2163,7 +2429,7 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 		if err != nil {
 			return err
 		}
-		e.push(e.round(a))
+		e.push(e.roundWithCompensation(a, e.engineCompensation(opcode)))
 		e.IP++
 
 	case opcode >= 0x6C && opcode <= 0x6F: // NROUND
@@ -2171,7 +2437,7 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 		if err != nil {
 			return err
 		}
-		e.push(a)
+		e.push(compensateDistance(a, e.engineCompensation(opcode)))
 		e.IP++
 
 	case opcode == 0x8A: // ROLL
@@ -2311,7 +2577,23 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 		}
 		e.IP++
 
-	case opcode == 0x51: // GT
+	case opcode == 0x51: // LTEQ
+		b, err := e.pop()
+		if err != nil {
+			return err
+		}
+		a, err := e.pop()
+		if err != nil {
+			return err
+		}
+		if a <= b {
+			e.push(1)
+		} else {
+			e.push(0)
+		}
+		e.IP++
+
+	case opcode == 0x52: // GT
 		b, err := e.pop()
 		if err != nil {
 			return err
@@ -2327,39 +2609,7 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 		}
 		e.IP++
 
-	case opcode == 0x52: // EQ
-		b, err := e.pop()
-		if err != nil {
-			return err
-		}
-		a, err := e.pop()
-		if err != nil {
-			return err
-		}
-		if a == b {
-			e.push(1)
-		} else {
-			e.push(0)
-		}
-		e.IP++
-
-	case opcode == 0x53: // NEQ
-		b, err := e.pop()
-		if err != nil {
-			return err
-		}
-		a, err := e.pop()
-		if err != nil {
-			return err
-		}
-		if a != b {
-			e.push(1)
-		} else {
-			e.push(0)
-		}
-		e.IP++
-
-	case opcode == 0x54: // GTEQ
+	case opcode == 0x53: // GTEQ
 		b, err := e.pop()
 		if err != nil {
 			return err
@@ -2375,7 +2625,7 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 		}
 		e.IP++
 
-	case opcode == 0x55: // LTEQ
+	case opcode == 0x54: // EQ
 		b, err := e.pop()
 		if err != nil {
 			return err
@@ -2384,7 +2634,23 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 		if err != nil {
 			return err
 		}
-		if a <= b {
+		if a == b {
+			e.push(1)
+		} else {
+			e.push(0)
+		}
+		e.IP++
+
+	case opcode == 0x55: // NEQ
+		b, err := e.pop()
+		if err != nil {
+			return err
+		}
+		a, err := e.pop()
+		if err != nil {
+			return err
+		}
+		if a != b {
 			e.push(1)
 		} else {
 			e.push(0)
@@ -2465,7 +2731,20 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 		e.IP++
 
 	default:
-		return fmt.Errorf("unsupported opcode 0x%02x", opcode)
+		if instruction, ok := e.Instructions[int32(opcode)]; ok {
+			if err := e.checkCallDepth(); err != nil {
+				return err
+			}
+			e.CallStack = append(e.CallStack, CallRecord{
+				ReturnIP:   e.IP + 1,
+				ReturnCode: e.Code,
+				Repeat:     1,
+			})
+			e.Code = instruction
+			e.IP = 0
+			return nil
+		}
+		return fmt.Errorf("reserved or undefined opcode 0x%02x", opcode)
 	}
 	return nil
 }

@@ -1,7 +1,6 @@
 package type1
 
 import (
-	"bytes"
 	"encoding/hex"
 	"errors"
 	"unicode"
@@ -23,12 +22,15 @@ func DecodePFB(data []byte) ([]byte, error) {
 		if data[i] != 0x80 {
 			return nil, errors.New("invalid PFB block header")
 		}
-		if i+1 >= len(data) {
-			break
+		if i+2 > len(data) {
+			return nil, errors.New("truncated PFB block header")
 		}
 		blockType := data[i+1]
 		if blockType == 3 {
 			break // EOF
+		}
+		if blockType != 1 && blockType != 2 {
+			return nil, errors.New("unsupported PFB block type")
 		}
 		if i+6 > len(data) {
 			return nil, errors.New("truncated PFB block header")
@@ -105,7 +107,10 @@ func Lexer(data []byte) []Token {
 			depth := 1
 			for i < len(data) && depth > 0 {
 				if data[i] == '\\' {
-					i += 2 // skip escaped char
+					i++
+					if i < len(data) {
+						i++
+					}
 					continue
 				}
 				if data[i] == '(' {
@@ -141,6 +146,11 @@ func Lexer(data []byte) []Token {
 			i += 2
 			continue
 		}
+		if isDelim(c) {
+			tokens = append(tokens, Token{Type: "Delim", Value: string(c)})
+			i++
+			continue
+		}
 
 		// Number or Operator
 		start := i
@@ -166,17 +176,25 @@ func isNumber(s string) bool {
 	if len(s) == 0 {
 		return false
 	}
+	digits := 0
+	dots := 0
 	for i, c := range s {
-		if c == '+' || c == '-' || c == '.' {
-			if i == 0 || (c == '.' && i > 0) {
-				continue
+		if (c == '+' || c == '-') && i == 0 {
+			continue
+		}
+		if c == '.' {
+			dots++
+			if dots > 1 {
+				return false
 			}
+			continue
 		}
 		if !unicode.IsDigit(c) {
 			return false
 		}
+		digits++
 	}
-	return true
+	return digits > 0
 }
 
 // ParseDicts basic PostScript dictionary parser returning map of properties.
@@ -198,6 +216,11 @@ func ParseDicts(tokens []Token) map[string][]Token {
 		} else if t.Type == "Delim" && (t.Value == "[" || t.Value == "{") {
 			inArray++
 		} else if t.Type == "Delim" && (t.Value == "]" || t.Value == "}") {
+			if inArray == 0 {
+				currentKey = ""
+				currentArray = nil
+				continue
+			}
 			inArray--
 			if inArray == 0 && currentKey != "" {
 				dicts[currentKey] = currentArray
@@ -217,12 +240,12 @@ func ParseDicts(tokens []Token) map[string][]Token {
 
 // ExtractEexec extracts and decrypts the eexec section.
 func ExtractEexec(data []byte) ([]byte, error) {
-	eexecIdx := bytes.Index(data, []byte("eexec"))
-	if eexecIdx == -1 {
+	_, eexecEnd := findType1Eexec(data)
+	if eexecEnd == -1 {
 		return nil, errors.New("eexec not found")
 	}
 
-	startIdx := eexecIdx + 5
+	startIdx := eexecEnd
 	// skip whitespace
 	for startIdx < len(data) && unicode.IsSpace(rune(data[startIdx])) {
 		startIdx++

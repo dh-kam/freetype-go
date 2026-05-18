@@ -196,8 +196,8 @@ func (p *PCF) GetBitmaps() ([]api.Bitmap, error) {
 		return nil, err
 	}
 
-	if int(glyphCount) != len(p.Metrics) {
-		// This happens sometimes in PCF? Usually they match.
+	if uint64(glyphCount) > uint64(len(p.Metrics)) {
+		return nil, fmt.Errorf("bitmap glyph count %d exceeds metrics count %d", glyphCount, len(p.Metrics))
 	}
 
 	offsets := make([]uint32, glyphCount)
@@ -214,8 +214,18 @@ func (p *PCF) GetBitmaps() ([]api.Bitmap, error) {
 		}
 	}
 
-	// For a basic parser, we'll just return correctly sized empty bitmaps
-	// based on metrics to satisfy "doesn't panic and reads the structures".
+	glyphPadIndex := int(format & PCF_GLYPH_PAD_MASK)
+	glyphPad := 1 << glyphPadIndex
+	bitmapSize := bitmapSizes[glyphPadIndex]
+	if bitmapSize > table.Size {
+		return nil, fmt.Errorf("bitmap data size %d exceeds table size %d", bitmapSize, table.Size)
+	}
+
+	bitmapData := make([]byte, bitmapSize)
+	if _, err := io.ReadFull(p.reader, bitmapData); err != nil {
+		return nil, err
+	}
+
 	bitmaps := make([]api.Bitmap, glyphCount)
 	for i := uint32(0); i < glyphCount; i++ {
 		m := p.Metrics[i]
@@ -229,8 +239,47 @@ func (p *PCF) GetBitmaps() ([]api.Bitmap, error) {
 		}
 		bm := core.NewBitmap(w, h)
 		bm.SetPixelMode(api.MODE_MONO)
+		if err := unpackPCFBitmap(bm.GetBuffer(), bm.GetPitch(), w, h, bitmapData, offsets[i], glyphPad, format); err != nil {
+			return nil, fmt.Errorf("glyph %d bitmap: %w", i, err)
+		}
 		bitmaps[i] = bm
 	}
 
 	return bitmaps, nil
+}
+
+func unpackPCFBitmap(dst []byte, dstPitch, width, rows int, src []byte, offset uint32, glyphPad int, format uint32) error {
+	if width <= 0 || rows <= 0 {
+		return nil
+	}
+	rowBytes := (width + 7) >> 3
+	paddedRowBytes := alignPCFRow(rowBytes, glyphPad)
+	need := uint64(offset) + uint64(paddedRowBytes*rows)
+	if need > uint64(len(src)) {
+		return fmt.Errorf("offset %d needs %d bytes, have %d", offset, paddedRowBytes*rows, len(src))
+	}
+
+	msbFirst := (format & PCF_BIT_MASK) != 0
+	start := int(offset)
+	for y := 0; y < rows; y++ {
+		row := src[start+y*paddedRowBytes : start+y*paddedRowBytes+rowBytes]
+		for x := 0; x < width; x++ {
+			byteIdx := x >> 3
+			bitIdx := uint(x & 7)
+			if msbFirst {
+				bitIdx = 7 - bitIdx
+			}
+			if row[byteIdx]&(1<<bitIdx) != 0 {
+				dst[y*dstPitch+x] = 255
+			}
+		}
+	}
+	return nil
+}
+
+func alignPCFRow(n, pad int) int {
+	if pad <= 1 {
+		return n
+	}
+	return (n + pad - 1) &^ (pad - 1)
 }

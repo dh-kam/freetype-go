@@ -38,6 +38,22 @@ The same command is wrapped by:
 make conformance-dump CONFORMANCE_FONT=/path/to/font.ttf
 ```
 
+For a dependency-free local smoke pass, let the tool discover installed system
+fonts and emit best-effort Go dumps:
+
+```sh
+make conformance-smoke
+```
+
+The `smoke` command scans common system font directories, XDG font locations on
+Unix-like hosts, and fontconfig output when available. It also honors explicit
+font files from repeated `-font` flags, `FTGO_CONFORMANCE_FONT`, or
+`CONFORMANCE_FONT`, plus directories from `-font-dir`,
+`FTGO_CONFORMANCE_FONTDIR`, or `CONFORMANCE_FONTDIR`. Missing fonts or
+unsupported local fonts are reported as `SKIP` and do not fail by default; use
+`CONFORMANCE_SMOKE_STRICT=1` when a local run should require at least one
+successful dump and fail on skipped discovered fonts.
+
 `dump` records face metadata, selected charmap lookups, glyph metrics, optional
 rich slot metrics, outline geometry, glyph format, bitmap metadata, and embedded
 image metadata when present. Metrics and outline coordinates are serialized as
@@ -51,7 +67,8 @@ The Go engine currently implements only a subset; unsupported concepts are still
 recorded so the reference comparison shows the semantic gap. `-render-mode`
 accepts `none`, `normal`, `light`, `mono`, `lcd`, and `lcd-v`. FreeType
 reference dumps call `FT_Render_Glyph` for non-`none` modes. The Go dump records
-an explicit render error until a matching render-to-slot API exists.
+matching Go load/render flags for those modes and emits bitmap metadata when the
+current driver exposes a rendered bitmap.
 
 Top-level schema:
 
@@ -132,7 +149,8 @@ go run ./tools/conformance compare \
   -candidate conformance-go.json \
   -metric-tolerance 0 \
   -point-tolerance 0 \
-  -allow-missing-slot-metrics
+  -allow-missing-slot-metrics \
+  -fail-stale-expected-gaps
 ```
 
 The Makefile wrapper is:
@@ -152,11 +170,23 @@ investigation.
 
 When the candidate is the current Go engine, render-mode and rich slot metric
 gaps are called out separately before the raw diff list. For example, a rendered
-FreeType glyph compared against an unrendered Go slot is grouped as
-`go render unsupported`, `go render bitmap missing`, or `go render output
-mismatch`; missing `GlyphSlot` metrics are grouped as
-`go slot metrics unavailable`. These labels are report annotations only; they do
-not hide diffs or change the non-zero exit status.
+FreeType glyph compared against a Go slot with missing or different bitmap data
+is grouped as `go render unsupported`, `go render bitmap missing`, or
+`go render output mismatch`; missing `GlyphSlot` metrics are grouped as
+`go slot metrics unavailable`. Render mismatches are further summarized by
+detail area, such as rendered format, bitmap availability, bitmap geometry,
+pixel mode, placement, and buffer/hash differences. These labels are report
+annotations only; they do not hide diffs or change the non-zero exit status.
+Numeric metric drift is summarized separately as `metric delta details`, grouped
+into glyph metrics, slot metrics, outline bbox, and outline points with field
+counts and maximum absolute 26.6 delta. The same paths are annotated in the raw
+diff list as `glyph metric delta`, `slot metric delta`, `outline bbox delta`,
+or `outline point delta`. Outline point and tag drift also prints
+`outline point/tag details`, grouped by glyph and point index, with coordinate
+delta points separated from `tag-only` points and tag transitions. Per-index tag
+paths are annotated as `outline tag delta`, which lets an `expected_gaps` entry
+accept a known outline family without masking render deltas or stale
+annotations.
 
 ## Request Files and Corpora
 
@@ -173,7 +203,10 @@ fields; Makefile request mode defers selection fields to the request file.
   "chars": ["U+0020", "U+0041", "U+0061"],
   "load_flags": ["default", "no-hinting+target-light"],
   "render_mode": ["none", "normal"],
-  "corpus": "smoke"
+  "corpus": "smoke",
+  "expected_gaps": [
+    {"kind": "go render output mismatch", "note": "Rasterizer parity is still under measurement."}
+  ]
 }
 ```
 
@@ -224,20 +257,69 @@ FreeType engine. Compare the per-request outputs with:
 go run ./tools/conformance batch-compare \
   -requests 'testdata/conformance/*.json' \
   -reference-dir conformance-out \
-  -candidate-dir conformance-out
+  -candidate-dir conformance-out \
+  -accept-expected-gaps
 ```
 
 The Makefile wrapper is:
 
 ```sh
 make conformance-batch-compare \
-  CONFORMANCE_REQUESTS='testdata/conformance/*.json'
+  CONFORMANCE_REQUESTS='testdata/conformance/*.json' \
+  CONFORMANCE_ACCEPT_EXPECTED_GAPS=1
 ```
 
 `batch` and `batch-compare` accept repeated `-request`/`-requests` flags,
 comma-separated lists, and quoted glob patterns. The default Go batch path has
 no FreeType or cgo dependency; only `ftdump` and `conformance-ftbatch` require
 the external FreeType library.
+
+`batch-compare` exits successfully only when every request is clean, or when
+`-accept-expected-gaps` is set and all diffs match `expected_gaps` annotations
+from the request or dump. It prints a corpus summary with clean, expected-gap,
+mismatched, read-error, total diff, expected diff, unexpected diff, render
+mismatch detail, metric delta detail, and stale expected-gap counts. Unexpected
+diffs are also grouped by full `sizes[...]` key, such as
+`12x12/default` or `12x12/no-hinting/render-normal`, and by load-flag set. Use
+those buckets to distinguish hinted/default outline mismatches from no-hinting
+or render-mode gaps before drilling into the raw diff list. Read/setup errors
+are reported separately from comparison mismatches.
+
+Expected gaps are request annotations, not hidden tolerances. A gap may match by
+`kind`, by exact `path`, or by a path prefix ending in `*`. Use `kind` for broad
+known porting gaps and `path` for narrow one-off differences:
+
+```json
+{
+  "expected_gaps": [
+    {
+      "kind": "go render unsupported",
+      "note": "Render-to-slot parity is not ported yet."
+    },
+    {
+      "path": "sizes[16x16/no-hinting/render-normal]*",
+      "note": "Temporary render-mode scope for this request."
+    }
+  ]
+}
+```
+
+Expected gaps that match no current diff are reported as stale. This is a
+strong signal that either the implementation caught up or the request no longer
+exercises the intended gap. Add `-fail-stale-expected-gaps` to `compare` or
+`batch-compare` when a corpus run should fail until stale annotations are
+removed or narrowed.
+
+The checked-in request fixtures under `testdata/conformance` intentionally do
+not commit font binaries. They separate common conformance slices:
+
+- `ascii-smoke-request.json`: minimal dependency-light dump coverage.
+- `ascii-outline-request.json`: outline, metrics, charmap, and load-flag sweep.
+- `ascii-render-request.json`: small render-mode slice for bitmap output.
+- `render-placement-request.json`: render bitmap geometry, pixel mode,
+  left/top placement, and buffer/hash comparison.
+- `expected-gap-policy-request.json`: tiny request for validating stale
+  expected-gap policy during batch comparison.
 
 ## Fixture Strategy
 
