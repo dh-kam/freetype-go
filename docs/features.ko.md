@@ -6,10 +6,11 @@
 ## 구현된 영역
 
 ### 1. 폰트 포맷 (Font Formats)
-- **TrueType (.ttf)**: SFNT 디렉터리 파싱, 주요 테이블 파싱, 글리프 로딩, cmap/hmtx 처리, TrueType 명령어 실행 구조가 포함되어 있습니다.
+- **TrueType (.ttf)**: SFNT 디렉터리 파싱, 주요 테이블 파싱, 글리프 로딩, cmap/hmtx 처리, TrueType 명령어 실행 구조가 포함되어 있으며 size/CVT/prep, MIRP CVT[-1], SDPVTL, negative SLOOP, DELTAP invalid-point, rollback 관련 회귀 테스트가 일부 있습니다.
 - **OpenType/CFF (.otf)**: CFF 파싱 및 CharString 관련 지원이 있습니다. 지원 범위는 계속 변할 수 있습니다.
+- **Type 1 (.pfa/.pfb)**: PFA/PFB 파싱, Type 1 딕셔너리와 인코딩 처리, CharString outline/metric/Subrs/flex/SEAC 지원, 그리고 `SetAFM`, `SetPFM`, `SetCompanionMetrics`, `SetCompanionMetricsFiles`, `SetCompanionMetricsForFont`를 통한 AFM/PFM companion metric 연결과 `ReadCompanionMetricsFiles`, `DiscoverCompanionMetricsFiles`, `ReadCompanionMetricsForFont`를 통한 명시적 경로 로딩 및 same-stem 인접 파일 discovery가 있습니다. `LoadFace`는 stream이 `FontPathStream`을 구현할 때 발견된 companion metric을 자동 연결할 수 있습니다. terminator, Subr return, unterminated flex, 제한적인 OtherSubr 3 result-pop 처리, pending OtherSubr result queue 관련 guard 테스트도 일부 있습니다. 지원 범위는 계속 변할 수 있습니다.
 - **TrueType/OpenType 컬렉션(.ttc/.otc)**: SFNT 로더가 기본적으로 첫 face를 열거나 `sfnt.LoadFaceIndex`로 지정한 face를 열 수 있습니다.
-- **WOFF/WOFF2 컨테이너**: WOFF 및 WOFF2 스트림을 SFNT 또는 TTC로 디코딩할 수 있으며, WOFF2는 변환된 `glyf`/`loca`, `hmtx`, collection directory 재구성을 포함합니다.
+- **WOFF/WOFF2 컨테이너**: WOFF 및 WOFF2 스트림을 SFNT 또는 TTC로 디코딩할 수 있으며, WOFF2는 변환된 `glyf`/`loca`, 변환된 `hmtx`, collection directory 재구성을 포함합니다. 현재 회귀 테스트는 변환 `hmtx`, instruction/bbox, short/long-loca multiglyph, per-glyph overlap bitmap, collection long-multiglyph, collection hmtx dependency, raw/transformed outline mismatch rejection, malformed shared-composite rejection 사례를 중점적으로 다룹니다.
 - **비트맵 폰트**: BDF, PCF, FNT 및 일부 내장 비트맵 테이블을 다룹니다.
 - **컬러 폰트**: 일부 `COLR`/`CPAL` 및 `sbix` 데이터 처리를 위한 파서와 헬퍼가 있습니다.
 

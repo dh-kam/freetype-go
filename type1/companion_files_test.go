@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -136,6 +138,90 @@ EndFontMetrics
 				t.Fatalf("GlyphNameByCode(65) = %q, %v; want A, true", name, ok)
 			}
 		})
+	}
+}
+
+func TestReadCompanionMetricsFilesParsesExplicitPaths(t *testing.T) {
+	pfmData, _, _ := testPFM()
+	dir := t.TempDir()
+	afmPath := filepath.Join(dir, "reader.afm")
+	pfmPath := filepath.Join(dir, "reader.pfm")
+
+	if err := os.WriteFile(afmPath, []byte(`
+StartFontMetrics 4.1
+FontName Reader-Regular
+StartCharMetrics 1
+C 65 ; WX 722 ; N A ; B 9 0 689 674 ;
+EndCharMetrics
+EndFontMetrics
+`), 0o600); err != nil {
+		t.Fatalf("WriteFile(AFM) failed: %v", err)
+	}
+	if err := os.WriteFile(pfmPath, pfmData, 0o600); err != nil {
+		t.Fatalf("WriteFile(PFM) failed: %v", err)
+	}
+
+	var encoding [256]string
+	encoding[65] = "A"
+	encoding[67] = "C"
+
+	metrics, err := ReadCompanionMetricsFiles(afmPath, pfmPath, encoding)
+	if err != nil {
+		t.Fatalf("ReadCompanionMetricsFiles failed: %v", err)
+	}
+	if metrics.AFM == nil {
+		t.Fatal("AFM is nil, want parsed AFM")
+	}
+	if metrics.PFM == nil {
+		t.Fatal("PFM is nil, want parsed PFM")
+	}
+	if name, ok := metrics.GlyphNameByCode(65); !ok || name != "A" {
+		t.Fatalf("GlyphNameByCode(65) = %q, %v; want A, true", name, ok)
+	}
+	if width, ok := metrics.WidthByCode(65); !ok || width != 722 {
+		t.Fatalf("WidthByCode(65) = %v, %v; want AFM width 722, true", width, ok)
+	}
+	if width, ok := metrics.WidthByCode(67); !ok || width != 620 {
+		t.Fatalf("WidthByCode(67) = %v, %v; want PFM width 620, true", width, ok)
+	}
+}
+
+func TestReadCompanionMetricsFilesOptionalEmptyPaths(t *testing.T) {
+	var encoding [256]string
+	encoding[65] = "A"
+
+	metrics, err := ReadCompanionMetricsFiles("", "", encoding)
+	if err != nil {
+		t.Fatalf("ReadCompanionMetricsFiles failed: %v", err)
+	}
+	if metrics.AFM != nil {
+		t.Fatalf("AFM present = %v, want false", metrics.AFM != nil)
+	}
+	if metrics.PFM != nil {
+		t.Fatalf("PFM present = %v, want false", metrics.PFM != nil)
+	}
+	if name, ok := metrics.GlyphNameByCode(65); !ok || name != "A" {
+		t.Fatalf("GlyphNameByCode(65) = %q, %v; want A, true", name, ok)
+	}
+}
+
+func TestReadCompanionMetricsFilesWrapsErrors(t *testing.T) {
+	dir := t.TempDir()
+	missingAFM := filepath.Join(dir, "missing.afm")
+	if _, err := ReadCompanionMetricsFiles(missingAFM, "", [256]string{}); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("missing AFM error = %v, want os.ErrNotExist", err)
+	} else if !strings.Contains(err.Error(), "open AFM companion metrics") || !strings.Contains(err.Error(), missingAFM) {
+		t.Fatalf("missing AFM error = %q, want context with AFM path", err)
+	}
+
+	badPFM := filepath.Join(dir, "bad.pfm")
+	if err := os.WriteFile(badPFM, []byte{0}, 0o600); err != nil {
+		t.Fatalf("WriteFile(PFM) failed: %v", err)
+	}
+	if _, err := ReadCompanionMetricsFiles("", badPFM, [256]string{}); err == nil {
+		t.Fatal("ReadCompanionMetricsFiles succeeded for malformed PFM")
+	} else if !strings.Contains(err.Error(), "read PFM companion metrics") || !strings.Contains(err.Error(), badPFM) {
+		t.Fatalf("bad PFM error = %q, want context with PFM path", err)
 	}
 }
 

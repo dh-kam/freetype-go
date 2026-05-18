@@ -107,7 +107,7 @@ func DecodeCharString(data []byte, subrs [][]byte) (*CharStringResult, error) {
 		result: result,
 		subrs:  subrs,
 	}
-	if err := ctx.interpret(data); err != nil {
+	if err := ctx.interpretTopLevel(data); err != nil {
 		return nil, err
 	}
 	return result, nil
@@ -141,9 +141,32 @@ type type1FlexPoint struct {
 	y float64
 }
 
-func (c *type1CharStringContext) interpret(data []byte) error {
+type type1CharStringStop uint8
+
+const (
+	type1CharStringStopEOF type1CharStringStop = iota
+	type1CharStringStopReturn
+	type1CharStringStopEndChar
+)
+
+func (c *type1CharStringContext) interpretTopLevel(data []byte) error {
+	stop, err := c.interpret(data)
+	if err != nil {
+		return err
+	}
+	switch stop {
+	case type1CharStringStopEndChar:
+		return nil
+	case type1CharStringStopReturn:
+		return errors.New("return in top-level type1 charstring")
+	default:
+		return errors.New("type1 charstring missing endchar")
+	}
+}
+
+func (c *type1CharStringContext) interpret(data []byte) (type1CharStringStop, error) {
 	if c.nesting > maxType1SubrNesting {
-		return errors.New("type1 charstring subroutine nesting too deep")
+		return 0, errors.New("type1 charstring subroutine nesting too deep")
 	}
 	c.nesting++
 	defer func() { c.nesting-- }()
@@ -153,10 +176,10 @@ func (c *type1CharStringContext) interpret(data []byte) error {
 		if b >= 32 {
 			v, next, err := decodeType1CharStringNumber(data, i)
 			if err != nil {
-				return err
+				return 0, err
 			}
 			if err := c.pushOperand(v); err != nil {
-				return err
+				return 0, err
 			}
 			i = next
 			continue
@@ -166,7 +189,7 @@ func (c *type1CharStringContext) interpret(data []byte) error {
 		op := int(b)
 		if op == 12 {
 			if i >= len(data) {
-				return errors.New("missing second byte for type1 charstring escape operator")
+				return 0, errors.New("missing second byte for type1 charstring escape operator")
 			}
 			op = 1200 + int(data[i])
 			i++
@@ -175,52 +198,52 @@ func (c *type1CharStringContext) interpret(data []byte) error {
 		switch op {
 		case 1: // hstem
 			if err := c.consumeStem("hstem", CharStringStemHorizontal); err != nil {
-				return err
+				return 0, err
 			}
 		case 3: // vstem
 			if err := c.consumeStem("vstem", CharStringStemVertical); err != nil {
-				return err
+				return 0, err
 			}
 		case 4: // vmoveto
 			args, err := c.consumeArgs(1, "vmoveto")
 			if err != nil {
-				return err
+				return 0, err
 			}
 			c.rmoveto(0, args[0])
 		case 5: // rlineto
 			if len(c.stack) == 0 || len(c.stack)%2 != 0 {
-				return errors.New("invalid operand count in rlineto")
+				return 0, errors.New("invalid operand count in rlineto")
 			}
 			args := c.takeStack()
 			for j := 0; j < len(args); j += 2 {
 				if err := c.rlineto(args[j], args[j+1]); err != nil {
-					return err
+					return 0, err
 				}
 			}
 		case 6: // hlineto
 			args, err := c.consumeArgs(1, "hlineto")
 			if err != nil {
-				return err
+				return 0, err
 			}
 			if err := c.rlineto(args[0], 0); err != nil {
-				return err
+				return 0, err
 			}
 		case 7: // vlineto
 			args, err := c.consumeArgs(1, "vlineto")
 			if err != nil {
-				return err
+				return 0, err
 			}
 			if err := c.rlineto(0, args[0]); err != nil {
-				return err
+				return 0, err
 			}
 		case 8: // rrcurveto
 			if len(c.stack) == 0 || len(c.stack)%6 != 0 {
-				return errors.New("invalid operand count in rrcurveto")
+				return 0, errors.New("invalid operand count in rrcurveto")
 			}
 			args := c.takeStack()
 			for j := 0; j < len(args); j += 6 {
 				if err := c.rrcurveto(args[j], args[j+1], args[j+2], args[j+3], args[j+4], args[j+5]); err != nil {
-					return err
+					return 0, err
 				}
 			}
 		case 9: // closepath
@@ -228,55 +251,66 @@ func (c *type1CharStringContext) interpret(data []byte) error {
 			c.stack = c.stack[:0]
 		case 10: // callsubr
 			if len(c.stack) < 1 {
-				return errors.New("stack underflow in callsubr")
+				return 0, errors.New("stack underflow in callsubr")
 			}
 			idx := int(c.stack[len(c.stack)-1])
 			c.stack = c.stack[:len(c.stack)-1]
 			if idx < 0 || idx >= len(c.subrs) {
-				return fmt.Errorf("type1 local subr %d out of range", idx)
+				return 0, fmt.Errorf("type1 local subr %d out of range", idx)
 			}
-			if err := c.interpret(c.subrs[idx]); err != nil {
-				return err
+			stop, err := c.interpret(c.subrs[idx])
+			if err != nil {
+				return 0, err
+			}
+			switch stop {
+			case type1CharStringStopReturn:
+			case type1CharStringStopEndChar:
+				return type1CharStringStopEndChar, nil
+			default:
+				return 0, fmt.Errorf("type1 local subr %d missing return", idx)
 			}
 		case 11: // return
-			return nil
+			return type1CharStringStopReturn, nil
 		case 13: // hsbw
 			args, err := c.consumeArgs(2, "hsbw")
 			if err != nil {
-				return err
+				return 0, err
 			}
 			c.setMetrics(args[0], 0, args[1], 0)
 		case 14: // endchar
+			if err := c.ensureTerminatorReady("endchar"); err != nil {
+				return 0, err
+			}
 			c.closeContour(false)
 			c.stack = c.stack[:0]
-			return nil
+			return type1CharStringStopEndChar, nil
 		case 21: // rmoveto
 			args, err := c.consumeArgs(2, "rmoveto")
 			if err != nil {
-				return err
+				return 0, err
 			}
 			c.rmoveto(args[0], args[1])
 		case 22: // hmoveto
 			args, err := c.consumeArgs(1, "hmoveto")
 			if err != nil {
-				return err
+				return 0, err
 			}
 			c.rmoveto(args[0], 0)
 		case 30: // vhcurveto
 			args, err := c.consumeArgs(4, "vhcurveto")
 			if err != nil {
-				return err
+				return 0, err
 			}
 			if err := c.rrcurveto(0, args[0], args[1], args[2], args[3], 0); err != nil {
-				return err
+				return 0, err
 			}
 		case 31: // hvcurveto
 			args, err := c.consumeArgs(4, "hvcurveto")
 			if err != nil {
-				return err
+				return 0, err
 			}
 			if err := c.rrcurveto(args[0], 0, args[1], args[2], 0, args[3]); err != nil {
-				return err
+				return 0, err
 			}
 		case 1200: // dotsection
 			c.recordHint(CharStringHint{
@@ -287,16 +321,19 @@ func (c *type1CharStringContext) interpret(data []byte) error {
 			c.stack = c.stack[:0]
 		case 1201: // vstem3
 			if err := c.consumeTripleStem("vstem3", CharStringStemVertical); err != nil {
-				return err
+				return 0, err
 			}
 		case 1202: // hstem3
 			if err := c.consumeTripleStem("hstem3", CharStringStemHorizontal); err != nil {
-				return err
+				return 0, err
 			}
 		case 1206: // seac
 			args, err := c.consumeArgs(5, "seac")
 			if err != nil {
-				return err
+				return 0, err
+			}
+			if err := c.ensureTerminatorReady("seac"); err != nil {
+				return 0, err
 			}
 			c.result.SEAC = &CharStringSEAC{
 				ASB:        int32(args[0]),
@@ -305,44 +342,45 @@ func (c *type1CharStringContext) interpret(data []byte) error {
 				BaseChar:   int32(args[3]),
 				AccentChar: int32(args[4]),
 			}
+			return type1CharStringStopEndChar, nil
 		case 1207: // sbw
 			args, err := c.consumeArgs(4, "sbw")
 			if err != nil {
-				return err
+				return 0, err
 			}
 			c.setMetrics(args[0], args[1], args[2], args[3])
 		case 1212: // div
 			if len(c.stack) < 2 {
-				return errors.New("stack underflow in div")
+				return 0, errors.New("stack underflow in div")
 			}
 			n := len(c.stack)
 			if c.stack[n-1] == 0 {
-				return errors.New("division by zero in div")
+				return 0, errors.New("division by zero in div")
 			}
 			c.stack[n-2] = c.stack[n-2] / c.stack[n-1]
 			c.stack = c.stack[:n-1]
 		case 1216: // callothersubr
 			if err := c.callOtherSubr(); err != nil {
-				return err
+				return 0, err
 			}
 		case 1217: // pop
 			if err := c.popOtherSubrResult(); err != nil {
-				return err
+				return 0, err
 			}
 		case 1233: // setcurrentpoint
 			args, err := c.consumeArgs(2, "setcurrentpoint")
 			if err != nil {
-				return err
+				return 0, err
 			}
 			c.x = args[0]
 			c.y = args[1]
 			c.flexState = false
 			c.flexPoints = c.flexPoints[:0]
 		default:
-			return fmt.Errorf("unsupported type1 charstring operator %d", op)
+			return 0, fmt.Errorf("unsupported type1 charstring operator %d", op)
 		}
 	}
-	return nil
+	return type1CharStringStopEOF, nil
 }
 
 func decodeType1CharStringNumber(data []byte, i int) (float64, int, error) {
@@ -512,10 +550,19 @@ func (c *type1CharStringContext) callOtherSubr() error {
 	if len(c.stack) < 2 {
 		return errors.New("stack underflow in callothersubr")
 	}
-	subrNo := int(c.stack[len(c.stack)-1])
-	argCount := int(c.stack[len(c.stack)-2])
+	subrNo, err := type1CharStringIntOperand(c.stack[len(c.stack)-1], "subroutine number", "callothersubr")
+	if err != nil {
+		return err
+	}
+	argCount, err := type1CharStringIntOperand(c.stack[len(c.stack)-2], "argument count", "callothersubr")
+	if err != nil {
+		return err
+	}
 	if argCount < 0 || argCount > len(c.stack)-2 {
 		return errors.New("stack underflow in callothersubr")
+	}
+	if len(c.otherSubrResults) != 0 {
+		return errors.New("pending OtherSubr pop results before callothersubr")
 	}
 	argsStart := len(c.stack) - 2 - argCount
 	args := append([]float64(nil), c.stack[argsStart:len(c.stack)-2]...)
@@ -579,6 +626,14 @@ func (c *type1CharStringContext) callOtherSubr() error {
 	return nil
 }
 
+func type1CharStringIntOperand(v float64, name, op string) (int, error) {
+	i := int(v)
+	if float64(i) != v {
+		return 0, fmt.Errorf("invalid %s in %s", name, op)
+	}
+	return i, nil
+}
+
 func (c *type1CharStringContext) popOtherSubrResult() error {
 	if len(c.otherSubrResults) == 0 {
 		return errors.New("unsupported type1 pop")
@@ -587,6 +642,16 @@ func (c *type1CharStringContext) popOtherSubrResult() error {
 	c.otherSubrResults = c.otherSubrResults[1:]
 	if err := c.pushOperand(v); err != nil {
 		return err
+	}
+	return nil
+}
+
+func (c *type1CharStringContext) ensureTerminatorReady(op string) error {
+	if c.flexState {
+		return fmt.Errorf("unterminated flex sequence before %s", op)
+	}
+	if len(c.otherSubrResults) != 0 {
+		return fmt.Errorf("pending OtherSubr pop results before %s", op)
 	}
 	return nil
 }

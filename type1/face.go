@@ -73,7 +73,15 @@ func (l *loader) LoadFace(stream api.Stream) (api.Face, error) {
 	if err != nil {
 		return nil, err
 	}
-	return newFace(font, l.sys), nil
+	face := newFace(font, l.sys)
+	metrics, ok, err := readCompanionMetricsForStream(stream, font.Encoding)
+	if err != nil {
+		return nil, err
+	}
+	if ok {
+		face.SetCompanionMetrics(metrics)
+	}
+	return face, nil
 }
 
 func newFace(font *Font, sys api.FreetypeSystem) *Face {
@@ -117,6 +125,23 @@ func (f *Face) SetPFM(pfm *PFM) {
 		return
 	}
 	f.pfm = pfm
+}
+
+// SetCompanionMetrics attaches parsed optional companion metrics to the face.
+//
+// Nil metrics clear both companion attachments. The face uses its own encoding
+// for PFM glyph-name resolution.
+func (f *Face) SetCompanionMetrics(metrics *CompanionMetrics) {
+	if f == nil {
+		return
+	}
+	if metrics == nil {
+		f.SetAFM(nil)
+		f.SetPFM(nil)
+		return
+	}
+	f.SetAFM(metrics.AFM)
+	f.SetPFM(metrics.PFM)
 }
 
 func (f *Face) SetPixelSizes(width, height int) error {

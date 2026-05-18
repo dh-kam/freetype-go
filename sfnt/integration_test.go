@@ -8,7 +8,7 @@ import (
 	"github.com/dh-kam/freetype-go/core"
 )
 
-func loadHintingFixture(t *testing.T, instr []byte) api.Face {
+func loadHintingFixture(t *testing.T, instr []byte) *Face {
 	t.Helper()
 	data := make([]byte, 2000)
 
@@ -81,7 +81,7 @@ func loadHintingFixture(t *testing.T, instr []byte) api.Face {
 	if err != nil {
 		t.Fatalf("LoadFace failed: %v", err)
 	}
-	return f
+	return f.(*Face)
 }
 
 func TestHintingIntegration(t *testing.T) {
@@ -138,9 +138,13 @@ func TestGlyphProgramErrorKeepsUnhintedOutline(t *testing.T) {
 		0xB0, 0, // PUSHB 0 (point index)
 		0xB0, 0, // PUSHB 0 (cvt index)
 		0x3E, // MIAP[0]
-		0x06, // SPVTL[0], currently unsupported and requires transaction rollback
+		0x8F, // reserved opcode after mutations, requiring rollback
 	}
 	f := loadHintingFixture(t, instr)
+
+	if got := f.scaledCVT[0]; got != 0 {
+		t.Fatalf("initial scaled CVT[0] = %d, want 0", got)
+	}
 
 	slot, err := f.LoadGlyph(1, 0)
 	if err != nil {
@@ -149,6 +153,9 @@ func TestGlyphProgramErrorKeepsUnhintedOutline(t *testing.T) {
 	points := slot.GetOutline().GetPoints()
 	if points[0].X != 10<<6 || points[0].Y != 20<<6 {
 		t.Fatalf("expected failed hinting to keep unhinted point (640, 1280), got (%d, %d)", points[0].X, points[0].Y)
+	}
+	if got := f.scaledCVT[0]; got != 0 {
+		t.Fatalf("failed hinting committed CVT[0] = %d, want 0", got)
 	}
 }
 

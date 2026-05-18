@@ -220,6 +220,49 @@ func TestReadDumpRequestExpectedGaps(t *testing.T) {
 	}
 }
 
+func TestCheckedInConformanceRequestsParse(t *testing.T) {
+	paths, err := filepath.Glob(filepath.Join("..", "..", "testdata", "conformance", "*.json"))
+	if err != nil {
+		t.Fatalf("glob requests: %v", err)
+	}
+	if len(paths) == 0 {
+		t.Fatal("no checked-in conformance requests found")
+	}
+	for _, path := range paths {
+		path := path
+		t.Run(filepath.Base(path), func(t *testing.T) {
+			base := filepath.Base(path)
+			request, err := readDumpRequest(path)
+			if err != nil {
+				t.Fatalf("readDumpRequest failed: %v", err)
+			}
+			if !strings.HasSuffix(base, "-request.json") {
+				t.Fatalf("checked-in request fixture %q must use the -request.json suffix", base)
+			}
+			if strings.TrimSpace(request.Description) == "" {
+				t.Fatal("description is required for checked-in request fixtures")
+			}
+			if strings.TrimSpace(request.Corpus) == "" {
+				t.Fatal("corpus is required for checked-in request fixtures")
+			}
+			if wantCorpus := strings.TrimSuffix(base, "-request.json"); request.Corpus != wantCorpus {
+				t.Fatalf("corpus = %q, want %q from fixture filename", request.Corpus, wantCorpus)
+			}
+			if len(request.PPEM) == 0 {
+				t.Fatal("ppem is required for checked-in request fixtures")
+			}
+			if len(request.Glyphs) == 0 && len(request.GlyphRanges) == 0 && len(request.Chars) == 0 {
+				t.Fatal("at least one glyph, glyph range, or char selection is required")
+			}
+			for i, gap := range request.ExpectedGaps {
+				if strings.TrimSpace(gap.Note) == "" {
+					t.Fatalf("expected_gaps[%d] must explain the measured gap", i)
+				}
+			}
+		})
+	}
+}
+
 func TestDiscoverFontFiles(t *testing.T) {
 	dir := t.TempDir()
 	nested := filepath.Join(dir, "nested")

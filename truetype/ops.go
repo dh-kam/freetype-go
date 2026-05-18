@@ -1123,6 +1123,9 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 		if err != nil {
 			return err
 		}
+		if val < 0 {
+			return fmt.Errorf("negative SLOOP count: %d", val)
+		}
 		if err := e.checkLoopCallRepeat(val); err != nil {
 			return err
 		}
@@ -1270,7 +1273,6 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 				return dualErr
 			}
 			dualVec = api.Vector{X: 0x4000, Y: 0}
-			perpendicular = false
 		}
 		projVec, projErr := normalizeLineVector(zone2.Points[p1Idx], zone1.Points[p2Idx], perpendicular)
 		if projErr != nil {
@@ -1575,7 +1577,7 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 		minDist := opcode&0x08 != 0
 		round := opcode&0x04 != 0
 
-		if cvtIdx < 0 || int(cvtIdx) >= len(e.CVT) {
+		if cvtIdx < -1 || int(cvtIdx) >= len(e.CVT) {
 			return fmt.Errorf("CVT index out of bounds: %d", cvtIdx)
 		}
 
@@ -1586,7 +1588,10 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 			return fmt.Errorf("index out of bounds in MIRP: rp0=%d, p=%d", e.RP0, pIdx)
 		}
 
-		targetDist := e.CVT[cvtIdx]
+		var targetDist int32
+		if cvtIdx >= 0 {
+			targetDist = e.CVT[cvtIdx]
+		}
 		targetDist = e.applySingleWidthDistance(targetDist, false)
 		if e.ZP1 == 0 {
 			zone1.OriginalPoints[pIdx] = e.pointAlongFreedom(zone0.OriginalPoints[e.RP0], targetDist)
@@ -1729,6 +1734,15 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 		}
 		shift := e.referencePointShift(refZone, refIdx)
 		zone := &e.Zones[e.ZP2]
+		if int64(e.GS.Loop) > int64(e.StackTop) {
+			return fmt.Errorf("stack underflow in SHP: need %d operands, have %d", e.GS.Loop, e.StackTop)
+		}
+		for i := 0; i < int(e.GS.Loop); i++ {
+			pIdx := e.Stack[e.StackTop-1-i]
+			if pIdx < 0 || int(pIdx) >= len(zone.Points) {
+				return fmt.Errorf("point index out of bounds in SHP: %d", pIdx)
+			}
+		}
 		for i := 0; i < int(e.GS.Loop); i++ {
 			pIdx, err := e.pop()
 			if err != nil {
@@ -1886,6 +1900,9 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 		if n < 0 {
 			return fmt.Errorf("negative DELTAP count: %d", n)
 		}
+		if int64(n)*2 > int64(e.StackTop) {
+			return fmt.Errorf("stack underflow in DELTAP: need %d operands, have %d", int64(n)*2, e.StackTop)
+		}
 		zone := &e.Zones[e.ZP0]
 		for i := 0; i < int(n); i++ {
 			pIdx, err := e.pop()
@@ -1899,6 +1916,7 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 			if e.GS.BackwardCompatibility {
 				if e.iupXCalled && e.iupYCalled ||
 					e.GS.FreeVector.Y == 0 ||
+					pIdx < 0 ||
 					int(pIdx) >= len(zone.Tags) ||
 					zone.Tags[pIdx]&outlineTagTouchY == 0 {
 					continue
@@ -1920,6 +1938,9 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 		}
 		if n < 0 {
 			return fmt.Errorf("negative DELTAC count: %d", n)
+		}
+		if int64(n)*2 > int64(e.StackTop) {
+			return fmt.Errorf("stack underflow in DELTAC: need %d operands, have %d", int64(n)*2, e.StackTop)
 		}
 		for i := 0; i < int(n); i++ {
 			cvtIdx, err := e.pop()

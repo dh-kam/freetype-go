@@ -311,15 +311,41 @@ exercises the intended gap. Add `-fail-stale-expected-gaps` to `compare` or
 removed or narrowed.
 
 The checked-in request fixtures under `testdata/conformance` intentionally do
-not commit font binaries. They separate common conformance slices:
+not commit font binaries. They separate common conformance slices and a few
+type-specific tracking templates:
 
 - `ascii-smoke-request.json`: minimal dependency-light dump coverage.
 - `ascii-outline-request.json`: outline, metrics, charmap, and load-flag sweep.
 - `ascii-render-request.json`: small render-mode slice for bitmap output.
 - `render-placement-request.json`: render bitmap geometry, pixel mode,
   left/top placement, and buffer/hash comparison.
+- `truetype-size-vm-request.json`: hinted TrueType ppem/load-target sweep for
+  size model, CVT/prep, slot metric, outline, and VM delta tracking, including
+  glyphs that can expose MIRP/SDPVTL, guard/error-path, and rollback-related
+  differences when a suitable corpus font is supplied.
+- `type1-segments-request.json`: Type 1 outline and native
+  `type1_segments` tracking for segment-aware reference runs. Use Type 1
+  fonts that also exercise explicit AFM/PFM companion attachment and guarded
+  flex/OtherSubr result-pop cases when those areas are under measurement.
+- `woff2-collection-request.json`: WOFF2 transformed `glyf`/`loca`, `hmtx`,
+  instruction/bbox, short/long-loca multiglyph, per-glyph overlap bitmap,
+  collection long-multiglyph, collection `hmtx` dependency comparison, and
+  shared outline/composite collection tracking.
+  This is a request scope for licensed WOFF2 corpus fonts; rerun with `-face`
+  overrides for additional collection faces.
 - `expected-gap-policy-request.json`: tiny request for validating stale
   expected-gap policy during batch comparison.
+
+The Type 1 and TrueType VM requests include broad `expected_gaps` because their
+purpose is to keep known deltas counted while the port is still converging. Run
+batch comparison with `-fail-stale-expected-gaps` when those annotations should
+be treated as cleanup work. The WOFF2 request has no expected gaps; for that
+slice, decode, charmap, metric, and outline mismatches should remain unexpected
+unless a specific corpus run justifies a narrower annotation.
+
+The conformance unit tests parse every checked-in request fixture and require
+basic tracking metadata: description, corpus, ppem selection, at least one glyph
+or character selector, and explanatory notes on any `expected_gaps` entries.
 
 ## Fixture Strategy
 
@@ -331,6 +357,23 @@ Recommended glyph sets for the next conformance rounds:
 
 - Smoke: `.notdef`, space, `0`, `A`, `a`.
 - Contours: simple on-curve, quadratic off-curve, empty glyph, composite glyph.
+- Type 1: glyphs with lines, cubic curves, Subrs, flex, SEAC composition,
+  custom encoding entries, AFM/PFM companion metrics, known stem/blue-zone
+  hints, malformed terminator/flex cases, and pending OtherSubr result queues
+  for rejection-only checks. Companion metric runs should cover both parsed
+  `CompanionMetrics` attachment, explicit `SetCompanionMetricsFiles` paths,
+  and path-based `SetCompanionMetricsForFont` discovery.
+- TrueType VM/size: glyphs that execute prep and glyph programs, touch CVT and
+  storage, use composites, exercise MIRP/SDPVTL-sensitive paths, and have
+  visible differences across ppem and target modes. Keep guard/error-path
+  cases such as negative loop counts and rollback-triggering program failures
+  as package tests unless a licensed corpus font naturally exercises them.
+- WOFF2: transformed `glyf`/`loca`, transformed `hmtx`, composite glyphs,
+  instruction streams, explicit bounding boxes, per-glyph overlap bitmaps,
+  short and long `loca`, multiglyph `hmtx` dependencies, collections with
+  shared outline or `hmtx` dependencies, collection long-multiglyph cases, and
+  malformed shared-`hmtx`, raw/transformed outline mismatch, shared-composite,
+  or truncated streams kept for rejection-only tests.
 - Scripts: representative Latin, CJK, symbol, and missing-glyph lookups.
 - Bitmap/color: bitmap strikes, COLR/CPAL layers, sbix/CBDT payloads.
 - Variations: default instance plus one non-default axis tuple.

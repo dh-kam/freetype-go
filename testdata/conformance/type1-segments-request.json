@@ -1,0 +1,23 @@
+{
+  "description": "Type 1 native segment and outline request. Supply a standalone PFA/PFB or Type 1-flavored font with CONFORMANCE_FONT or -font.",
+  "corpus": "type1-segments",
+  "ppem": ["12", "24"],
+  "glyphs": [0],
+  "chars": ["U+0041", "U+0061"],
+  "load_flags": ["no-hinting", "default"],
+  "render_mode": "none",
+  "expected_gaps": [
+    {
+      "kind": "type1 segment delta",
+      "note": "Tracks native Type 1 segment kind, unit, and coordinate drift in segment-aware reference runs; stale when the reference dump omits type1_segments."
+    },
+    {
+      "kind": "outline point delta",
+      "note": "Tracks Type 1 outline coordinate drift while cubic preservation, flattening, and hint application remain under comparison."
+    },
+    {
+      "kind": "outline tag delta",
+      "note": "Tracks Type 1 outline tag drift from cubic flattening or reference outline conversion differences."
+    }
+  ]
+}

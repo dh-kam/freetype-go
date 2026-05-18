@@ -1,0 +1,11 @@
+{
+  "description": "WOFF2 decode request for transformed glyf/loca, hmtx, and collection/shared-outline cases. Supply a WOFF2 or WOFF2 collection font with CONFORMANCE_FONT or -font; rerun with -face for additional collection faces.",
+  "corpus": "woff2-collection",
+  "face_index": 0,
+  "ppem": ["12", "16"],
+  "glyphs": [0],
+  "glyph_ranges": ["1-4"],
+  "chars": ["U+0020", "U+0041", "U+0061"],
+  "load_flags": ["default", "no-hinting", "no-bitmap"],
+  "render_mode": "none"
+}

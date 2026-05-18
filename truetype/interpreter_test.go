@@ -232,6 +232,39 @@ func TestMIRPUsesOriginalDistanceWhenCVTExceedsCutIn(t *testing.T) {
 	}
 }
 
+func TestMIRPAllowsNegativeOneCVTAsZeroDistance(t *testing.T) {
+	sys := core.NewSystem()
+	ctx := NewContext(sys)
+
+	ctx.CVT = nil
+	ctx.Zones[1].Points = []api.Vector{{X: 0, Y: 0}, {X: 100, Y: 0}}
+	ctx.Zones[1].OriginalPoints = []api.Vector{{X: 0, Y: 0}, {X: 100, Y: 0}}
+	ctx.Zones[1].TouchedX = make([]bool, 2)
+	ctx.Zones[1].TouchedY = make([]bool, 2)
+	ctx.ZP0 = 1
+	ctx.ZP1 = 1
+	ctx.RP0 = 0
+
+	ctx.Code = []byte{
+		0x01,       // SVTCA[x]
+		0xB0, 0x01, // point 1
+		0xB8, 0xFF, 0xFF, // CVT index -1, treated as distance 0 for MIRP
+		0xE0, // MIRP without rounding or minimum distance
+	}
+	if err := ctx.Run(); err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+	if got := ctx.Zones[1].Points[1].X; got != 0 {
+		t.Fatalf("MIRP CVT[-1] moved X to %d, want 0", got)
+	}
+	if ctx.RP0 != 0 || ctx.RP1 != 0 || ctx.RP2 != 1 {
+		t.Fatalf("MIRP refs got RP0=%d RP1=%d RP2=%d, want 0,0,1", ctx.RP0, ctx.RP1, ctx.RP2)
+	}
+	if !ctx.Zones[1].TouchedX[1] {
+		t.Fatalf("MIRP should touch point 1 on X")
+	}
+}
+
 func TestMSIRPMovesPointAndUpdatesReferencePoints(t *testing.T) {
 	sys := core.NewSystem()
 	ctx := NewContext(sys)
@@ -402,6 +435,72 @@ func TestSHPShiftsByReferencePointDelta(t *testing.T) {
 	}
 	if ctx.GS.Loop != 1 {
 		t.Fatalf("SHP should reset loop to 1, got %d", ctx.GS.Loop)
+	}
+}
+
+func TestSHPPreflightsLoopPointIndexes(t *testing.T) {
+	sys := core.NewSystem()
+	ctx := NewContext(sys)
+
+	ctx.Zones[1].Points = []api.Vector{{X: 128, Y: 0}, {X: 50, Y: 0}}
+	ctx.Zones[1].OriginalPoints = []api.Vector{{X: 100, Y: 0}, {X: 50, Y: 0}}
+	ctx.Zones[1].TouchedX = make([]bool, 2)
+	ctx.Zones[1].TouchedY = make([]bool, 2)
+	ctx.ZP1 = 1
+	ctx.ZP2 = 1
+	ctx.RP2 = 0
+
+	ctx.Code = []byte{
+		0x01,             // SVTCA[x]
+		0xB0, 0x02, 0x17, // SLOOP 2
+		0xB1, 0x05, 0x01, // invalid point 5 below valid point 1 on stack
+		0x32, // SHP[0], reference rp2 in zp1
+	}
+
+	if err := ctx.Run(); err == nil {
+		t.Fatalf("SHP with an invalid loop point should fail")
+	}
+	if got := ctx.Zones[1].Points[1]; got != (api.Vector{X: 50, Y: 0}) {
+		t.Fatalf("SHP partially moved valid point before invalid operand: %#v", got)
+	}
+	if ctx.Zones[1].TouchedX[1] || ctx.Zones[1].TouchedY[1] {
+		t.Fatalf("SHP touched valid point before invalid operand: X=%v Y=%v", ctx.Zones[1].TouchedX[1], ctx.Zones[1].TouchedY[1])
+	}
+	if ctx.GS.Loop != 2 {
+		t.Fatalf("SHP invalid operand changed loop to %d, want 2", ctx.GS.Loop)
+	}
+}
+
+func TestSHPPreflightsLoopStackDepth(t *testing.T) {
+	sys := core.NewSystem()
+	ctx := NewContext(sys)
+
+	ctx.Zones[1].Points = []api.Vector{{X: 128, Y: 0}, {X: 50, Y: 0}}
+	ctx.Zones[1].OriginalPoints = []api.Vector{{X: 100, Y: 0}, {X: 50, Y: 0}}
+	ctx.Zones[1].TouchedX = make([]bool, 2)
+	ctx.Zones[1].TouchedY = make([]bool, 2)
+	ctx.ZP1 = 1
+	ctx.ZP2 = 1
+	ctx.RP2 = 0
+
+	ctx.Code = []byte{
+		0x01,             // SVTCA[x]
+		0xB0, 0x02, 0x17, // SLOOP 2
+		0xB0, 0x01, // one point for two SHP loop iterations
+		0x32, // SHP[0], reference rp2 in zp1
+	}
+
+	if err := ctx.Run(); err == nil {
+		t.Fatalf("SHP with too few loop operands should fail")
+	}
+	if got := ctx.Zones[1].Points[1]; got != (api.Vector{X: 50, Y: 0}) {
+		t.Fatalf("SHP partially moved valid point before stack underflow: %#v", got)
+	}
+	if ctx.Zones[1].TouchedX[1] || ctx.Zones[1].TouchedY[1] {
+		t.Fatalf("SHP touched valid point before stack underflow: X=%v Y=%v", ctx.Zones[1].TouchedX[1], ctx.Zones[1].TouchedY[1])
+	}
+	if ctx.GS.Loop != 2 {
+		t.Fatalf("SHP stack underflow changed loop to %d, want 2", ctx.GS.Loop)
 	}
 }
 
@@ -659,6 +758,181 @@ func TestDeltaInstructions(t *testing.T) {
 			t.Fatalf("SDB/SDS delta moved X to %d, want 32", got)
 		}
 	})
+
+	t.Run("DELTAP_backward_compat_negative_point", func(t *testing.T) {
+		ctx := NewContext(sys)
+		ctx.PPEM = 9
+		ctx.GS.BackwardCompatibility = true
+		ctx.GS.FreeVector = api.Vector{Y: 0x4000}
+		ctx.Zones[1].Points = []api.Vector{{X: 10, Y: 20}}
+		ctx.Zones[1].OriginalPoints = []api.Vector{{X: 10, Y: 20}}
+		ctx.Zones[1].TouchedX = make([]bool, 1)
+		ctx.Zones[1].TouchedY = make([]bool, 1)
+		ctx.Zones[1].Tags = []byte{outlineTagTouchY}
+		ctx.ZP0 = 1
+		ctx.Code = []byte{
+			0xB0, 0x08, // arg
+			0xB8, 0xFF, 0xFF, // point -1
+			0xB0, 0x01, // count
+			0x5D, // DELTAP1
+		}
+
+		if err := ctx.Run(); err != nil {
+			t.Fatalf("Run failed: %v", err)
+		}
+		if ctx.StackTop != 0 {
+			t.Fatalf("DELTAP should consume invalid pair, stack top=%d", ctx.StackTop)
+		}
+		if got := ctx.Zones[1].Points[0]; got != (api.Vector{X: 10, Y: 20}) {
+			t.Fatalf("DELTAP changed point for invalid index: %#v", got)
+		}
+		if ctx.Zones[1].TouchedX[0] || ctx.Zones[1].TouchedY[0] {
+			t.Fatalf("DELTAP touched point for invalid index: X=%v Y=%v", ctx.Zones[1].TouchedX[0], ctx.Zones[1].TouchedY[0])
+		}
+	})
+
+	for _, tt := range pointOps {
+		t.Run(tt.name+"_invalid_point_indexes", func(t *testing.T) {
+			ctx := NewContext(sys)
+			ctx.PPEM = tt.ppem
+			ctx.Zones[1].Points = []api.Vector{{X: 10, Y: 20}}
+			ctx.Zones[1].OriginalPoints = []api.Vector{{X: 10, Y: 20}}
+			ctx.Zones[1].TouchedX = make([]bool, 1)
+			ctx.Zones[1].TouchedY = make([]bool, 1)
+			ctx.ZP0 = 1
+			ctx.Code = []byte{
+				0xB0, 0x08, // arg for point -1
+				0xB8, 0xFF, 0xFF, // point -1
+				0xB1, 0x08, 0x05, // arg, out-of-range point 5
+				0xB0, 0x02, // count
+				tt.opcode,
+			}
+
+			if err := ctx.Run(); err != nil {
+				t.Fatalf("Run failed: %v", err)
+			}
+			if ctx.StackTop != 0 {
+				t.Fatalf("%s should consume invalid point pairs, stack top=%d", tt.name, ctx.StackTop)
+			}
+			if got := ctx.Zones[1].Points[0]; got != (api.Vector{X: 10, Y: 20}) {
+				t.Fatalf("%s changed point for invalid indexes: %#v", tt.name, got)
+			}
+			if ctx.Zones[1].TouchedX[0] || ctx.Zones[1].TouchedY[0] {
+				t.Fatalf("%s touched point for invalid indexes: X=%v Y=%v", tt.name, ctx.Zones[1].TouchedX[0], ctx.Zones[1].TouchedY[0])
+			}
+		})
+
+		t.Run(tt.name+"_negative_count", func(t *testing.T) {
+			ctx := NewContext(sys)
+			ctx.PPEM = tt.ppem
+			ctx.Zones[1].Points = []api.Vector{{X: 10, Y: 20}}
+			ctx.Zones[1].OriginalPoints = []api.Vector{{X: 10, Y: 20}}
+			ctx.Zones[1].TouchedX = make([]bool, 1)
+			ctx.Zones[1].TouchedY = make([]bool, 1)
+			ctx.ZP0 = 1
+			ctx.Code = []byte{
+				0xB1, 0x08, 0x00, // arg, point
+				0xB8, 0xFF, 0xFF, // count -1
+				tt.opcode,
+			}
+
+			if err := ctx.Run(); err == nil {
+				t.Fatalf("%s with negative count should fail", tt.name)
+			}
+			if got := ctx.Zones[1].Points[0]; got != (api.Vector{X: 10, Y: 20}) {
+				t.Fatalf("%s changed point after negative count: %#v", tt.name, got)
+			}
+			if ctx.Zones[1].TouchedX[0] || ctx.Zones[1].TouchedY[0] {
+				t.Fatalf("%s touched point after negative count: X=%v Y=%v", tt.name, ctx.Zones[1].TouchedX[0], ctx.Zones[1].TouchedY[0])
+			}
+		})
+
+		t.Run(tt.name+"_truncated_operands", func(t *testing.T) {
+			ctx := NewContext(sys)
+			ctx.PPEM = tt.ppem
+			ctx.Zones[1].Points = []api.Vector{{X: 10, Y: 20}}
+			ctx.Zones[1].OriginalPoints = []api.Vector{{X: 10, Y: 20}}
+			ctx.Zones[1].TouchedX = make([]bool, 1)
+			ctx.Zones[1].TouchedY = make([]bool, 1)
+			ctx.ZP0 = 1
+			ctx.Code = []byte{
+				0xB1, 0x08, 0x00, // one arg/point pair
+				0xB0, 0x02, // count asks for two pairs
+				tt.opcode,
+			}
+
+			if err := ctx.Run(); err == nil {
+				t.Fatalf("%s with truncated operands should fail", tt.name)
+			}
+			if got := ctx.Zones[1].Points[0]; got != (api.Vector{X: 10, Y: 20}) {
+				t.Fatalf("%s changed point after truncated operands: %#v", tt.name, got)
+			}
+			if ctx.Zones[1].TouchedX[0] || ctx.Zones[1].TouchedY[0] {
+				t.Fatalf("%s touched point after truncated operands: X=%v Y=%v", tt.name, ctx.Zones[1].TouchedX[0], ctx.Zones[1].TouchedY[0])
+			}
+		})
+	}
+
+	for _, tt := range cvtOps {
+		t.Run(tt.name+"_invalid_cvt_indexes", func(t *testing.T) {
+			ctx := NewContext(sys)
+			ctx.PPEM = tt.ppem
+			ctx.CVT = []int32{100}
+			ctx.Code = []byte{
+				0xB0, 0x08, // arg for CVT -1
+				0xB8, 0xFF, 0xFF, // CVT -1
+				0xB1, 0x08, 0x05, // arg, out-of-range CVT 5
+				0xB0, 0x02, // count
+				tt.opcode,
+			}
+
+			if err := ctx.Run(); err != nil {
+				t.Fatalf("Run failed: %v", err)
+			}
+			if ctx.StackTop != 0 {
+				t.Fatalf("%s should consume invalid CVT pairs, stack top=%d", tt.name, ctx.StackTop)
+			}
+			if got := ctx.CVT[0]; got != 100 {
+				t.Fatalf("%s changed CVT[0] for invalid indexes: %d", tt.name, got)
+			}
+		})
+
+		t.Run(tt.name+"_negative_count", func(t *testing.T) {
+			ctx := NewContext(sys)
+			ctx.PPEM = tt.ppem
+			ctx.CVT = []int32{100}
+			ctx.Code = []byte{
+				0xB1, 0x08, 0x00, // arg, CVT index
+				0xB8, 0xFF, 0xFF, // count -1
+				tt.opcode,
+			}
+
+			if err := ctx.Run(); err == nil {
+				t.Fatalf("%s with negative count should fail", tt.name)
+			}
+			if got := ctx.CVT[0]; got != 100 {
+				t.Fatalf("%s changed CVT[0] after negative count: %d", tt.name, got)
+			}
+		})
+
+		t.Run(tt.name+"_truncated_operands", func(t *testing.T) {
+			ctx := NewContext(sys)
+			ctx.PPEM = tt.ppem
+			ctx.CVT = []int32{100}
+			ctx.Code = []byte{
+				0xB1, 0x08, 0x00, // one arg/CVT pair
+				0xB0, 0x02, // count asks for two pairs
+				tt.opcode,
+			}
+
+			if err := ctx.Run(); err == nil {
+				t.Fatalf("%s with truncated operands should fail", tt.name)
+			}
+			if got := ctx.CVT[0]; got != 100 {
+				t.Fatalf("%s changed CVT[0] after truncated operands: %d", tt.name, got)
+			}
+		})
+	}
 }
 
 func TestControlScanAndInstructionStateOpcodes(t *testing.T) {
@@ -1159,6 +1433,9 @@ func TestVectorToLineSetsProjectionAndFreedomVectors(t *testing.T) {
 	if got := ctx.GS.FreeVector; got != (api.Vector{X: 0, Y: 0x4000}) {
 		t.Fatalf("FreeVector = %#v, want y-axis", got)
 	}
+	if got := ctx.GS.DualVector; got != (api.Vector{X: 0x4000, Y: 0}) {
+		t.Fatalf("DualVector = %#v, want SPVTL projection x-axis", got)
+	}
 }
 
 func TestStackVectorOps(t *testing.T) {
@@ -1256,6 +1533,32 @@ func TestSDPVTLUsesOriginalForDualAndCurrentForProjection(t *testing.T) {
 				t.Fatalf("DualVector = %#v, want %#v", got, tt.wantDual)
 			}
 		})
+	}
+}
+
+func TestSDPVTLPerpendicularProjectionSurvivesOriginalFallback(t *testing.T) {
+	sys := core.NewSystem()
+	ctx := NewContext(sys)
+
+	ctx.Zones[1].Points = []api.Vector{{X: 0, Y: 0}, {X: 100, Y: 0}}
+	ctx.Zones[1].OriginalPoints = []api.Vector{{X: 50, Y: 50}, {X: 50, Y: 50}}
+	ctx.Zones[1].TouchedX = make([]bool, 2)
+	ctx.Zones[1].TouchedY = make([]bool, 2)
+	ctx.ZP1 = 1
+	ctx.ZP2 = 1
+
+	ctx.Code = []byte{
+		0xB1, 0x01, 0x00, // p2=1, p1=0
+		0x87, // SDPVTL[1], perpendicular
+	}
+	if err := ctx.Run(); err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+	if got := ctx.GS.ProjVector; got != (api.Vector{X: 0, Y: 0x4000}) {
+		t.Fatalf("ProjVector = %#v, want current line perpendicular y-axis", got)
+	}
+	if got := ctx.GS.DualVector; got != (api.Vector{X: 0x4000, Y: 0}) {
+		t.Fatalf("DualVector = %#v, want degenerate original fallback x-axis", got)
 	}
 }
 
@@ -1461,6 +1764,22 @@ func TestAlignReferencePoint(t *testing.T) {
 	}
 	if ctx.GS.Loop != 1 {
 		t.Fatalf("ALIGNRP should reset loop to 1, got %d", ctx.GS.Loop)
+	}
+}
+
+func TestSLOOPRejectsNegativeCount(t *testing.T) {
+	ctx := NewContext(core.NewSystem())
+
+	ctx.Code = []byte{
+		0xB8, 0xFF, 0xFF, // PUSHW -1
+		0x17, // SLOOP
+	}
+
+	if err := ctx.Run(); err == nil {
+		t.Fatalf("SLOOP with a negative loop count should fail")
+	}
+	if ctx.GS.Loop != 1 {
+		t.Fatalf("SLOOP negative count changed loop to %d, want default 1", ctx.GS.Loop)
 	}
 }
 

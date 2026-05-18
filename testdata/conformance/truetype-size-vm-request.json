@@ -1,0 +1,31 @@
+{
+  "description": "TrueType size and VM parity request. Supply a hinted TrueType font with CONFORMANCE_FONT or -font; this isolates ppem/load-target changes without render output.",
+  "corpus": "truetype-size-vm",
+  "ppem": ["9", "12", "16", "17x19", "24"],
+  "glyphs": [0],
+  "chars": ["U+0048", "U+006D", "U+0069", "U+00C5"],
+  "load_flags": ["default", "target-light", "target-mono", "target-lcd"],
+  "render_mode": "none",
+  "expected_gaps": [
+    {
+      "kind": "glyph metric delta",
+      "note": "Tracks hinted advance and side-bearing drift across ppem/load-target sweeps while TrueType size and VM parity remain open."
+    },
+    {
+      "kind": "slot metric delta",
+      "note": "Tracks FreeType-style slot metric drift across size changes, prep reruns, CVT scaling, and target modes."
+    },
+    {
+      "kind": "outline bbox delta",
+      "note": "Tracks hinted outline bounds drift from size, CVT, prep, and VM behavior that is not yet FreeType-equivalent."
+    },
+    {
+      "kind": "outline point delta",
+      "note": "Tracks hinted point coordinate drift from remaining TrueType VM, phantom/twilight, and size-state differences."
+    },
+    {
+      "kind": "outline tag delta",
+      "note": "Tracks tag drift in hinted TrueType outlines so it remains visible separately from coordinate deltas."
+    }
+  ]
+}

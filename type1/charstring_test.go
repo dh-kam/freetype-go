@@ -2,6 +2,7 @@ package type1
 
 import (
 	"bytes"
+	"strings"
 	"testing"
 
 	"github.com/dh-kam/freetype-go/api"
@@ -172,6 +173,33 @@ func TestDecodeCharStringSubrAndDiv(t *testing.T) {
 	}
 }
 
+func TestDecodeCharStringRejectsTopLevelEOFWithoutTerminator(t *testing.T) {
+	data := t1prog(
+		t1nums(0, 500), t1ops(13),
+		t1nums(10, 20), t1ops(21),
+	)
+
+	if _, err := DecodeCharString(data, nil); err == nil {
+		t.Fatal("DecodeCharString unexpectedly accepted a top-level charstring without endchar")
+	}
+}
+
+func TestDecodeCharStringRejectsSubrEOFWithoutReturn(t *testing.T) {
+	subrs := [][]byte{
+		t1prog(t1nums(50), t1ops(6)), // hlineto without return
+	}
+	data := t1prog(
+		t1nums(0, 500), t1ops(13),
+		t1nums(10, 20), t1ops(21),
+		t1nums(0), t1ops(10),
+		t1ops(14),
+	)
+
+	if _, err := DecodeCharString(data, subrs); err == nil {
+		t.Fatal("DecodeCharString unexpectedly accepted a local subr without return")
+	}
+}
+
 func TestDecodeCharStringCurveOperatorsPreserveCubicTags(t *testing.T) {
 	data := t1prog(
 		t1nums(0, 500), t1ops(13),
@@ -248,6 +276,16 @@ func TestDecodeCharStringSEAC(t *testing.T) {
 	}
 	if *result.SEAC != (CharStringSEAC{ASB: 10, ADX: 20, ADY: 30, BaseChar: 65, AccentChar: 180}) {
 		t.Fatalf("SEAC = %+v", *result.SEAC)
+	}
+}
+
+func TestDecodeCharStringSEACTerminatesWithoutEndchar(t *testing.T) {
+	result, err := DecodeCharString(t1prog(t1nums(10, 20, 30, 65, 180), t1ops(12, 6)), nil)
+	if err != nil {
+		t.Fatalf("DecodeCharString failed: %v", err)
+	}
+	if result.SEAC == nil {
+		t.Fatal("expected SEAC metadata")
 	}
 }
 
@@ -329,6 +367,132 @@ func TestDecodeCharStringRejectsFlexSetcurrentpointWithMissingPop(t *testing.T) 
 
 	if _, err := DecodeCharString(data, nil); err == nil {
 		t.Fatal("DecodeCharString unexpectedly accepted flex setcurrentpoint with a missing pop")
+	}
+}
+
+func TestDecodeCharStringRejectsUnterminatedFlexBeforeTerminator(t *testing.T) {
+	tests := []struct {
+		name       string
+		terminator []byte
+		wantErr    string
+	}{
+		{name: "endchar", terminator: t1ops(14), wantErr: "unterminated flex sequence before endchar"},
+		{name: "seac", terminator: t1prog(t1nums(10, 20, 30, 65, 180), t1ops(12, 6)), wantErr: "unterminated flex sequence before seac"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data := t1prog(unterminatedType1FlexPrefix(), tt.terminator)
+
+			_, err := DecodeCharString(data, nil)
+			if err == nil {
+				t.Fatal("DecodeCharString unexpectedly accepted unterminated flex")
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("error = %q, want substring %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestDecodeCharStringRejectsPendingOtherSubrPopResultsBeforeTerminator(t *testing.T) {
+	tests := []struct {
+		name       string
+		terminator []byte
+		wantErr    string
+	}{
+		{name: "endchar", terminator: t1ops(14), wantErr: "pending OtherSubr pop results before endchar"},
+		{name: "seac", terminator: t1prog(t1nums(10, 20, 30, 65, 180), t1ops(12, 6)), wantErr: "pending OtherSubr pop results before seac"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data := t1prog(
+				t1nums(0, 500), t1ops(13),
+				t1nums(123, 1, 3), t1ops(12, 16), // OtherSubr 3 returns one value via pop.
+				tt.terminator,
+			)
+
+			_, err := DecodeCharString(data, nil)
+			if err == nil {
+				t.Fatal("DecodeCharString unexpectedly accepted pending OtherSubr pop results")
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("error = %q, want substring %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestDecodeCharStringRejectsPendingOtherSubrPopResultsBeforeCallOtherSubr(t *testing.T) {
+	data := t1prog(
+		t1nums(0, 500), t1ops(13),
+		t1nums(123, 1, 3), t1ops(12, 16), // OtherSubr 3 returns one value via pop.
+		t1nums(0, 1), t1ops(12, 16),
+		t1ops(14),
+	)
+
+	_, err := DecodeCharString(data, nil)
+	if err == nil {
+		t.Fatal("DecodeCharString unexpectedly accepted pending OtherSubr pop results before callothersubr")
+	}
+	if !strings.Contains(err.Error(), "pending OtherSubr pop results before callothersubr") {
+		t.Fatalf("error = %q, want pending OtherSubr callothersubr error", err)
+	}
+}
+
+func TestDecodeCharStringRejectsNonIntegerCallOtherSubrOperands(t *testing.T) {
+	tests := []struct {
+		name    string
+		data    []byte
+		wantErr string
+	}{
+		{
+			name: "argument count",
+			data: t1prog(
+				t1nums(0, 500), t1ops(13),
+				t1nums(1, 2), t1ops(12, 12), // 0.5
+				t1nums(1), t1ops(12, 16),
+			),
+			wantErr: "invalid argument count in callothersubr",
+		},
+		{
+			name: "subroutine number",
+			data: t1prog(
+				t1nums(0, 500), t1ops(13),
+				t1nums(0, 3, 2), t1ops(12, 12), // 1.5
+				t1ops(12, 16),
+			),
+			wantErr: "invalid subroutine number in callothersubr",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := DecodeCharString(tt.data, nil)
+			if err == nil {
+				t.Fatal("DecodeCharString unexpectedly accepted non-integer callothersubr operands")
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("error = %q, want substring %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestDecodeCharStringOtherSubr3PopValue(t *testing.T) {
+	data := t1prog(
+		t1nums(0, 500), t1ops(13),
+		t1nums(123, 1, 3), t1ops(12, 16), // OtherSubr 3 returns one value via pop.
+		t1ops(12, 17), // pop
+		t1ops(22),     // hmoveto consumes the popped value.
+		t1ops(14),
+	)
+
+	result, err := DecodeCharString(data, nil)
+	if err != nil {
+		t.Fatalf("DecodeCharString failed: %v", err)
+	}
+	wantPoints := []api.Vector{{X: 123 * 64}}
+	if !vectorsEqual(result.Outline.Points, wantPoints) {
+		t.Fatalf("points = %+v, want %+v", result.Outline.Points, wantPoints)
 	}
 }
 
@@ -524,6 +688,22 @@ func standardType1FlexSubrs() [][]byte {
 		t1prog(t1nums(0, 1), t1ops(12, 16, 11)),
 		t1prog(t1nums(0, 2), t1ops(12, 16, 11)),
 	}
+}
+
+func unterminatedType1FlexPrefix() []byte {
+	return t1prog(
+		t1nums(0, 500), t1ops(13),
+		t1nums(0, 0), t1ops(21),
+		t1nums(0, 1), t1ops(12, 16),
+		t1nums(0, 2), t1ops(12, 16),
+		t1nums(10, 0), t1ops(21), t1nums(0, 2), t1ops(12, 16),
+		t1nums(10, 10), t1ops(21), t1nums(0, 2), t1ops(12, 16),
+		t1nums(10, 0), t1ops(21), t1nums(0, 2), t1ops(12, 16),
+		t1nums(10, 0), t1ops(21), t1nums(0, 2), t1ops(12, 16),
+		t1nums(10, -10), t1ops(21), t1nums(0, 2), t1ops(12, 16),
+		t1nums(10, 0), t1ops(21), t1nums(0, 2), t1ops(12, 16),
+		t1nums(0, 0, 0, 3, 0), t1ops(12, 16),
+	)
 }
 
 func t1ops(ops ...int) []byte {
