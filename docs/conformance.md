@@ -321,8 +321,9 @@ type-specific tracking templates:
   left/top placement, and buffer/hash comparison.
 - `truetype-size-vm-request.json`: hinted TrueType ppem/load-target sweep for
   size model, CVT/prep, slot metric, outline, and VM delta tracking, including
-  glyphs that can expose MIRP/SDPVTL, ALIGNRP, guard/error-path, and
-  rollback-related differences when a suitable corpus font is supplied.
+  glyphs that can expose MIRP/SDPVTL, looped point-mutation opcodes,
+  guard/error-path, and rollback-related differences when a suitable corpus
+  font is supplied.
 - `type1-segments-request.json`: Type 1 outline and native
   `type1_segments` tracking for segment-aware reference runs. Use Type 1
   fonts that also exercise explicit AFM/PFM companion attachment and guarded
@@ -373,9 +374,9 @@ Recommended glyph sets for the next conformance rounds:
 - TrueType VM/size: glyphs that execute prep and glyph programs, touch CVT and
   storage, use composites, exercise MIRP/SDPVTL-sensitive paths, and have
   visible differences across ppem and target modes. Keep guard/error-path
-  cases such as negative loop counts, ALIGNRP preflight failures, and
-  rollback-triggering program failures as package tests unless a licensed
-  corpus font naturally exercises them.
+  cases such as negative loop counts, SHP/ALIGNRP/FLIPPT/SHPIX/IP preflight
+  failures, and rollback-triggering program failures as package tests unless a
+  licensed corpus font naturally exercises them.
 - WOFF2: transformed `glyf`/`loca`, transformed `hmtx`, composite glyphs,
   instruction streams, explicit bounding boxes, per-glyph overlap bitmaps,
   short and long `loca`, multiglyph `hmtx` dependencies, collections with

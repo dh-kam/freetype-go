@@ -12,7 +12,7 @@ areas.
 - **TrueType (.ttf)**: SFNT directory parsing, common table parsing, glyph
   loading, cmap/hmtx support, and TrueType instruction machinery with focused
   size/CVT/prep, MIRP CVT[-1], SDPVTL, negative SLOOP, DELTAP invalid-point,
-  ALIGNRP preflight, and rollback regression coverage.
+  SHP/ALIGNRP/FLIPPT/SHPIX/IP loop preflight, and rollback regression coverage.
 - **OpenType/CFF (.otf)**: CFF parsing and charstring-related support are
   present. Coverage should be treated as evolving.
 - **Type 1 (.pfa/.pfb)**: PFA/PFB parsing, Type 1 dictionary and encoding

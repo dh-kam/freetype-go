@@ -29,7 +29,7 @@ scope.
 | --- | --- | --- |
 | SFNT/OpenType shell | Implemented for directory parsing, common tables, collections, glyph lookup, glyph loading, and selected image/color/variation tables. | Needs broader real-font corpus coverage and more table edge cases before this can be treated as FreeType-compatible coverage. |
 | TrueType outlines | Implemented and comparable for outline geometry, metrics, charmap lookups, selected load flags, and current size/CVT/prep regression coverage. | Hinting-dependent output is not a full FreeType VM parity claim. Composite, transform, variation, loader-level size model behavior, and malformed-font edge cases still need corpus expansion. |
-| TrueType hinting VM | Implemented enough for ongoing hinting work and package tests, including prep execution, CVT scaling/mutation, cvar-before-scaling, size-reset regression coverage, selected MIRP CVT[-1] and SDPVTL vector fallback coverage, negative SLOOP and DELTAP invalid-point guards, ALIGNRP operand preflight coverage, and glyph-program rollback checks. | FreeType instruction semantics are broad. Remaining VM opcode behavior, graphics-state edge cases, twilight/phantom point behavior, target modes, size/driver state interactions, and rollback/error handling need systematic parity tests. |
+| TrueType hinting VM | Implemented enough for ongoing hinting work and package tests, including prep execution, CVT scaling/mutation, cvar-before-scaling, size-reset regression coverage, selected MIRP CVT[-1] and SDPVTL vector fallback coverage, negative SLOOP and DELTAP invalid-point guards, loop operand preflight coverage for SHP, ALIGNRP, FLIPPT, SHPIX, and IP, and glyph-program rollback checks. | FreeType instruction semantics are broad. Remaining VM opcode behavior, graphics-state edge cases, twilight/phantom point behavior, target modes, size/driver state interactions, and rollback/error handling need systematic parity tests. |
 | Smooth/mono/LCD raster output | Render-to-bitmap paths and conformance bitmap metadata are present. | FreeType bitmap bit parity is not closed. Pixel mode, pitch, placement, coverage, LCD filtering, mono packing, and byte-for-byte buffer hashes can still differ. |
 | Bitmap fonts and embedded bitmaps | BDF, PCF, FNT, and selected embedded bitmap table support exist. | Bitmap bit parity against FreeType is still an expected gap. Strike selection, placement, pixel modes, and packed buffer layout need reference comparisons across real bitmap fonts. |
 | CFF/CFF2 | Parser and charstring-related support exist, including CFF2 variation-related work. | Synthetic coverage is not enough. A licensed CFF/CFF2 corpus is needed to verify dicts, subrs, FDSelect/FDArray, blends, private dict behavior, and outline parity against FreeType. |
@@ -96,10 +96,10 @@ comparison:
   a zero-distance case. SDPVTL coverage now keeps the perpendicular projection
   when an original-point dual vector needs fallback, SLOOP rejects negative
   loop counts without mutating state, DELTAP backward-compatibility handling
-  skips invalid negative point indexes, ALIGNRP preflights loop stack depth and
-  point indexes before mutating points or resetting loop state, and
-  glyph-program failure coverage checks that outline/CVT mutations are rolled
-  back after an error.
+  skips invalid negative point indexes, and looped mutation opcodes now have
+  focused preflight coverage for SHP, ALIGNRP, FLIPPT, SHPIX, and IP before
+  mutating points, tags, or resetting loop state. Glyph-program failure
+  coverage checks that outline/CVT mutations are rolled back after an error.
 - Go and optional C FreeType JSON dumps, batch requests, render metadata,
   bitmap hashes, and `expected_gaps` remain the main way to measure progress.
 
@@ -202,8 +202,8 @@ applicable criteria are true:
   convergence.
 - **Hinting VM parity**: The interpreter needs broader opcode, graphics-state,
   target-mode, composite, variation, and error-path comparisons against
-  FreeType. ALIGNRP preflight and rollback coverage is a focused regression
-  slice, not a complete instruction-family claim.
+  FreeType. SHP/ALIGNRP/FLIPPT/SHPIX/IP preflight and rollback coverage is a
+  focused regression slice, not a complete instruction-family claim.
 - **TrueType size model parity**: Regression tests now cover important
   `SetPixelSizes`, CVT, cvar, prep, storage, and twilight-state behavior, but
   the loader-level size model is not yet a full FreeType size/driver-state
