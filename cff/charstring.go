@@ -9,6 +9,11 @@ import (
 	"github.com/dh-kam/freetype-go/core"
 )
 
+const (
+	maxCFF1ArgumentStack = 48
+	maxCFF2ArgumentStack = 513
+)
+
 type charStringContext struct {
 	stack        []float64
 	x, y         float64
@@ -25,6 +30,7 @@ type charStringContext struct {
 	widthParsed  bool
 	hintCount    int
 	vsIndex      int
+	maxStack     int
 	transient    [32]float64
 	randomSeed   uint32
 }
@@ -57,10 +63,22 @@ type charStringDecodeOptions struct {
 	variationStore  *VariationStore
 	variationCoords []float64
 	defaultVSIndex  int
+	maxStack        int
 }
 
-func (c *charStringContext) push(v float64) {
+func (c *charStringContext) stackLimit() int {
+	if c.maxStack > 0 {
+		return c.maxStack
+	}
+	return maxCFF1ArgumentStack
+}
+
+func (c *charStringContext) push(v float64) error {
+	if len(c.stack) >= c.stackLimit() {
+		return errors.New("charstring operand stack overflow")
+	}
 	c.stack = append(c.stack, v)
+	return nil
 }
 
 func (c *charStringContext) pop() (float64, error) {
@@ -193,6 +211,7 @@ func decodeCharString(data []byte, opts charStringDecodeOptions) (*charStringRes
 		varStore:    opts.variationStore,
 		varCoords:   opts.variationCoords,
 		vsIndex:     opts.defaultVSIndex,
+		maxStack:    opts.maxStack,
 	}
 	err := ctx.interpret(data)
 	if err != nil {
@@ -246,7 +265,9 @@ func (c *charStringContext) interpret(data []byte) error {
 				v = float64(int16(uint16(data[i])<<8|uint16(data[i+1]))) + float64(uint16(data[i+2])<<8|uint16(data[i+3]))/65536.0
 				i += 4
 			}
-			c.push(v)
+			if err := c.push(v); err != nil {
+				return err
+			}
 		} else {
 			// Operator
 			op := int(b)
@@ -490,7 +511,9 @@ func (c *charStringContext) interpret(data []byte) error {
 					return err
 				}
 			case 1223: // random
-				c.stack = append(c.stack, c.random())
+				if err := c.push(c.random()); err != nil {
+					return err
+				}
 			case 1224: // mul
 				if err := c.binaryStackOp("mul", func(a, b float64) (float64, error) {
 					return a * b, nil
@@ -642,8 +665,7 @@ func (c *charStringContext) dup() error {
 	if len(c.stack) < 1 {
 		return errors.New("stack underflow in dup")
 	}
-	c.stack = append(c.stack, c.stack[len(c.stack)-1])
-	return nil
+	return c.push(c.stack[len(c.stack)-1])
 }
 
 func (c *charStringContext) exch() error {
@@ -667,8 +689,7 @@ func (c *charStringContext) index() error {
 	if idx >= len(c.stack) {
 		idx = len(c.stack) - 1
 	}
-	c.stack = append(c.stack, c.stack[len(c.stack)-1-idx])
-	return nil
+	return c.push(c.stack[len(c.stack)-1-idx])
 }
 
 func (c *charStringContext) roll() error {

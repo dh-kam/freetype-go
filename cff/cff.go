@@ -524,6 +524,7 @@ func (c *CFF) loadGlyphOutline(glyphIndex int, variationCoords []float64) (*core
 		localSubrs:  localSubrs,
 	}
 	if c.Major == 2 {
+		opts.maxStack = maxCFF2ArgumentStack
 		fdIndex := 0
 		if c.FDSelect != nil {
 			fdIndex, err = c.FDSelect.FDIndex(glyphIndex)

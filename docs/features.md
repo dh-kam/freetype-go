@@ -13,8 +13,9 @@ areas.
   loading, cmap/hmtx support, and TrueType instruction machinery with focused
   size/CVT/prep, MIRP CVT[-1], SDPVTL, negative SLOOP, DELTAP invalid-point,
   SHP/ALIGNRP/FLIPPT/SHPIX/IP loop preflight, and rollback regression coverage.
-- **OpenType/CFF (.otf)**: CFF parsing and charstring-related support are
-  present. Coverage should be treated as evolving.
+- **OpenType/CFF (.otf)**: CFF parsing, CFF2 variation-related charstring
+  support, and CFF1/CFF2 operand stack bounds are present. Coverage should be
+  treated as evolving.
 - **Type 1 (.pfa/.pfb)**: PFA/PFB parsing, Type 1 dictionary and encoding
   handling, charstring outlines/metrics/Subrs/flex/SEAC coverage, and explicit
   AFM/PFM companion metric attachment through `SetAFM`, `SetPFM`, and

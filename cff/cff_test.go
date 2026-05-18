@@ -1368,6 +1368,40 @@ func TestDecodeCharStringRejectsOperandUnderflow(t *testing.T) {
 	}
 }
 
+func TestDecodeCharStringRejectsOperandStackOverflow(t *testing.T) {
+	n := csNumber
+	tests := []struct {
+		name string
+		data []byte
+	}{
+		{name: "number push", data: bytes.Repeat([]byte{n(0)}, maxCFF1ArgumentStack+1)},
+		{name: "dup push", data: append(bytes.Repeat([]byte{n(0)}, maxCFF1ArgumentStack), 12, 27)},
+		{name: "random push", data: append(bytes.Repeat([]byte{n(0)}, maxCFF1ArgumentStack), 12, 23)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := DecodeCharString(tt.data, nil, nil, nil); err == nil {
+				t.Fatalf("DecodeCharString succeeded for %s stack overflow", tt.name)
+			}
+		})
+	}
+}
+
+func TestDecodeCharStringCFF2OperandStackLimit(t *testing.T) {
+	n := csNumber
+	if _, err := decodeCharString(bytes.Repeat([]byte{n(0)}, maxCFF1ArgumentStack+1), charStringDecodeOptions{
+		maxStack: maxCFF2ArgumentStack,
+	}); err != nil {
+		t.Fatalf("CFF2-sized stack failed below configured limit: %v", err)
+	}
+	if _, err := decodeCharString(bytes.Repeat([]byte{n(0)}, maxCFF2ArgumentStack+1), charStringDecodeOptions{
+		maxStack: maxCFF2ArgumentStack,
+	}); err == nil {
+		t.Fatal("decodeCharString accepted CFF2 operand stack overflow")
+	}
+}
+
 func TestDecodeCharStringRejectsMalformedBounds(t *testing.T) {
 	n := csNumber
 
