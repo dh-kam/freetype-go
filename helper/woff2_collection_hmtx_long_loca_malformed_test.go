@@ -36,6 +36,29 @@ func TestWOFF2CollectionHmtxRejectsMalformedRawLongLocaDependencies(t *testing.T
 			},
 			want: "WOFF2 loca/glyf length mismatch",
 		},
+		{
+			name:           "long-loca-offset-beyond-glyf",
+			maxp:           testMaxpTable(1),
+			hmtxOrigLength: 4,
+			hmtx:           []byte{1, 0x01, 0xf4},
+			loca: []byte{
+				0, 0, 0, 0,
+				0, 0, 0, 20,
+			},
+			want: "invalid WOFF2 glyf bounds",
+		},
+		{
+			name:           "long-loca-non-monotonic-offsets",
+			maxp:           testMaxpTable(2),
+			hmtxOrigLength: 6,
+			hmtx:           []byte{3, 0x01, 0xf4},
+			loca: []byte{
+				0, 0, 0, 0,
+				0, 0, 0, 16,
+				0, 0, 0, 8,
+			},
+			want: "invalid WOFF2 loca offsets",
+		},
 	}
 
 	for _, tt := range tests {

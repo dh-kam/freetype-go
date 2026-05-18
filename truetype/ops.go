@@ -1842,6 +1842,9 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 		e.IP++
 
 	case opcode == 0x38: // SHPIX
+		if int64(e.GS.Loop)+1 > int64(e.StackTop) {
+			return fmt.Errorf("stack underflow in SHPIX: need %d operands, have %d", int64(e.GS.Loop)+1, e.StackTop)
+		}
 		dist, err := e.pop()
 		if err != nil {
 			return err
@@ -1969,6 +1972,9 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 		e.IP++
 
 	case opcode == 0x80: // FLIPPT
+		if int64(e.GS.Loop) > int64(e.StackTop) {
+			return fmt.Errorf("stack underflow in FLIPPT: need %d operands, have %d", e.GS.Loop, e.StackTop)
+		}
 		if e.GS.BackwardCompatibility && e.iupXCalled && e.iupYCalled {
 			for i := 0; i < int(e.GS.Loop); i++ {
 				if _, err := e.pop(); err != nil {
@@ -1980,6 +1986,12 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 			break
 		}
 		zone := &e.Zones[e.ZP0]
+		for i := 0; i < int(e.GS.Loop); i++ {
+			pIdx := e.Stack[e.StackTop-1-i]
+			if pIdx < 0 || int(pIdx) >= len(zone.Points) {
+				return fmt.Errorf("point index out of bounds in FLIPPT: %d", pIdx)
+			}
+		}
 		for i := 0; i < int(e.GS.Loop); i++ {
 			pIdx, err := e.pop()
 			if err != nil {

@@ -559,6 +559,38 @@ func TestShiftInstructionsMeasureReferenceOriginalWithDualVector(t *testing.T) {
 	})
 }
 
+func TestSHPIXPreflightsLoopStackDepth(t *testing.T) {
+	sys := core.NewSystem()
+	ctx := NewContext(sys)
+
+	ctx.GS.ProjVector = api.Vector{X: 0x4000, Y: 0}
+	ctx.GS.FreeVector = api.Vector{X: 0x4000, Y: 0}
+	ctx.Zones[1].Points = []api.Vector{{X: 20, Y: 0}, {X: 40, Y: 0}}
+	ctx.Zones[1].OriginalPoints = []api.Vector{{X: 20, Y: 0}, {X: 40, Y: 0}}
+	ctx.Zones[1].TouchedX = make([]bool, 2)
+	ctx.Zones[1].TouchedY = make([]bool, 2)
+	ctx.ZP2 = 1
+
+	ctx.Code = []byte{
+		0xB0, 0x02, 0x17, // SLOOP 2
+		0xB1, 0x01, 0x10, // one point and distance for two loop iterations
+		0x38, // SHPIX
+	}
+
+	if err := ctx.Run(); err == nil {
+		t.Fatal("SHPIX with too few loop operands should fail")
+	}
+	if got := ctx.Zones[1].Points[1]; got != (api.Vector{X: 40, Y: 0}) {
+		t.Fatalf("SHPIX partially moved valid point before stack underflow: %#v", got)
+	}
+	if ctx.Zones[1].TouchedX[1] || ctx.Zones[1].TouchedY[1] {
+		t.Fatalf("SHPIX touched valid point before stack underflow: X=%v Y=%v", ctx.Zones[1].TouchedX[1], ctx.Zones[1].TouchedY[1])
+	}
+	if ctx.GS.Loop != 2 {
+		t.Fatalf("SHPIX stack underflow changed loop to %d, want 2", ctx.GS.Loop)
+	}
+}
+
 func TestStackDepthDebugAndStateOpcodes(t *testing.T) {
 	sys := core.NewSystem()
 
@@ -1246,6 +1278,62 @@ func TestFlipOpcodesUseZoneTagsWhenAvailable(t *testing.T) {
 	}
 	if ctx.Zones[1].TouchedX[0] || ctx.Zones[1].TouchedX[1] || ctx.Zones[1].TouchedX[2] {
 		t.Fatalf("FLIP opcodes should not touch points, touched X=%#v", ctx.Zones[1].TouchedX)
+	}
+}
+
+func TestFLIPPTPreflightsLoopPointIndexes(t *testing.T) {
+	sys := core.NewSystem()
+	ctx := NewContext(sys)
+
+	ctx.Zones[1].Points = []api.Vector{{}, {}}
+	ctx.Zones[1].OriginalPoints = []api.Vector{{}, {}}
+	ctx.Zones[1].TouchedX = make([]bool, 2)
+	ctx.Zones[1].TouchedY = make([]bool, 2)
+	ctx.Zones[1].Tags = []byte{1, 0}
+	ctx.ZP0 = 1
+
+	ctx.Code = []byte{
+		0xB0, 0x02, 0x17, // loop = 2
+		0xB1, 0x05, 0x01, // invalid point 5 below valid point 1 on stack
+		0x80, // FLIPPT
+	}
+
+	if err := ctx.Run(); err == nil {
+		t.Fatal("FLIPPT with an invalid loop point should fail")
+	}
+	if got, want := ctx.Zones[1].Tags, []byte{1, 0}; got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("FLIPPT partially changed tags before invalid operand: got %#v want %#v", got, want)
+	}
+	if ctx.GS.Loop != 2 {
+		t.Fatalf("FLIPPT invalid operand changed loop to %d, want 2", ctx.GS.Loop)
+	}
+}
+
+func TestFLIPPTPreflightsLoopStackDepth(t *testing.T) {
+	sys := core.NewSystem()
+	ctx := NewContext(sys)
+
+	ctx.Zones[1].Points = []api.Vector{{}, {}}
+	ctx.Zones[1].OriginalPoints = []api.Vector{{}, {}}
+	ctx.Zones[1].TouchedX = make([]bool, 2)
+	ctx.Zones[1].TouchedY = make([]bool, 2)
+	ctx.Zones[1].Tags = []byte{1, 0}
+	ctx.ZP0 = 1
+
+	ctx.Code = []byte{
+		0xB0, 0x02, 0x17, // loop = 2
+		0xB0, 0x01, // one point for two FLIPPT loop iterations
+		0x80, // FLIPPT
+	}
+
+	if err := ctx.Run(); err == nil {
+		t.Fatal("FLIPPT with too few loop operands should fail")
+	}
+	if got, want := ctx.Zones[1].Tags, []byte{1, 0}; got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("FLIPPT partially changed tags before stack underflow: got %#v want %#v", got, want)
+	}
+	if ctx.GS.Loop != 2 {
+		t.Fatalf("FLIPPT stack underflow changed loop to %d, want 2", ctx.GS.Loop)
 	}
 }
 
