@@ -914,15 +914,15 @@ func TestDecodeCharStringLineAndCurveOperators(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DecodeCharString failed: %v", err)
 	}
-	if len(outline.Points) != 36 {
-		t.Fatalf("expected 36 points, got %d", len(outline.Points))
+	if len(outline.Points) != 15 {
+		t.Fatalf("expected 15 points, got %d", len(outline.Points))
 	}
 	assertPoint(t, outline, 0, 0, 0)
 	assertPoint(t, outline, 3, 40, 20)
 	assertPoint(t, outline, 5, 47, 25)
-	assertPoint(t, outline, 15, 67, 45)
-	assertPoint(t, outline, 25, 97, 115)
-	assertPoint(t, outline, 35, 157, 155)
+	assertPoint(t, outline, 8, 67, 45)
+	assertPoint(t, outline, 11, 97, 115)
+	assertPoint(t, outline, 14, 157, 155)
 }
 
 func TestDecodeCharStringPreservesNativeCubicSegments(t *testing.T) {
@@ -937,8 +937,8 @@ func TestDecodeCharStringPreservesNativeCubicSegments(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decodeCharString failed: %v", err)
 	}
-	if len(result.outline.Points) != 11 {
-		t.Fatalf("flattened outline points = %d, want 11", len(result.outline.Points))
+	if len(result.outline.Points) != 4 {
+		t.Fatalf("cubic outline points = %d, want 4", len(result.outline.Points))
 	}
 	if len(result.segments) != 2 {
 		t.Fatalf("segments = %d, want 2", len(result.segments))
@@ -955,7 +955,10 @@ func TestDecodeCharStringPreservesNativeCubicSegments(t *testing.T) {
 	assertVector(t, cubic.ctrl1, 10, 20)
 	assertVector(t, cubic.ctrl2, 40, 60)
 	assertVector(t, cubic.to, 90, 120)
-	assertPoint(t, result.outline, 10, 90, 120)
+	if got, want := result.outline.Tags, []byte{1, 2, 2, 1}; !bytes.Equal(got, want) {
+		t.Fatalf("outline tags = %v, want %v", got, want)
+	}
+	assertPoint(t, result.outline, 3, 90, 120)
 }
 
 func TestDecodeCharStringCurveOperatorSegments(t *testing.T) {
@@ -1060,11 +1063,11 @@ func TestDecodeCharStringFlexOperators(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DecodeCharString failed: %v", err)
 	}
-	if len(outline.Points) != 41 {
-		t.Fatalf("expected 41 points, got %d", len(outline.Points))
+	if len(outline.Points) != 13 {
+		t.Fatalf("expected 13 points, got %d", len(outline.Points))
 	}
-	assertPoint(t, outline, 20, 210, 0)
-	assertPoint(t, outline, 40, 367, 0)
+	assertPoint(t, outline, 6, 210, 0)
+	assertPoint(t, outline, 12, 367, 0)
 }
 
 func TestDecodeCharStringFlexOperatorSegments(t *testing.T) {

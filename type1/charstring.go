@@ -497,16 +497,12 @@ func (c *type1CharStringContext) rrcurveto(dx1, dy1, dx2, dy2, dx3, dy3 float64)
 			type1CharStringPoint(x3, y3),
 		},
 	})
-
-	const steps = 10
-	for i := 1; i <= steps; i++ {
-		t := float64(i) / steps
-		mt := 1 - t
-		px := mt*mt*mt*x0 + 3*mt*mt*t*x1 + 3*mt*t*t*x2 + t*t*t*x3
-		py := mt*mt*mt*y0 + 3*mt*mt*t*y1 + 3*mt*t*t*y2 + t*t*t*y3
-		c.result.Outline.Points = append(c.result.Outline.Points, type1CharStringPoint(px, py))
-		c.result.Outline.Tags = append(c.result.Outline.Tags, 1)
-	}
+	c.result.Outline.Points = append(c.result.Outline.Points,
+		type1CharStringPoint(x1, y1),
+		type1CharStringPoint(x2, y2),
+		type1CharStringPoint(x3, y3),
+	)
+	c.result.Outline.Tags = append(c.result.Outline.Tags, 2, 2, 1)
 	c.x = x3
 	c.y = y3
 	return nil

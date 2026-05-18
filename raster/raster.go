@@ -18,6 +18,10 @@ const (
 	pixelBits = 8
 	onePixel  = 1 << pixelBits
 	upscale   = onePixel >> 6
+
+	curveTagOn    = 1
+	curveTagConic = 0
+	curveTagCubic = 2
 )
 
 // TCell represents a single pixel cell in the smooth rasterizer.
@@ -153,82 +157,118 @@ func (r *SmoothRasterizer) decompose(outline api.Outline) error {
 	xScale := int32(r.worker.XScale)
 	yScale := int32(r.worker.YScale)
 
-	start := 0
-	for _, end := range contours {
-		if end < start || end >= len(points) || end >= len(tags) {
+	first := 0
+	for _, last := range contours {
+		if last < first || last >= len(points) || last >= len(tags) {
 			continue
 		}
 
-		contourPoints := points[start : end+1]
-		contourTags := tags[start : end+1]
-		if len(contourPoints) < 2 {
-			start = end + 1
+		vStart := r.worker.scaledOutlinePoint(points[first], xScale, yScale)
+		vLast := r.worker.scaledOutlinePoint(points[last], xScale, yScale)
+		point := first
+		limit := last
+		tag := curveTag(tags[first])
+		if tag == curveTagCubic {
+			first = last + 1
 			continue
 		}
 
-		type segmentPoint struct {
-			X, Y int32
-			On   bool
-		}
-		var segs []segmentPoint
-
-		for i := 0; i < len(contourPoints); i++ {
-			y := contourPoints[i].Y
-			if r.worker.FlipY {
-				y = int32((r.worker.MaxEy/r.worker.YScale)<<6) - y
+		if tag == curveTagConic {
+			if curveTag(tags[last]) == curveTagOn {
+				vStart = vLast
+				limit--
+			} else {
+				vStart = midpoint(vStart, vLast)
+				vLast = vStart
 			}
-			segs = append(segs, segmentPoint{
-				X:  contourPoints[i].X * xScale * upscale,
-				Y:  y * yScale * upscale,
-				On: (contourTags[i] & 1) == 1,
-			})
+			point--
 		}
 
-		// Handle implicit on-curve points or shift to start with an on-curve point
-		if !segs[0].On && !segs[len(segs)-1].On {
-			midX := (segs[0].X + segs[len(segs)-1].X) / 2
-			midY := (segs[0].Y + segs[len(segs)-1].Y) / 2
-			segs = append([]segmentPoint{{X: midX, Y: midY, On: true}}, segs...)
-		} else if !segs[0].On && segs[len(segs)-1].On {
-			last := segs[len(segs)-1]
-			segs = append([]segmentPoint{last}, segs[:len(segs)-1]...)
-		}
-
-		// Close the contour
-		segs = append(segs, segs[0])
-
-		r.worker.x = segs[0].X
-		r.worker.y = segs[0].Y
+		r.worker.x = vStart.X
+		r.worker.y = vStart.Y
 		r.worker.X = int(r.worker.x >> pixelBits)
 		r.worker.Y = int(r.worker.y >> pixelBits)
 		r.worker.Area = 0
 		r.worker.Cover = 0
 
-		for i := 1; i < len(segs); i++ {
-			pt := segs[i]
-			if pt.On {
-				r.worker.renderLine(pt.X, pt.Y)
-			} else {
-				nextPt := segs[i+1]
-				if nextPt.On {
-					r.worker.renderQuadratic(pt.X, pt.Y, nextPt.X, nextPt.Y)
-					i++
+		for point < limit {
+			point++
+			tag = curveTag(tags[point])
+			switch tag {
+			case curveTagOn:
+				vec := r.worker.scaledOutlinePoint(points[point], xScale, yScale)
+				r.worker.renderLine(vec.X, vec.Y)
+			case curveTagConic:
+				control := r.worker.scaledOutlinePoint(points[point], xScale, yScale)
+				for {
+					if point >= limit {
+						r.worker.renderQuadratic(control.X, control.Y, vStart.X, vStart.Y)
+						goto closeContour
+					}
+					point++
+					vec := r.worker.scaledOutlinePoint(points[point], xScale, yScale)
+					tag = curveTag(tags[point])
+					if tag == curveTagOn {
+						r.worker.renderQuadratic(control.X, control.Y, vec.X, vec.Y)
+						break
+					}
+					if tag != curveTagConic {
+						goto closeContour
+					}
+					mid := midpoint(control, vec)
+					r.worker.renderQuadratic(control.X, control.Y, mid.X, mid.Y)
+					control = vec
+				}
+			case curveTagCubic:
+				if point+1 > limit || curveTag(tags[point+1]) != curveTagCubic {
+					goto closeContour
+				}
+				control1 := r.worker.scaledOutlinePoint(points[point], xScale, yScale)
+				point++
+				control2 := r.worker.scaledOutlinePoint(points[point], xScale, yScale)
+				point++
+				if point <= limit {
+					vec := r.worker.scaledOutlinePoint(points[point], xScale, yScale)
+					r.worker.renderCubic(control1.X, control1.Y, control2.X, control2.Y, vec.X, vec.Y)
 				} else {
-					midX := (pt.X + nextPt.X) / 2
-					midY := (pt.Y + nextPt.Y) / 2
-					r.worker.renderQuadratic(pt.X, pt.Y, midX, midY)
+					r.worker.renderCubic(control1.X, control1.Y, control2.X, control2.Y, vStart.X, vStart.Y)
+					goto closeContour
 				}
 			}
 		}
 
-		// Record the last active cell
+		r.worker.renderLine(vStart.X, vStart.Y)
+
+	closeContour:
 		if r.worker.Area != 0 || r.worker.Cover != 0 {
 			r.worker.recordCell()
 		}
 
-		start = end + 1
+		first = last + 1
 	}
 	return nil
+}
+
+func (w *TWorker) scaledOutlinePoint(point api.Vector, xScale, yScale int32) api.Vector {
+	y := point.Y
+	if w.FlipY {
+		y = int32((w.MaxEy/w.YScale)<<6) - y
+	}
+	return api.Vector{
+		X: point.X * xScale * upscale,
+		Y: y * yScale * upscale,
+	}
+}
+
+func curveTag(tag byte) byte {
+	return tag & 3
+}
+
+func midpoint(a, b api.Vector) api.Vector {
+	return api.Vector{
+		X: (a.X + b.X) / 2,
+		Y: (a.Y + b.Y) / 2,
+	}
 }
 
 func (w *TWorker) renderQuadratic(ctrlX, ctrlY, toX, toY int32) {
@@ -297,6 +337,84 @@ func absInt64(v int64) int64 {
 		return -v
 	}
 	return v
+}
+
+type cubicPoint struct {
+	X int64
+	Y int64
+}
+
+func (w *TWorker) renderCubic(control1X, control1Y, control2X, control2Y, toX, toY int32) {
+	var stack [16*3 + 7]cubicPoint
+	arc := 0
+	stack[0] = cubicPoint{X: int64(toX), Y: int64(toY)}
+	stack[1] = cubicPoint{X: int64(control2X), Y: int64(control2Y)}
+	stack[2] = cubicPoint{X: int64(control1X), Y: int64(control1Y)}
+	stack[3] = cubicPoint{X: int64(w.x), Y: int64(w.y)}
+
+	if (int(stack[0].Y>>pixelBits) >= w.MaxEy &&
+		int(stack[1].Y>>pixelBits) >= w.MaxEy &&
+		int(stack[2].Y>>pixelBits) >= w.MaxEy &&
+		int(stack[3].Y>>pixelBits) >= w.MaxEy) ||
+		(int(stack[0].Y>>pixelBits) < w.MinEy &&
+			int(stack[1].Y>>pixelBits) < w.MinEy &&
+			int(stack[2].Y>>pixelBits) < w.MinEy &&
+			int(stack[3].Y>>pixelBits) < w.MinEy) {
+		w.x = toX
+		w.y = toY
+		return
+	}
+
+	for {
+		if absInt64(2*stack[arc].X-3*stack[arc+1].X+stack[arc+3].X) > onePixel/2 ||
+			absInt64(2*stack[arc].Y-3*stack[arc+1].Y+stack[arc+3].Y) > onePixel/2 ||
+			absInt64(stack[arc].X-3*stack[arc+2].X+2*stack[arc+3].X) > onePixel/2 ||
+			absInt64(stack[arc].Y-3*stack[arc+2].Y+2*stack[arc+3].Y) > onePixel/2 {
+			if arc+6 >= len(stack) {
+				w.renderLine(int32(stack[arc].X), int32(stack[arc].Y))
+				if arc == 0 {
+					return
+				}
+				arc -= 3
+				continue
+			}
+			splitCubic(stack[arc:])
+			arc += 3
+			continue
+		}
+
+		w.renderLine(int32(stack[arc].X), int32(stack[arc].Y))
+		if arc == 0 {
+			return
+		}
+		arc -= 3
+	}
+}
+
+func splitCubic(base []cubicPoint) {
+	base[6].X = base[3].X
+	a := base[0].X + base[1].X
+	b := base[1].X + base[2].X
+	c := base[2].X + base[3].X
+	base[5].X = c >> 1
+	c += b
+	base[4].X = c >> 2
+	base[1].X = a >> 1
+	a += b
+	base[2].X = a >> 2
+	base[3].X = (a + c) >> 3
+
+	base[6].Y = base[3].Y
+	a = base[0].Y + base[1].Y
+	b = base[1].Y + base[2].Y
+	c = base[2].Y + base[3].Y
+	base[5].Y = c >> 1
+	c += b
+	base[4].Y = c >> 2
+	base[1].Y = a >> 1
+	a += b
+	base[2].Y = a >> 2
+	base[3].Y = (a + c) >> 3
 }
 
 func (w *TWorker) setCell(ex, ey int) {

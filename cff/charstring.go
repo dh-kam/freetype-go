@@ -997,22 +997,12 @@ func (c *charStringContext) rrcurveto(dx1, dy1, dx2, dy2, dx3, dy3 float64) {
 		to:    charStringPoint(x3, y3),
 	})
 
-	// Flatten cubic Bezier to line segments
-	const steps = 10
-	for i := 1; i <= steps; i++ {
-		t := float64(i) / float64(steps)
-		t2 := t * t
-		t3 := t2 * t
-		mt := 1.0 - t
-		mt2 := mt * mt
-		mt3 := mt2 * mt
-
-		px := mt3*x0 + 3*mt2*t*x1 + 3*mt*t2*x2 + t3*x3
-		py := mt3*y0 + 3*mt2*t*y1 + 3*mt*t2*y2 + t3*y3
-
-		c.outline.Points = append(c.outline.Points, charStringPoint(px, py))
-		c.outline.Tags = append(c.outline.Tags, 1)
-	}
+	c.outline.Points = append(c.outline.Points,
+		charStringPoint(x1, y1),
+		charStringPoint(x2, y2),
+		charStringPoint(x3, y3),
+	)
+	c.outline.Tags = append(c.outline.Tags, 2, 2, 1)
 	c.x, c.y = x3, y3
 }
 

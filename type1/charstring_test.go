@@ -172,7 +172,7 @@ func TestDecodeCharStringSubrAndDiv(t *testing.T) {
 	}
 }
 
-func TestDecodeCharStringCurveOperatorsFlattenToLineSegments(t *testing.T) {
+func TestDecodeCharStringCurveOperatorsPreserveCubicTags(t *testing.T) {
 	data := t1prog(
 		t1nums(0, 500), t1ops(13),
 		t1nums(0, 0), t1ops(21),
@@ -188,32 +188,31 @@ func TestDecodeCharStringCurveOperatorsFlattenToLineSegments(t *testing.T) {
 	}
 
 	points := result.Outline.Points
-	if got, want := len(points), 31; got != want {
+	if got, want := len(points), 10; got != want {
 		t.Fatalf("point count = %d, want %d", got, want)
 	}
 	if got, want := len(result.Outline.Tags), len(points); got != want {
 		t.Fatalf("tag count = %d, want %d", got, want)
 	}
-	// core/raster currently expose only on/off-curve tags, so Type 1 cubics
-	// are flattened into on-curve line points rather than stored as cubics.
+	wantTags := []byte{1, 2, 2, 1, 2, 2, 1, 2, 2, 1}
 	for i, tag := range result.Outline.Tags {
-		if tag != 1 {
-			t.Fatalf("tag[%d] = %d, want on-curve flattened line point", i, tag)
+		if tag != wantTags[i] {
+			t.Fatalf("tag[%d] = %d, want %d", i, tag, wantTags[i])
 		}
 	}
 
 	wantPoints := map[int]api.Vector{
-		0:  {},
-		10: {X: 20 * 64, Y: 10 * 64},
-		20: {X: 50 * 64, Y: 30 * 64},
-		30: {X: 80 * 64, Y: 0},
+		0: {},
+		3: {X: 20 * 64, Y: 10 * 64},
+		6: {X: 50 * 64, Y: 30 * 64},
+		9: {X: 80 * 64, Y: 0},
 	}
 	for i, want := range wantPoints {
 		if got := points[i]; got != want {
 			t.Fatalf("point[%d] = %+v, want %+v", i, got, want)
 		}
 	}
-	if got, want := result.Outline.Contours, []int{30}; !intsEqual(got, want) {
+	if got, want := result.Outline.Contours, []int{9}; !intsEqual(got, want) {
 		t.Fatalf("contours = %v, want %v", got, want)
 	}
 	wantSegments := []CharStringSegment{
@@ -297,8 +296,8 @@ func TestDecodeCharStringFlexOtherSubrs(t *testing.T) {
 		t.Fatalf("DecodeCharString flex failed: %v", err)
 	}
 	points := result.Outline.Points
-	if len(points) != 21 {
-		t.Fatalf("flex point count = %d, want 21", len(points))
+	if len(points) != 7 {
+		t.Fatalf("flex point count = %d, want 7", len(points))
 	}
 	if points[0] != (api.Vector{}) {
 		t.Fatalf("flex start point = %+v, want zero", points[0])
@@ -306,7 +305,7 @@ func TestDecodeCharStringFlexOtherSubrs(t *testing.T) {
 	if got, want := points[len(points)-1], (api.Vector{X: 60 * 64, Y: 0}); got != want {
 		t.Fatalf("flex end point = %+v, want %+v", got, want)
 	}
-	if got, want := result.Outline.Contours, []int{20}; !intsEqual(got, want) {
+	if got, want := result.Outline.Contours, []int{6}; !intsEqual(got, want) {
 		t.Fatalf("flex contours = %v, want %v", got, want)
 	}
 }
@@ -358,7 +357,7 @@ func TestDecodeCharStringStandardFlexSubrsPreserveCallSubrOperands(t *testing.T)
 	if got, want := result.Outline.Points[len(result.Outline.Points)-1], (api.Vector{X: 65 * 64, Y: 7 * 64}); got != want {
 		t.Fatalf("point after flex = %+v, want %+v", got, want)
 	}
-	if got, want := result.Outline.Contours, []int{21}; !intsEqual(got, want) {
+	if got, want := result.Outline.Contours, []int{7}; !intsEqual(got, want) {
 		t.Fatalf("flex subr contours = %v, want %v", got, want)
 	}
 	wantSegments := []CharStringSegment{
