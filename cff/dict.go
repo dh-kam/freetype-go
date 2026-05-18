@@ -37,7 +37,11 @@ func ParseDict(data []byte) (map[int][]float64, error) {
 				return nil, fmt.Errorf("unexpected EOF reading 16-bit int")
 			}
 			val := int16(uint16(data[i])<<8 | uint16(data[i+1]))
-			stack = append(stack, float64(val))
+			var err error
+			stack, err = pushDictOperand(stack, float64(val))
+			if err != nil {
+				return nil, err
+			}
 			i += 2
 		} else if b0 == 29 {
 			// 32-bit integer
@@ -45,7 +49,11 @@ func ParseDict(data []byte) (map[int][]float64, error) {
 				return nil, fmt.Errorf("unexpected EOF reading 32-bit int")
 			}
 			val := int32(uint32(data[i])<<24 | uint32(data[i+1])<<16 | uint32(data[i+2])<<8 | uint32(data[i+3]))
-			stack = append(stack, float64(val))
+			var err error
+			stack, err = pushDictOperand(stack, float64(val))
+			if err != nil {
+				return nil, err
+			}
 			i += 4
 		} else if b0 == 30 {
 			// Real number (BCD)
@@ -85,9 +93,16 @@ func ParseDict(data []byte) (map[int][]float64, error) {
 			if err != nil {
 				return nil, fmt.Errorf("failed to parse BCD float %q: %v", sb.String(), err)
 			}
-			stack = append(stack, val)
+			stack, err = pushDictOperand(stack, val)
+			if err != nil {
+				return nil, err
+			}
 		} else if b0 >= 32 && b0 <= 246 {
-			stack = append(stack, float64(int(b0)-139))
+			var err error
+			stack, err = pushDictOperand(stack, float64(int(b0)-139))
+			if err != nil {
+				return nil, err
+			}
 		} else if b0 >= 247 && b0 <= 250 {
 			if i >= len(data) {
 				return nil, fmt.Errorf("unexpected EOF reading short int")
@@ -95,7 +110,11 @@ func ParseDict(data []byte) (map[int][]float64, error) {
 			b1 := data[i]
 			i++
 			val := (int(b0)-247)*256 + int(b1) + 108
-			stack = append(stack, float64(val))
+			var err error
+			stack, err = pushDictOperand(stack, float64(val))
+			if err != nil {
+				return nil, err
+			}
 		} else if b0 >= 251 && b0 <= 254 {
 			if i >= len(data) {
 				return nil, fmt.Errorf("unexpected EOF reading short int")
@@ -103,11 +122,25 @@ func ParseDict(data []byte) (map[int][]float64, error) {
 			b1 := data[i]
 			i++
 			val := -(int(b0)-251)*256 - int(b1) - 108
-			stack = append(stack, float64(val))
+			var err error
+			stack, err = pushDictOperand(stack, float64(val))
+			if err != nil {
+				return nil, err
+			}
 		} else {
 			return nil, fmt.Errorf("invalid DICT byte %d", b0)
 		}
 	}
+	if len(stack) != 0 {
+		return nil, fmt.Errorf("unterminated DICT operands")
+	}
 
 	return dict, nil
+}
+
+func pushDictOperand(stack []float64, v float64) ([]float64, error) {
+	if len(stack) >= maxCFF2ArgumentStack {
+		return nil, fmt.Errorf("DICT operand stack overflow")
+	}
+	return append(stack, v), nil
 }

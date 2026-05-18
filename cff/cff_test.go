@@ -922,6 +922,24 @@ func TestParseDict(t *testing.T) {
 	}
 }
 
+func TestParseDictRejectsMalformedOperandStack(t *testing.T) {
+	tests := []struct {
+		name string
+		data []byte
+	}{
+		{name: "trailing operand", data: []byte{csNumber(0)}},
+		{name: "operand stack overflow", data: bytes.Repeat([]byte{csNumber(0)}, maxCFF2ArgumentStack+1)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := ParseDict(tt.data); err == nil {
+				t.Fatal("ParseDict unexpectedly accepted malformed operand stack")
+			}
+		})
+	}
+}
+
 func TestDecodeCharString(t *testing.T) {
 	// Simple charstring: 100 100 rmoveto 50 0 lineto 0 50 lineto -50 0 lineto endchar
 	// Encodings:
