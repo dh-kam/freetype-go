@@ -54,7 +54,7 @@ type TWorker struct {
 	LCDFilter int
 
 	FreeTypeFillRule bool
-	GraySpans func(y int, spans []Span)
+	GraySpans        func(y int, spans []Span)
 }
 
 // Span represents a horizontal span of pixels with the same coverage.
