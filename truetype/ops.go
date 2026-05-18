@@ -2050,6 +2050,16 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 		oldRange := e.dualProjectIPDistance(zone0, e.RP1, zone1, e.RP2, twilight)
 		curRange := e.getProjectedDistance(zone0.Points[e.RP1], zone1.Points[e.RP2])
 
+		if int64(e.GS.Loop) > int64(e.StackTop) {
+			return fmt.Errorf("stack underflow in IP: need %d operands, have %d", e.GS.Loop, e.StackTop)
+		}
+		for i := 0; i < int(e.GS.Loop); i++ {
+			pIdx := e.Stack[e.StackTop-1-i]
+			if pIdx < 0 || int(pIdx) >= len(zone2.Points) || int(pIdx) >= len(zone2.OriginalPoints) {
+				return fmt.Errorf("index out of bounds in IP: rp1=%d, rp2=%d, p=%d", e.RP1, e.RP2, pIdx)
+			}
+		}
+
 		for i := 0; i < int(e.GS.Loop); i++ {
 			pIdx, err := e.pop()
 			if err != nil {

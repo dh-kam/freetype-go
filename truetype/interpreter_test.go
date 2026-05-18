@@ -1780,6 +1780,80 @@ func TestOriginalMeasurementsUseDualProjectionVector(t *testing.T) {
 	})
 }
 
+func TestIPPreflightsLoopPointIndexes(t *testing.T) {
+	sys := core.NewSystem()
+	ctx := NewContext(sys)
+
+	ctx.GS.ProjVector = api.Vector{X: 0x4000, Y: 0}
+	ctx.GS.FreeVector = api.Vector{X: 0x4000, Y: 0}
+	ctx.GS.DualVector = api.Vector{X: 0, Y: 0x4000}
+	ctx.Zones[1].Points = []api.Vector{{X: 0, Y: 0}, {X: 200, Y: 0}, {X: 0, Y: 0}}
+	ctx.Zones[1].OriginalPoints = []api.Vector{{X: 0, Y: 0}, {X: 0, Y: 100}, {X: 0, Y: 50}}
+	ctx.Zones[1].TouchedX = make([]bool, 3)
+	ctx.Zones[1].TouchedY = make([]bool, 3)
+	ctx.ZP0 = 1
+	ctx.ZP1 = 1
+	ctx.ZP2 = 1
+	ctx.RP1 = 0
+	ctx.RP2 = 1
+
+	ctx.Code = []byte{
+		0xB0, 0x02, 0x17, // SLOOP 2
+		0xB1, 0x05, 0x02, // invalid point 5 below valid point 2 on stack
+		0x39, // IP
+	}
+
+	if err := ctx.Run(); err == nil {
+		t.Fatal("IP with an invalid loop point should fail")
+	}
+	if got := ctx.Zones[1].Points[2]; got != (api.Vector{X: 0, Y: 0}) {
+		t.Fatalf("IP partially moved valid point before invalid operand: %#v", got)
+	}
+	if ctx.Zones[1].TouchedX[2] || ctx.Zones[1].TouchedY[2] {
+		t.Fatalf("IP touched valid point before invalid operand: X=%v Y=%v", ctx.Zones[1].TouchedX[2], ctx.Zones[1].TouchedY[2])
+	}
+	if ctx.GS.Loop != 2 {
+		t.Fatalf("IP invalid operand changed loop to %d, want 2", ctx.GS.Loop)
+	}
+}
+
+func TestIPPreflightsLoopStackDepth(t *testing.T) {
+	sys := core.NewSystem()
+	ctx := NewContext(sys)
+
+	ctx.GS.ProjVector = api.Vector{X: 0x4000, Y: 0}
+	ctx.GS.FreeVector = api.Vector{X: 0x4000, Y: 0}
+	ctx.GS.DualVector = api.Vector{X: 0, Y: 0x4000}
+	ctx.Zones[1].Points = []api.Vector{{X: 0, Y: 0}, {X: 200, Y: 0}, {X: 0, Y: 0}}
+	ctx.Zones[1].OriginalPoints = []api.Vector{{X: 0, Y: 0}, {X: 0, Y: 100}, {X: 0, Y: 50}}
+	ctx.Zones[1].TouchedX = make([]bool, 3)
+	ctx.Zones[1].TouchedY = make([]bool, 3)
+	ctx.ZP0 = 1
+	ctx.ZP1 = 1
+	ctx.ZP2 = 1
+	ctx.RP1 = 0
+	ctx.RP2 = 1
+
+	ctx.Code = []byte{
+		0xB0, 0x02, 0x17, // SLOOP 2
+		0xB0, 0x02, // one point for two IP loop iterations
+		0x39, // IP
+	}
+
+	if err := ctx.Run(); err == nil {
+		t.Fatal("IP with too few loop operands should fail")
+	}
+	if got := ctx.Zones[1].Points[2]; got != (api.Vector{X: 0, Y: 0}) {
+		t.Fatalf("IP partially moved valid point before stack underflow: %#v", got)
+	}
+	if ctx.Zones[1].TouchedX[2] || ctx.Zones[1].TouchedY[2] {
+		t.Fatalf("IP touched valid point before stack underflow: X=%v Y=%v", ctx.Zones[1].TouchedX[2], ctx.Zones[1].TouchedY[2])
+	}
+	if ctx.GS.Loop != 2 {
+		t.Fatalf("IP stack underflow changed loop to %d, want 2", ctx.GS.Loop)
+	}
+}
+
 func TestZonePointerOps(t *testing.T) {
 	sys := core.NewSystem()
 	ctx := NewContext(sys)
