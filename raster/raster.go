@@ -53,6 +53,7 @@ type TWorker struct {
 	LCDLine   []byte
 	LCDFilter int
 
+	FreeTypeFillRule bool
 	GraySpans func(y int, spans []Span)
 }
 
@@ -68,6 +69,8 @@ type Span struct {
 type SmoothRasterizer struct {
 	worker    TWorker
 	GraySpans func(y int, spans []Span)
+
+	freeTypeFillRule bool
 }
 
 // NewSmoothRasterizer creates a new instance of the smooth rasterizer.
@@ -78,6 +81,11 @@ func NewSmoothRasterizer() *SmoothRasterizer {
 // SetLCDFilter implements the api.Rasterizer interface.
 func (r *SmoothRasterizer) SetLCDFilter(filterType int) {
 	r.worker.LCDFilter = filterType
+}
+
+// SetFreeTypeFillRule enables FreeType's non-zero fill coverage rule.
+func (r *SmoothRasterizer) SetFreeTypeFillRule(enabled bool) {
+	r.freeTypeFillRule = enabled
 }
 
 // Render implements the api.Rasterizer interface.
@@ -98,6 +106,7 @@ func (r *SmoothRasterizer) Render(outline api.Outline, bitmap api.Bitmap) error 
 	r.worker.XScale = 1
 	r.worker.YScale = 1
 	r.worker.FlipY = false
+	r.worker.FreeTypeFillRule = r.freeTypeFillRule
 	if _, top, ok := api.GetBitmapPlacement(bitmap); ok && top != 0 && pixelMode != core.PixelModeLCDV {
 		r.worker.FlipY = true
 	}
@@ -1031,10 +1040,13 @@ func (w *TWorker) filterLCD(i int) byte {
 }
 
 func (w *TWorker) calculateGray(area int) byte {
-	if area < 0 {
+	if !w.FreeTypeFillRule && area < 0 {
 		area = -area
 	}
 	coverage := area >> (pixelBits*2 + 1 - 8)
+	if w.FreeTypeFillRule && coverage < 0 {
+		coverage = ^coverage
+	}
 	if coverage > 255 {
 		coverage = 255
 	}

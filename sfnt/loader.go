@@ -494,6 +494,11 @@ type Face struct {
 	loadedMetrics   map[int]glyphMetrics26Dot6
 }
 
+// UsesCFFOutlines reports whether this SFNT face renders glyph outlines from CFF/CFF2 data.
+func (f *Face) UsesCFFOutlines() bool {
+	return f != nil && f.cff != nil
+}
+
 type GlyphSlot struct {
 	outline        *core.Outline
 	bitmap         api.Bitmap
