@@ -98,6 +98,26 @@ func GetGlyphSlotMetrics(slot GlyphSlot) (GlyphMetrics, bool) {
 	return provider.GetMetrics()
 }
 
+// GlyphNameProvider is optional. Implementations can expose PostScript glyph
+// names, matching the role of FreeType's FT_Get_Glyph_Name, without changing
+// the stable Face interface.
+type GlyphNameProvider interface {
+	GetGlyphName(glyphIndex int) (string, bool)
+}
+
+// GetGlyphName returns a glyph's PostScript name when a face implementation
+// exposes it through GlyphNameProvider.
+func GetGlyphName(face Face, glyphIndex int) (string, bool) {
+	if face == nil {
+		return "", false
+	}
+	provider, ok := face.(GlyphNameProvider)
+	if !ok {
+		return "", false
+	}
+	return provider.GetGlyphName(glyphIndex)
+}
+
 // BitmapPlacementProvider is optional. Rendered outline bitmaps can expose
 // FreeType-style bitmap_left and bitmap_top placement without changing the
 // stable Bitmap interface.

@@ -566,6 +566,9 @@ func TestParseCFFRawMetadataEncodingAndFontBBox(t *testing.T) {
 	if got := face.GetUnitsPerEm(); got != 1000 {
 		t.Fatalf("GetUnitsPerEm = %d, want 1000", got)
 	}
+	if got := face.GetNumGlyphs(); got != 21 {
+		t.Fatalf("GetNumGlyphs = %d, want 21", got)
+	}
 	if bbox, ok := face.GetFontBBox(); !ok || bbox != ([4]float64{-10, -20, 700, 800}) {
 		t.Fatalf("GetFontBBox = %v, %v; want [-10 -20 700 800], true", bbox, ok)
 	}
@@ -580,6 +583,9 @@ func TestParseCFFRawMetadataEncodingAndFontBBox(t *testing.T) {
 	}
 	if name, ok := face.GlyphName(20); !ok || name != "comma" {
 		t.Fatalf("GlyphName(20) = %q, %v; want comma, true", name, ok)
+	}
+	if name, ok := face.GetGlyphName(20); !ok || name != "comma" {
+		t.Fatalf("GetGlyphName(20) = %q, %v; want comma, true", name, ok)
 	}
 }
 

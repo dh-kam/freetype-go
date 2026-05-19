@@ -57,6 +57,31 @@ func TestLoadFace(t *testing.T) {
 	}
 }
 
+func TestFaceGetGlyphNameUsesPostTable(t *testing.T) {
+	tables := []sfntTestTable{
+		{tag: "head", data: buildMetricsTestHeadTable()},
+		{tag: "maxp", data: buildMetricsTestMaxpTable(2)},
+		{tag: "post", data: buildGlyphNamePostTable()},
+	}
+	loaded, err := NewLoader(&mockSystem{}).LoadFace(&mockStream{data: buildSFNTTestData(t, tables)})
+	if err != nil {
+		t.Fatalf("LoadFace failed: %v", err)
+	}
+	face := loaded.(*Face)
+	if name, ok := face.GetGlyphName(0); !ok || name != "A.alt" {
+		t.Fatalf("GetGlyphName(0) = %q, %v; want A.alt, true", name, ok)
+	}
+	if name, ok := face.GetGlyphName(1); !ok || name != "A" {
+		t.Fatalf("GetGlyphName(1) = %q, %v; want A, true", name, ok)
+	}
+	if _, ok := face.GetGlyphName(2); ok {
+		t.Fatal("GetGlyphName succeeded for out-of-range glyph")
+	}
+	if name, ok := api.GetGlyphName(face, 0); !ok || name != "A.alt" {
+		t.Fatalf("api.GetGlyphName = %q, %v; want A.alt, true", name, ok)
+	}
+}
+
 func TestLoadFaceTTCFirstFace(t *testing.T) {
 	data := testTTCData([]ttcFaceSpec{
 		{offset: 32, headOffset: 300, maxpOffset: 354, numGlyphs: 7, indexToLocFormat: 1},
@@ -808,6 +833,17 @@ func buildMetricsTestMaxpTable(numGlyphs int) []byte {
 	data := make([]byte, 32)
 	binary.BigEndian.PutUint32(data[0:4], 0x00010000)
 	binary.BigEndian.PutUint16(data[4:6], uint16(numGlyphs))
+	return data
+}
+
+func buildGlyphNamePostTable() []byte {
+	data := make([]byte, 32+2+2*2+1+5)
+	binary.BigEndian.PutUint32(data[0:4], 0x00020000)
+	binary.BigEndian.PutUint16(data[32:34], 2)
+	binary.BigEndian.PutUint16(data[34:36], 258)
+	binary.BigEndian.PutUint16(data[36:38], 36)
+	data[38] = 5
+	copy(data[39:44], "A.alt")
 	return data
 }
 

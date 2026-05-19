@@ -339,6 +339,14 @@ func (f *Face) glyphName(glyphIndex int) (string, error) {
 	return f.font.GlyphNames[glyphIndex], nil
 }
 
+func (f *Face) GetGlyphName(glyphIndex int) (string, bool) {
+	if f == nil {
+		return "", false
+	}
+	name, err := f.glyphName(glyphIndex)
+	return name, err == nil && name != ""
+}
+
 func (f *Face) loadGlyphResultByName(name string, active map[string]bool) (*CharStringResult, error) {
 	if name == "" {
 		return nil, errors.New("empty Type 1 glyph name")

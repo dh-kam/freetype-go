@@ -31,6 +31,9 @@ func TestType1LoaderAndFace(t *testing.T) {
 	if face.GetNumGlyphs() != 2 {
 		t.Fatalf("num glyphs = %d, want 2", face.GetNumGlyphs())
 	}
+	if name, ok := face.GetGlyphName(1); !ok || name != "A" {
+		t.Fatalf("GetGlyphName(1) = %q, %v; want A, true", name, ok)
+	}
 	gid, err := face.GetGlyphIndex('A')
 	if err != nil {
 		t.Fatalf("GetGlyphIndex failed: %v", err)

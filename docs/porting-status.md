@@ -38,7 +38,7 @@ scope.
 | Color fonts | COLR/CPAL and sbix parsing/helpers exist for selected data. | There is no full COLR pixel renderer parity claim. COLR v0/v1 composition, gradients, transforms, clips, palette/variation handling, blending, and glyph recursion need rendered pixel comparisons. |
 | Variations | Selected variation tables such as `fvar` and `gvar` are supported. | Needs more multi-axis real-font corpus coverage and FreeType comparisons for outlines, metrics, CFF2 blends, and interaction with hinting/render modes. |
 | Layout | GSUB/GPOS parsing and selected application helpers exist. | FreeType itself is not a full shaping engine, so completion must be scoped carefully. The current layout support should be tracked as helper coverage, not FreeType rendering parity. |
-| API facade | FreeType-like load flags, render modes, errors, glyph slot metrics, bitmap, and image plumbing are present. | Drivers may expose only subsets. API compatibility should be judged by documented behavior and conformance data, not by matching names alone. |
+| API facade | FreeType-like load flags, render modes, errors, glyph slot metrics, optional glyph-name lookup, bitmap, and image plumbing are present. | Drivers may expose only subsets. API compatibility should be judged by documented behavior and conformance data, not by matching names alone. |
 | Conformance harness | Go dumps, optional C FreeType dumps, batch runs, smoke discovery, render metadata, bitmap hashes, Type 1 native segment comparison, and `expected_gaps` policy are present. | The harness is now capable of tracking gaps, but coverage is only as strong as the request corpus and fixture fonts used with it. |
 
 ## Recent Work Reflected Here

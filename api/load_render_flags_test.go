@@ -111,6 +111,36 @@ func TestGetBitmapPlacementMissingProvider(t *testing.T) {
 	}
 }
 
+type glyphNameFace struct{}
+
+func (glyphNameFace) GetNumGlyphs() int                                          { return 0 }
+func (glyphNameFace) SetPixelSizes(width, height int) error                      { return nil }
+func (glyphNameFace) LoadGlyph(glyphIndex int, loadFlags int) (GlyphSlot, error) { return nil, nil }
+func (glyphNameFace) GetGlyphSlot() GlyphSlot                                    { return nil }
+func (glyphNameFace) GetUnitsPerEm() uint16                                      { return 0 }
+func (glyphNameFace) GetGlyphIndex(char rune) (int, error)                       { return 0, nil }
+func (glyphNameFace) GetGlyphMetrics(glyphIndex int) (int32, int32, error)       { return 0, 0, nil }
+func (glyphNameFace) Shape(text string) ([]int, []Vector)                        { return nil, nil }
+func (glyphNameFace) GetGlyphName(glyphIndex int) (string, bool) {
+	if glyphIndex == 7 {
+		return "seven", true
+	}
+	return "", false
+}
+
+func TestGetGlyphNameUsesOptionalProvider(t *testing.T) {
+	name, ok := GetGlyphName(glyphNameFace{}, 7)
+	if !ok || name != "seven" {
+		t.Fatalf("glyph name = %q, %v; want seven, true", name, ok)
+	}
+	if _, ok := GetGlyphName(glyphNameFace{}, 8); ok {
+		t.Fatal("unexpected glyph name for missing glyph")
+	}
+	if _, ok := GetGlyphName(nil, 7); ok {
+		t.Fatal("nil face returned glyph name")
+	}
+}
+
 type bitmapWithoutPlacement struct{}
 
 func (bitmapWithoutPlacement) GetRows() int            { return 0 }

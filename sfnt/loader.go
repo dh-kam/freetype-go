@@ -610,6 +610,16 @@ func (f *Face) GetUnitsPerEm() uint16 {
 	return f.head.UnitsPerEm
 }
 
+func (f *Face) GetGlyphName(glyphIndex int) (string, bool) {
+	if f == nil || glyphIndex < 0 || glyphIndex >= f.GetNumGlyphs() {
+		return "", false
+	}
+	if f.cff != nil {
+		return f.cff.GlyphName(glyphIndex)
+	}
+	return f.post.GlyphName(glyphIndex)
+}
+
 func (f *Face) recomputeSizeMetrics() {
 	f.pointSize = int32(f.yPPEM)
 	f.xScale = f.computeScale(f.xPPEM)

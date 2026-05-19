@@ -605,6 +605,16 @@ func TestParsePostVersion2(t *testing.T) {
 	if len(post.Names) != 2 || post.Names[0] != "A.alt" || post.Names[1] != "foo" {
 		t.Fatalf("unexpected post names: %+v", post.Names)
 	}
+	if got, ok := post.GlyphName(0); !ok || got != "A.alt" {
+		t.Fatalf("post glyph 0 name = %q, %v; want A.alt, true", got, ok)
+	}
+	if got, ok := post.GlyphName(1); !ok || got != "foo" {
+		t.Fatalf("post glyph 1 name = %q, %v; want foo, true", got, ok)
+	}
+	standard := PostTable{Version: 0x00010000}
+	if got, ok := standard.GlyphName(36); !ok || got != "A" {
+		t.Fatalf("standard post glyph 36 name = %q, %v; want A, true", got, ok)
+	}
 }
 
 func TestParsePostRejectsShortHeader(t *testing.T) {

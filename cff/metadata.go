@@ -376,6 +376,13 @@ func (c *CFF) GetFontBBox() ([4]float64, bool) {
 	return c.FontBBox, true
 }
 
+func (c *CFF) GetNumGlyphs() int {
+	if c == nil {
+		return 0
+	}
+	return int(c.CharStringsIndex.Count)
+}
+
 func (c *CFF) GetGlyphIndex(char rune) (int, error) {
 	if c == nil {
 		return 0, errors.New("nil CFF face")
@@ -415,6 +422,10 @@ func (c *CFF) LookupGlyphIndexByName(name string) (int, bool) {
 	}
 	gid, ok := c.GlyphIndexByName[name]
 	return gid, ok
+}
+
+func (c *CFF) GetGlyphName(glyphIndex int) (string, bool) {
+	return c.GlyphName(glyphIndex)
 }
 
 func (c *CFF) GlyphName(glyphIndex int) (string, bool) {
