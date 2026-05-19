@@ -58,6 +58,20 @@ func cblcWithIndexSubtable(firstGlyph, lastGlyph uint16, subtable []byte) []byte
 	return cblcBuf.Bytes()
 }
 
+func embeddedBitmapRecord(metricsLen int, data []byte) []byte {
+	record := make([]byte, metricsLen+len(data))
+	copy(record[metricsLen:], data)
+	return record
+}
+
+func embeddedPNGRecord(metricsLen int, data []byte) []byte {
+	record := new(bytes.Buffer)
+	record.Write(make([]byte, metricsLen))
+	binary.Write(record, binary.BigEndian, uint32(len(data)))
+	record.Write(data)
+	return record.Bytes()
+}
+
 func TestSbixImage(t *testing.T) {
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.BigEndian, uint16(1))  // version
@@ -129,10 +143,10 @@ func TestCBLCCBDTImage(t *testing.T) {
 	binary.Write(cblcBuf, binary.BigEndian, uint16(17)) // imageFormat
 	binary.Write(cblcBuf, binary.BigEndian, uint32(0))  // imageDataOffset
 	binary.Write(cblcBuf, binary.BigEndian, uint32(0))  // offsetArray[0]
-	binary.Write(cblcBuf, binary.BigEndian, uint32(13)) // offsetArray[1]
+	binary.Write(cblcBuf, binary.BigEndian, uint32(22)) // offsetArray[1]
 
 	cbdtBuf := new(bytes.Buffer)
-	cbdtBuf.Write([]byte("mock_png_data"))
+	cbdtBuf.Write(embeddedPNGRecord(5, []byte("mock_png_data")))
 
 	sys := core.NewSystem()
 	sys.SetImageDecoder(&MockImageDecoder{})
@@ -228,7 +242,7 @@ func TestCBLCCBDTRejectsOversizedImageBeforeAllocation(t *testing.T) {
 func TestCBLCCBDTIndexFormat2ConstantSize(t *testing.T) {
 	subtable := new(bytes.Buffer)
 	binary.Write(subtable, binary.BigEndian, uint16(2)) // indexFormat
-	binary.Write(subtable, binary.BigEndian, uint16(17))
+	binary.Write(subtable, binary.BigEndian, uint16(5))
 	binary.Write(subtable, binary.BigEndian, uint32(0)) // imageDataOffset
 	binary.Write(subtable, binary.BigEndian, uint32(4)) // imageSize
 	subtable.Write(make([]byte, 8))                     // bigMetrics
@@ -254,17 +268,17 @@ func TestCBLCCBDTIndexFormat2ConstantSize(t *testing.T) {
 func TestCBLCCBDTIndexFormat3ShortOffsets(t *testing.T) {
 	subtable := new(bytes.Buffer)
 	binary.Write(subtable, binary.BigEndian, uint16(3)) // indexFormat
-	binary.Write(subtable, binary.BigEndian, uint16(17))
-	binary.Write(subtable, binary.BigEndian, uint32(0)) // imageDataOffset
-	binary.Write(subtable, binary.BigEndian, uint16(0)) // offsetArray[0]
-	binary.Write(subtable, binary.BigEndian, uint16(3)) // offsetArray[1]
-	binary.Write(subtable, binary.BigEndian, uint16(8)) // offsetArray[2]
+	binary.Write(subtable, binary.BigEndian, uint16(1))
+	binary.Write(subtable, binary.BigEndian, uint32(0))  // imageDataOffset
+	binary.Write(subtable, binary.BigEndian, uint16(0))  // offsetArray[0]
+	binary.Write(subtable, binary.BigEndian, uint16(8))  // offsetArray[1]
+	binary.Write(subtable, binary.BigEndian, uint16(18)) // offsetArray[2]
 
 	cblc, err := parseCBLC(&MockStream{data: cblcWithIndexSubtable(1, 2, subtable.Bytes())})
 	if err != nil {
 		t.Fatalf("parseCBLC failed: %v", err)
 	}
-	cbdt, err := parseCBDT(&MockStream{data: []byte("aaabbbbb")})
+	cbdt, err := parseCBDT(&MockStream{data: append(embeddedBitmapRecord(5, []byte("aaa")), embeddedBitmapRecord(5, []byte("bbbbb"))...)})
 	if err != nil {
 		t.Fatalf("parseCBDT failed: %v", err)
 	}
@@ -281,21 +295,21 @@ func TestCBLCCBDTIndexFormat3ShortOffsets(t *testing.T) {
 func TestCBLCCBDTIndexFormat4SparseGlyphOffsets(t *testing.T) {
 	subtable := new(bytes.Buffer)
 	binary.Write(subtable, binary.BigEndian, uint16(4))  // indexFormat
-	binary.Write(subtable, binary.BigEndian, uint16(17)) // imageFormat
+	binary.Write(subtable, binary.BigEndian, uint16(1))  // imageFormat
 	binary.Write(subtable, binary.BigEndian, uint32(0))  // imageDataOffset
 	binary.Write(subtable, binary.BigEndian, uint32(2))  // numGlyphs
 	binary.Write(subtable, binary.BigEndian, uint16(10)) // glyphID
 	binary.Write(subtable, binary.BigEndian, uint16(0))  // sbitOffset
 	binary.Write(subtable, binary.BigEndian, uint16(25)) // glyphID
-	binary.Write(subtable, binary.BigEndian, uint16(4))  // sbitOffset
+	binary.Write(subtable, binary.BigEndian, uint16(9))  // sbitOffset
 	binary.Write(subtable, binary.BigEndian, uint16(26)) // sentinel glyphID
-	binary.Write(subtable, binary.BigEndian, uint16(12)) // sentinel sbitOffset
+	binary.Write(subtable, binary.BigEndian, uint16(22)) // sentinel sbitOffset
 
 	cblc, err := parseCBLC(&MockStream{data: cblcWithIndexSubtable(10, 30, subtable.Bytes())})
 	if err != nil {
 		t.Fatalf("parseCBLC failed: %v", err)
 	}
-	cbdt, err := parseCBDT(&MockStream{data: []byte("skipfmt4data")})
+	cbdt, err := parseCBDT(&MockStream{data: append(embeddedBitmapRecord(5, []byte("skip")), embeddedBitmapRecord(5, []byte("fmt4data"))...)})
 	if err != nil {
 		t.Fatalf("parseCBDT failed: %v", err)
 	}
@@ -319,14 +333,14 @@ func TestCBLCCBDTIndexFormat4SparseGlyphOffsets(t *testing.T) {
 
 func TestCBLCCBDTIndexFormat5SparseConstantMetrics(t *testing.T) {
 	subtable := new(bytes.Buffer)
-	binary.Write(subtable, binary.BigEndian, uint16(5))  // indexFormat
-	binary.Write(subtable, binary.BigEndian, uint16(17)) // imageFormat
-	binary.Write(subtable, binary.BigEndian, uint32(0))  // imageDataOffset
-	binary.Write(subtable, binary.BigEndian, uint32(5))  // imageSize
-	subtable.Write(make([]byte, 8))                      // bigMetrics
-	binary.Write(subtable, binary.BigEndian, uint32(2))  // numGlyphs
-	binary.Write(subtable, binary.BigEndian, uint16(3))  // glyphID
-	binary.Write(subtable, binary.BigEndian, uint16(9))  // glyphID
+	binary.Write(subtable, binary.BigEndian, uint16(5)) // indexFormat
+	binary.Write(subtable, binary.BigEndian, uint16(5)) // imageFormat
+	binary.Write(subtable, binary.BigEndian, uint32(0)) // imageDataOffset
+	binary.Write(subtable, binary.BigEndian, uint32(5)) // imageSize
+	subtable.Write(make([]byte, 8))                     // bigMetrics
+	binary.Write(subtable, binary.BigEndian, uint32(2)) // numGlyphs
+	binary.Write(subtable, binary.BigEndian, uint16(3)) // glyphID
+	binary.Write(subtable, binary.BigEndian, uint16(9)) // glyphID
 
 	cblc, err := parseCBLC(&MockStream{data: cblcWithIndexSubtable(3, 9, subtable.Bytes())})
 	if err != nil {
@@ -343,6 +357,43 @@ func TestCBLCCBDTIndexFormat5SparseConstantMetrics(t *testing.T) {
 	}
 	if string(got) != "VWXYZ" {
 		t.Fatalf("unexpected image data: %q", got)
+	}
+}
+
+func TestCBLCCBDTStripsEmbeddedBitmapHeaders(t *testing.T) {
+	tests := []struct {
+		name        string
+		imageFormat uint16
+		record      []byte
+		want        string
+	}{
+		{name: "small metrics byte aligned", imageFormat: 1, record: embeddedBitmapRecord(5, []byte("bits")), want: "bits"},
+		{name: "big metrics byte aligned", imageFormat: 6, record: embeddedBitmapRecord(8, []byte("bigbits")), want: "bigbits"},
+		{name: "small metrics PNG", imageFormat: 17, record: embeddedPNGRecord(5, []byte("png17")), want: "png17"},
+		{name: "big metrics PNG", imageFormat: 18, record: embeddedPNGRecord(8, []byte("png18")), want: "png18"},
+		{name: "CBLC metrics PNG", imageFormat: 19, record: embeddedPNGRecord(0, []byte("png19")), want: "png19"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := extractEmbeddedBitmapPayload(tt.imageFormat, tt.record)
+			if err != nil {
+				t.Fatalf("extractEmbeddedBitmapPayload failed: %v", err)
+			}
+			if string(got) != tt.want {
+				t.Fatalf("payload = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCBLCCBDTRejectsTruncatedEmbeddedBitmapHeaders(t *testing.T) {
+	if _, err := extractEmbeddedBitmapPayload(17, []byte{0, 1, 2}); err == nil {
+		t.Fatal("expected truncated PNG payload error")
+	}
+	record := embeddedPNGRecord(0, []byte("png"))
+	record[3] = 10
+	if _, err := extractEmbeddedBitmapPayload(19, record); err == nil {
+		t.Fatal("expected PNG length out of bounds error")
 	}
 }
 

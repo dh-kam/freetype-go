@@ -1,7 +1,9 @@
 package sfnt
 
 import (
+	"encoding/binary"
 	"errors"
+
 	"github.com/dh-kam/freetype-go/api"
 )
 
@@ -390,21 +392,45 @@ func GetCBLCImage(cblc CBLCTable, cbdt CBDTTable, glyphIndex int) ([]byte, error
 		return nil, err
 	}
 
+	return extractEmbeddedBitmapPayload(imageFormat, rawData)
+}
+
+func extractEmbeddedBitmapPayload(imageFormat uint16, rawData []byte) ([]byte, error) {
 	switch imageFormat {
-	case 17:
+	case 1, 2:
+		return stripEmbeddedBitmapHeader(rawData, 5)
+	case 5:
 		return rawData, nil
+	case 6, 7:
+		return stripEmbeddedBitmapHeader(rawData, 8)
+	case 17:
+		return extractLengthPrefixedEmbeddedBitmap(rawData, 5)
 	case 18:
-		if len(rawData) > 5 {
-			return rawData[5:], nil
-		}
+		return extractLengthPrefixedEmbeddedBitmap(rawData, 8)
 	case 19:
-		if len(rawData) > 8 {
-			return rawData[8:], nil
-		}
+		return extractLengthPrefixedEmbeddedBitmap(rawData, 0)
 	default:
-		// Unsupported image format (maybe not PNG), return as is for now
+		// Composite and unknown bitmap formats are not decoded here yet.
 		return rawData, nil
 	}
+}
 
-	return rawData, nil
+func stripEmbeddedBitmapHeader(rawData []byte, headerLen int) ([]byte, error) {
+	if len(rawData) < headerLen {
+		return nil, errors.New("embedded bitmap payload too short")
+	}
+	return rawData[headerLen:], nil
+}
+
+func extractLengthPrefixedEmbeddedBitmap(rawData []byte, metricsLen int) ([]byte, error) {
+	lengthOffset := metricsLen
+	if len(rawData) < lengthOffset+4 {
+		return nil, errors.New("embedded bitmap PNG payload too short")
+	}
+	dataLen := binary.BigEndian.Uint32(rawData[lengthOffset : lengthOffset+4])
+	if dataLen > uint32(len(rawData)-(lengthOffset+4)) {
+		return nil, errors.New("embedded bitmap PNG length out of bounds")
+	}
+	start := lengthOffset + 4
+	return rawData[start : start+int(dataLen)], nil
 }
