@@ -310,6 +310,8 @@ func (c *charStringContext) interpret(data []byte) error {
 			}
 
 			switch op {
+			case 1200: // dotsection
+				c.stack = c.stack[:0]
 			case 1: // hstem
 				if err := c.consumeStemHints("hstem", false); err != nil {
 					return err

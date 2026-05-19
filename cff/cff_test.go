@@ -1318,6 +1318,25 @@ func TestDecodeCharStringFlexOperators(t *testing.T) {
 	assertPoint(t, outline, 12, 367, 0)
 }
 
+func TestDecodeCharStringIgnoresDotsection(t *testing.T) {
+	n := csNumber
+	data := []byte{
+		n(0), n(0), 21,
+		12, 0, // deprecated dotsection no-op
+		n(10), n(0), 5,
+		14,
+	}
+
+	result, err := decodeCharString(data, charStringDecodeOptions{})
+	if err != nil {
+		t.Fatalf("decodeCharString failed: %v", err)
+	}
+	if len(result.segments) != 2 {
+		t.Fatalf("segments = %d, want 2", len(result.segments))
+	}
+	assertLineSegment(t, result.segments[1], 0, 0, 10, 0)
+}
+
 func TestDecodeCharStringFlexOperatorSegments(t *testing.T) {
 	n := csNumber
 
@@ -1790,7 +1809,7 @@ func TestDecodeCharStringRejectsMalformedBounds(t *testing.T) {
 	})
 
 	t.Run("unsupported escaped operator", func(t *testing.T) {
-		if _, err := DecodeCharString([]byte{12, 0}, nil, nil, nil); err == nil {
+		if _, err := DecodeCharString([]byte{12, 1}, nil, nil, nil); err == nil {
 			t.Fatalf("DecodeCharString succeeded for unsupported escaped operator")
 		}
 	})
