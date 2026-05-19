@@ -591,6 +591,38 @@ func TestSHPIXPreflightsLoopStackDepth(t *testing.T) {
 	}
 }
 
+func TestSHPIXPreflightsLoopPointIndexes(t *testing.T) {
+	sys := core.NewSystem()
+	ctx := NewContext(sys)
+
+	ctx.GS.ProjVector = api.Vector{X: 0x4000, Y: 0}
+	ctx.GS.FreeVector = api.Vector{X: 0x4000, Y: 0}
+	ctx.Zones[1].Points = []api.Vector{{X: 20, Y: 0}, {X: 40, Y: 0}}
+	ctx.Zones[1].OriginalPoints = []api.Vector{{X: 20, Y: 0}, {X: 40, Y: 0}}
+	ctx.Zones[1].TouchedX = make([]bool, 2)
+	ctx.Zones[1].TouchedY = make([]bool, 2)
+	ctx.ZP2 = 1
+
+	ctx.Code = []byte{
+		0xB0, 0x02, 0x17, // SLOOP 2
+		0xB2, 0x05, 0x01, 0x10, // invalid point 5 below valid point 1, then distance
+		0x38, // SHPIX
+	}
+
+	if err := ctx.Run(); err == nil {
+		t.Fatal("SHPIX with an invalid loop point should fail")
+	}
+	if got := ctx.Zones[1].Points[1]; got != (api.Vector{X: 40, Y: 0}) {
+		t.Fatalf("SHPIX partially moved valid point before invalid operand: %#v", got)
+	}
+	if ctx.Zones[1].TouchedX[1] || ctx.Zones[1].TouchedY[1] {
+		t.Fatalf("SHPIX touched valid point before invalid operand: X=%v Y=%v", ctx.Zones[1].TouchedX[1], ctx.Zones[1].TouchedY[1])
+	}
+	if ctx.GS.Loop != 2 {
+		t.Fatalf("SHPIX invalid operand changed loop to %d, want 2", ctx.GS.Loop)
+	}
+}
+
 func TestStackDepthDebugAndStateOpcodes(t *testing.T) {
 	sys := core.NewSystem()
 

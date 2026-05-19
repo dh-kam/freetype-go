@@ -1845,19 +1845,22 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 		if int64(e.GS.Loop)+1 > int64(e.StackTop) {
 			return fmt.Errorf("stack underflow in SHPIX: need %d operands, have %d", int64(e.GS.Loop)+1, e.StackTop)
 		}
+		zone := &e.Zones[e.ZP2]
+		for i := 0; i < int(e.GS.Loop); i++ {
+			pIdx := e.Stack[e.StackTop-2-i]
+			if pIdx < 0 || int(pIdx) >= len(zone.Points) {
+				return fmt.Errorf("point index out of bounds in SHPIX: %d", pIdx)
+			}
+		}
 		dist, err := e.pop()
 		if err != nil {
 			return err
 		}
-		zone := &e.Zones[e.ZP2]
 		inTwilight := e.ZP0 == 0 || e.ZP1 == 0 || e.ZP2 == 0
 		for i := 0; i < int(e.GS.Loop); i++ {
 			pIdx, err := e.pop()
 			if err != nil {
 				return err
-			}
-			if pIdx < 0 || int(pIdx) >= len(zone.Points) {
-				continue
 			}
 			if e.GS.BackwardCompatibility {
 				if !inTwilight && (e.iupXCalled && e.iupYCalled ||

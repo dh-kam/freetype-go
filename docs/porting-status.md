@@ -105,7 +105,8 @@ comparison:
   skips invalid negative point indexes, and looped mutation opcodes now have
   focused preflight coverage for SHP, ALIGNRP, FLIPPT, SHPIX, and IP before
   mutating points, tags, or resetting loop state. Glyph-program failure
-  coverage checks that outline/CVT mutations are rolled back after an error.
+  coverage checks that outline/CVT mutations are rolled back after an error,
+  including SHPIX invalid point indexes.
 - Go and optional C FreeType JSON dumps, batch requests, render metadata,
   bitmap hashes, and `expected_gaps` remain the main way to measure progress.
 
