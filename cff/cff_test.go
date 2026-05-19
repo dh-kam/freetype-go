@@ -282,9 +282,12 @@ func testCFF1CIDFixture() []byte {
 }
 
 func testCFF1MetadataFixture(charset, encoding []byte, charStringCount int) []byte {
+	return testCFF1MetadataFixtureWithStrings(charset, encoding, testIndex16Bytes(), charStringCount)
+}
+
+func testCFF1MetadataFixtureWithStrings(charset, encoding, stringIndex []byte, charStringCount int) []byte {
 	header := []byte{1, 0, 4, 4}
 	nameIndex := testIndex16Bytes([]byte("RawCFF"))
-	stringIndex := testIndex16Bytes()
 	globalSubrs := testIndex16Bytes()
 	charStringsData := make([][]byte, charStringCount)
 	for i := range charStringsData {
@@ -599,6 +602,63 @@ func TestParseCFFRawEncodingSupplementUsesGlyphName(t *testing.T) {
 	}
 	if gid, err := face.GetGlyphIndex('A'); err != nil || gid != 1 {
 		t.Fatalf("GetGlyphIndex(A) = %d, %v; want 1, nil", gid, err)
+	}
+}
+
+func TestParseCFFRawMetadataFormat1CharsetAndEncoding(t *testing.T) {
+	charset := []byte{
+		1, 0, 34, 2, // charset format 1: SIDs 34..36 => A..C.
+	}
+	encoding := []byte{
+		1, 1, 65, 2, // Encoding format 1: codes 65..67 => GIDs 1..3.
+	}
+
+	face, err := ParseCFF(core.NewMemoryStream(testCFF1MetadataFixture(charset, encoding, 4)), 0)
+	if err != nil {
+		t.Fatalf("ParseCFF failed: %v", err)
+	}
+
+	if gid, err := face.GetGlyphIndex('C'); err != nil || gid != 3 {
+		t.Fatalf("GetGlyphIndex(C) = %d, %v; want 3, nil", gid, err)
+	}
+	if name, ok := face.GetGlyphNameByCharCode(67); !ok || name != "C" {
+		t.Fatalf("GetGlyphNameByCharCode(67) = %q, %v; want C, true", name, ok)
+	}
+}
+
+func TestParseCFFRawMetadataStringIndexSID(t *testing.T) {
+	charset := testCFFCharsetFormat0(391)
+	encoding := []byte{0, 1, 42}
+	stringIndex := testIndex16Bytes([]byte("customglyph"))
+
+	face, err := ParseCFF(core.NewMemoryStream(testCFF1MetadataFixtureWithStrings(charset, encoding, stringIndex, 2)), 0)
+	if err != nil {
+		t.Fatalf("ParseCFF failed: %v", err)
+	}
+
+	if name, ok := face.GlyphName(1); !ok || name != "customglyph" {
+		t.Fatalf("GlyphName(1) = %q, %v; want customglyph, true", name, ok)
+	}
+	if gid, ok := face.LookupGlyphIndexByName("customglyph"); !ok || gid != 1 {
+		t.Fatalf("LookupGlyphIndexByName(customglyph) = %d, %v; want 1, true", gid, ok)
+	}
+	if name, ok := face.GetGlyphNameByCharCode(42); !ok || name != "customglyph" {
+		t.Fatalf("GetGlyphNameByCharCode(42) = %q, %v; want customglyph, true", name, ok)
+	}
+}
+
+func TestCFFStandardSIDNamesIncludeLigatures(t *testing.T) {
+	face := &CFF{}
+	tests := map[int]string{
+		266: "ff",
+		267: "ffi",
+		268: "ffl",
+	}
+	for sid, want := range tests {
+		got, err := face.stringForSID(sid)
+		if err != nil || got != want {
+			t.Fatalf("stringForSID(%d) = %q, %v; want %q, nil", sid, got, err, want)
+		}
 	}
 }
 
