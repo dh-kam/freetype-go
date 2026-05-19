@@ -29,6 +29,67 @@ func TestWOFF2Invalid(t *testing.T) {
 	}
 }
 
+func TestWOFF2ReadBase128(t *testing.T) {
+	tests := []struct {
+		name    string
+		data    []byte
+		want    uint32
+		wantErr string
+	}{
+		{
+			name: "single byte",
+			data: []byte{0x7f},
+			want: 0x7f,
+		},
+		{
+			name: "max uint32",
+			data: []byte{0x8f, 0xff, 0xff, 0xff, 0x7f},
+			want: 0xffffffff,
+		},
+		{
+			name:    "leading zero group",
+			data:    []byte{0x80, 0x01},
+			wantErr: "invalid base128",
+		},
+		{
+			name:    "overflow",
+			data:    []byte{0x90, 0x80, 0x80, 0x80, 0x00},
+			wantErr: "base128 overflow",
+		},
+		{
+			name:    "too many bytes",
+			data:    []byte{0x81, 0x80, 0x80, 0x80, 0x80, 0x00},
+			wantErr: "base128 exceeds 5 bytes",
+		},
+		{
+			name:    "truncated continuation",
+			data:    []byte{0x81},
+			wantErr: "EOF",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := readBase128(bytes.NewReader(tt.data))
+			if tt.wantErr != "" {
+				if err == nil {
+					t.Fatalf("readBase128 succeeded; want %q", tt.wantErr)
+				}
+				if !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("error = %q, want containing %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("readBase128 failed: %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("readBase128 = %#x, want %#x", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestDecodeWOFFIfNeededReturnsNonWOFFStream(t *testing.T) {
 	stream := core.NewMemoryStream([]byte("not a wrapped font"))
 	out, err := DecodeWOFFIfNeeded(stream)

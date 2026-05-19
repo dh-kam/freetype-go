@@ -75,7 +75,7 @@ func readBase128(r io.Reader) (uint32, error) {
 	var result uint32
 	var b [1]byte
 	for i := 0; i < 5; i++ {
-		if _, err := r.Read(b[:]); err != nil {
+		if _, err := io.ReadFull(r, b[:]); err != nil {
 			return 0, err
 		}
 		data := b[0]
