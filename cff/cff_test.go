@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"math"
+	"strings"
 	"testing"
 
 	"github.com/dh-kam/freetype-go/api"
@@ -1403,6 +1404,80 @@ func TestDecodeCharStringRejectsOperandUnderflow(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if _, err := DecodeCharString(tt.data, nil, nil, []float64{1}); err == nil {
 				t.Fatalf("DecodeCharString succeeded for %s", tt.name)
+			}
+		})
+	}
+}
+
+func TestDecodeCharStringRejectsNonIntegerIntegerOperands(t *testing.T) {
+	n := csNumber
+	half := []byte{255, 0, 0, 0x80, 0}
+	tests := []struct {
+		name        string
+		data        []byte
+		globalSubrs *Index
+		localSubrs  *Index
+		blendVector []float64
+		wantErr     string
+	}{
+		{
+			name:       "callsubr index",
+			data:       append(append([]byte{}, half...), 10),
+			localSubrs: testIndex([]byte{11}),
+			wantErr:    "invalid subroutine index in callsubr",
+		},
+		{
+			name:        "callgsubr index",
+			data:        append(append([]byte{}, half...), 29),
+			globalSubrs: testIndex([]byte{11}),
+			wantErr:     "invalid subroutine index in callgsubr",
+		},
+		{
+			name:        "blend count",
+			data:        append(append([]byte{}, half...), 16),
+			blendVector: []float64{1},
+			wantErr:     "invalid operand count in blend",
+		},
+		{
+			name:    "vsindex",
+			data:    append(append([]byte{}, half...), 15),
+			wantErr: "invalid variation store index in vsindex",
+		},
+		{
+			name:    "index",
+			data:    append([]byte{n(10), n(20)}, append(half, 12, 29)...),
+			wantErr: "invalid stack index in index",
+		},
+		{
+			name:    "roll count",
+			data:    append([]byte{n(1), n(2)}, append(half, n(1), 12, 30)...),
+			wantErr: "invalid roll count in roll",
+		},
+		{
+			name:    "roll shift",
+			data:    append([]byte{n(1), n(2), n(2)}, append(half, 12, 30)...),
+			wantErr: "invalid roll shift in roll",
+		},
+		{
+			name:    "put index",
+			data:    append([]byte{n(10)}, append(half, 12, 20)...),
+			wantErr: "invalid transient array index in put",
+		},
+		{
+			name:    "get index",
+			data:    append(append([]byte{}, half...), 12, 21),
+			wantErr: "invalid transient array index in get",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := DecodeCharString(tt.data, tt.globalSubrs, tt.localSubrs, tt.blendVector)
+			if err == nil {
+				t.Fatal("DecodeCharString unexpectedly accepted non-integer operand")
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("error = %q, want substring %q", err, tt.wantErr)
 			}
 		})
 	}

@@ -181,6 +181,14 @@ func boolNumber(v bool) float64 {
 	return 0
 }
 
+func charStringIntOperand(v float64, name, op string) (int, error) {
+	i := int(v)
+	if float64(i) != v {
+		return 0, fmt.Errorf("invalid %s in %s", name, op)
+	}
+	return i, nil
+}
+
 func calculateBias(count int) int {
 	if count < 1240 {
 		return 107
@@ -359,10 +367,14 @@ func (c *charStringContext) interpret(data []byte) error {
 				if err != nil {
 					return fmt.Errorf("stack underflow in callsubr")
 				}
+				subrIndex, err := charStringIntOperand(operand, "subroutine index", "callsubr")
+				if err != nil {
+					return err
+				}
 				if c.localSubrs == nil {
 					return errors.New("callsubr called but no local subrs")
 				}
-				idx := int(operand) + calculateBias(int(c.localSubrs.Count))
+				idx := subrIndex + calculateBias(int(c.localSubrs.Count))
 				subrData, err := c.localSubrs.Get(idx)
 				if err != nil {
 					return fmt.Errorf("failed to get local subr %d: %v", idx, err)
@@ -375,10 +387,14 @@ func (c *charStringContext) interpret(data []byte) error {
 				if err != nil {
 					return fmt.Errorf("stack underflow in callgsubr")
 				}
+				subrIndex, err := charStringIntOperand(operand, "subroutine index", "callgsubr")
+				if err != nil {
+					return err
+				}
 				if c.globalSubrs == nil {
 					return errors.New("callgsubr called but no global subrs")
 				}
-				idx := int(operand) + calculateBias(int(c.globalSubrs.Count))
+				idx := subrIndex + calculateBias(int(c.globalSubrs.Count))
 				subrData, err := c.globalSubrs.Get(idx)
 				if err != nil {
 					return fmt.Errorf("failed to get global subr %d: %v", idx, err)
@@ -554,7 +570,10 @@ func (c *charStringContext) interpret(data []byte) error {
 				if err != nil {
 					return fmt.Errorf("stack underflow in blend")
 				}
-				n := int(operand)
+				n, err := charStringIntOperand(operand, "operand count", "blend")
+				if err != nil {
+					return err
+				}
 				if n < 0 {
 					return errors.New("negative operand count in blend")
 				}
@@ -610,7 +629,10 @@ func (c *charStringContext) vsindex() error {
 	if len(c.stack) < 1 {
 		return errors.New("stack underflow in vsindex")
 	}
-	idx := int(c.stack[len(c.stack)-1])
+	idx, err := charStringIntOperand(c.stack[len(c.stack)-1], "variation store index", "vsindex")
+	if err != nil {
+		return err
+	}
 	if idx < 0 {
 		return errors.New("negative variation store index in vsindex")
 	}
@@ -681,7 +703,10 @@ func (c *charStringContext) index() error {
 	if len(c.stack) < 2 {
 		return errors.New("stack underflow in index")
 	}
-	idx := int(c.stack[len(c.stack)-1])
+	idx, err := charStringIntOperand(c.stack[len(c.stack)-1], "stack index", "index")
+	if err != nil {
+		return err
+	}
 	c.stack = c.stack[:len(c.stack)-1]
 	if idx < 0 {
 		idx = 0
@@ -696,8 +721,14 @@ func (c *charStringContext) roll() error {
 	if len(c.stack) < 2 {
 		return errors.New("stack underflow in roll")
 	}
-	j := int(c.stack[len(c.stack)-1])
-	n := int(c.stack[len(c.stack)-2])
+	j, err := charStringIntOperand(c.stack[len(c.stack)-1], "roll shift", "roll")
+	if err != nil {
+		return err
+	}
+	n, err := charStringIntOperand(c.stack[len(c.stack)-2], "roll count", "roll")
+	if err != nil {
+		return err
+	}
 	c.stack = c.stack[:len(c.stack)-2]
 	if n < 0 || n > len(c.stack) {
 		return errors.New("invalid operand count in roll")
@@ -725,7 +756,10 @@ func (c *charStringContext) put() error {
 	if len(c.stack) < 2 {
 		return errors.New("stack underflow in put")
 	}
-	idx := int(c.stack[len(c.stack)-1])
+	idx, err := charStringIntOperand(c.stack[len(c.stack)-1], "transient array index", "put")
+	if err != nil {
+		return err
+	}
 	if idx < 0 || idx >= len(c.transient) {
 		return errors.New("transient array index out of range in put")
 	}
@@ -738,7 +772,10 @@ func (c *charStringContext) get() error {
 	if len(c.stack) < 1 {
 		return errors.New("stack underflow in get")
 	}
-	idx := int(c.stack[len(c.stack)-1])
+	idx, err := charStringIntOperand(c.stack[len(c.stack)-1], "transient array index", "get")
+	if err != nil {
+		return err
+	}
 	if idx < 0 || idx >= len(c.transient) {
 		return errors.New("transient array index out of range in get")
 	}
