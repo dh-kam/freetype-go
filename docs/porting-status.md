@@ -62,7 +62,8 @@ comparison:
   auto-attachment. This only broadens same-stem file-backed discovery.
 - Type 1 encoding support includes ExpertEncoding, and Type 1 charstring
   decoding now has bounded operand-stack handling for malformed inputs,
-  including `callsubr` paths. Top-level charstrings must terminate with
+  including `callsubr` paths and integer-only subroutine indexes. Top-level
+  charstrings must terminate with
   `endchar` or SEAC, and local Subrs must return instead of silently ending at
   EOF. Pending OtherSubr pop-result queues are rejected before any non-`pop`
   operand or operator, including `endchar`, SEAC, `return`, or another

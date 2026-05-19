@@ -262,7 +262,10 @@ func (c *type1CharStringContext) interpret(data []byte) (type1CharStringStop, er
 			if len(c.stack) < 1 {
 				return 0, errors.New("stack underflow in callsubr")
 			}
-			idx := int(c.stack[len(c.stack)-1])
+			idx, err := type1CharStringIntOperand(c.stack[len(c.stack)-1], "subroutine index", "callsubr")
+			if err != nil {
+				return 0, err
+			}
 			c.stack = c.stack[:len(c.stack)-1]
 			if idx < 0 || idx >= len(c.subrs) {
 				return 0, fmt.Errorf("type1 local subr %d out of range", idx)

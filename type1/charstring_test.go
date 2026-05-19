@@ -200,6 +200,24 @@ func TestDecodeCharStringRejectsSubrEOFWithoutReturn(t *testing.T) {
 	}
 }
 
+func TestDecodeCharStringRejectsNonIntegerCallSubrOperand(t *testing.T) {
+	subrs := [][]byte{t1ops(11)}
+	data := t1prog(
+		t1nums(0, 500), t1ops(13),
+		t1nums(1, 2), t1ops(12, 12), // 0.5
+		t1ops(10),
+		t1ops(14),
+	)
+
+	_, err := DecodeCharString(data, subrs)
+	if err == nil {
+		t.Fatal("DecodeCharString unexpectedly accepted a non-integer callsubr operand")
+	}
+	if !strings.Contains(err.Error(), "invalid subroutine index in callsubr") {
+		t.Fatalf("error = %q, want invalid callsubr index error", err)
+	}
+}
+
 func TestDecodeCharStringCurveOperatorsPreserveCubicTags(t *testing.T) {
 	data := t1prog(
 		t1nums(0, 500), t1ops(13),
