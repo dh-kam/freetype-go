@@ -81,19 +81,19 @@ func (t *SbixTable) GetImage(glyphIndex int, ppem uint16) ([]byte, error) {
 	}
 
 	var bestStrikeOffset uint32
-	var bestPpem uint16 = 0
+	var bestPpem uint16
 
 	for _, off := range t.StrikeOffsets {
 		strikePpem, err := readUint16(t.Stream, int64(off))
 		if err != nil {
 			continue
 		}
-		if strikePpem <= ppem && strikePpem > bestPpem {
+		if bestStrikeOffset == 0 || betterEmbeddedBitmapStrike(ppem, strikePpem, bestPpem) {
 			bestPpem = strikePpem
 			bestStrikeOffset = off
-		} else if bestStrikeOffset == 0 {
-			bestPpem = strikePpem
-			bestStrikeOffset = off
+			if ppem != 0 && strikePpem == ppem {
+				break
+			}
 		}
 	}
 
@@ -198,7 +198,7 @@ func GetCBLCImageAtPPEM(cblc CBLCTable, cbdt CBDTTable, glyphIndex int, ppem uin
 			if err != nil {
 				return nil, err
 			}
-			if foundSizeOffset == 0 || betterCBLCStrike(ppem, sizePPEM, foundPPEM) {
+			if foundSizeOffset == 0 || betterEmbeddedBitmapStrike(ppem, sizePPEM, foundPPEM) {
 				foundSizeOffset = offset
 				foundPPEM = sizePPEM
 				if ppem != 0 && sizePPEM == ppem {
@@ -432,7 +432,7 @@ func readByteAt(s api.Stream, offset int64) (byte, error) {
 	return buf[0], nil
 }
 
-func betterCBLCStrike(requested, candidate, current uint16) bool {
+func betterEmbeddedBitmapStrike(requested, candidate, current uint16) bool {
 	if requested == 0 {
 		return false
 	}

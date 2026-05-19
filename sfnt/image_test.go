@@ -67,6 +67,36 @@ func cblcWithIndexSubtable(firstGlyph, lastGlyph uint16, subtable []byte) []byte
 	return cblcBuf.Bytes()
 }
 
+type sbixStrikeFixture struct {
+	ppem    uint16
+	payload []byte
+}
+
+func sbixWithStrikes(strikes []sbixStrikeFixture) []byte {
+	buf := new(bytes.Buffer)
+	binary.Write(buf, binary.BigEndian, uint16(1))            // version
+	binary.Write(buf, binary.BigEndian, uint16(0))            // flags
+	binary.Write(buf, binary.BigEndian, uint32(len(strikes))) // numStrikes
+
+	strikeData := new(bytes.Buffer)
+	strikeBase := 8 + len(strikes)*4
+	for _, strike := range strikes {
+		binary.Write(buf, binary.BigEndian, uint32(strikeBase+strikeData.Len()))
+		record := new(bytes.Buffer)
+		binary.Write(record, binary.BigEndian, strike.ppem)
+		binary.Write(record, binary.BigEndian, uint16(72)) // ppi
+		binary.Write(record, binary.BigEndian, uint32(12))
+		binary.Write(record, binary.BigEndian, uint32(12+8+len(strike.payload)))
+		binary.Write(record, binary.BigEndian, int16(0))           // originX
+		binary.Write(record, binary.BigEndian, int16(0))           // originY
+		binary.Write(record, binary.BigEndian, uint32(0x706e6720)) // 'png '
+		record.Write(strike.payload)
+		strikeData.Write(record.Bytes())
+	}
+	buf.Write(strikeData.Bytes())
+	return buf.Bytes()
+}
+
 type cblcStrikeFixture struct {
 	firstGlyph      uint16
 	lastGlyph       uint16
@@ -256,6 +286,37 @@ func TestSbixRejectsInvalidGlyphImageLength(t *testing.T) {
 
 	if _, err := sbix.GetImage(0, 12); err == nil {
 		t.Fatalf("expected invalid sbix image length error")
+	}
+}
+
+func TestSbixSelectsStrikeForPPEM(t *testing.T) {
+	sbix, err := parseSbix(&MockStream{data: sbixWithStrikes([]sbixStrikeFixture{
+		{ppem: 12, payload: []byte("small")},
+		{ppem: 24, payload: []byte("large")},
+		{ppem: 48, payload: []byte("huge")},
+	})})
+	if err != nil {
+		t.Fatalf("parseSbix failed: %v", err)
+	}
+
+	tests := []struct {
+		ppem uint16
+		want string
+	}{
+		{ppem: 0, want: "small"},
+		{ppem: 10, want: "small"},
+		{ppem: 24, want: "large"},
+		{ppem: 40, want: "large"},
+		{ppem: 50, want: "huge"},
+	}
+	for _, tt := range tests {
+		got, err := sbix.GetImage(0, tt.ppem)
+		if err != nil {
+			t.Fatalf("GetImage(%d) failed: %v", tt.ppem, err)
+		}
+		if string(got) != tt.want {
+			t.Fatalf("GetImage(%d) = %q, want %q", tt.ppem, got, tt.want)
+		}
 	}
 }
 
@@ -469,6 +530,34 @@ func TestLoadGlyphCBLCUsesCurrentPPEM(t *testing.T) {
 	sys := core.NewSystem()
 	sys.SetImageDecoder(decoder)
 	face := &Face{sys: sys, cblc: &cblc, cbdt: &cbdt}
+	if err := face.SetPixelSizes(24, 24); err != nil {
+		t.Fatalf("SetPixelSizes failed: %v", err)
+	}
+
+	slot, err := face.LoadGlyph(0, 0)
+	if err != nil {
+		t.Fatalf("LoadGlyph failed: %v", err)
+	}
+	if string(decoder.last) != "large" {
+		t.Fatalf("decoded payload = %q, want large", decoder.last)
+	}
+	if slot.GetImage() == nil || slot.GetImage().Width != len("large") {
+		t.Fatalf("image = %+v, want decoded large payload", slot.GetImage())
+	}
+}
+
+func TestLoadGlyphSbixUsesCurrentPPEM(t *testing.T) {
+	sbix, err := parseSbix(&MockStream{data: sbixWithStrikes([]sbixStrikeFixture{
+		{ppem: 12, payload: []byte("small")},
+		{ppem: 24, payload: []byte("large")},
+	})})
+	if err != nil {
+		t.Fatalf("parseSbix failed: %v", err)
+	}
+	decoder := &recordingImageDecoder{}
+	sys := core.NewSystem()
+	sys.SetImageDecoder(decoder)
+	face := &Face{sys: sys, sbix: &sbix}
 	if err := face.SetPixelSizes(24, 24); err != nil {
 		t.Fatalf("SetPixelSizes failed: %v", err)
 	}

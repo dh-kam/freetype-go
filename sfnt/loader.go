@@ -1259,13 +1259,13 @@ func (f *Face) LoadGlyph(glyphIndex int, loadFlags int) (api.GlyphSlot, error) {
 
 	if loadFlags&(api.LoadNoBitmap|api.LoadNoScale) == 0 {
 		if f.sbix != nil {
-			payload, err := f.sbix.GetImage(glyphIndex, 0xFFFF) // Request max size
+			payload, err := f.sbix.GetImage(glyphIndex, embeddedBitmapRequestPPEM(f.yPPEM))
 			if err == nil && payload != nil {
 				imagePayload = payload
 			}
 		}
 		if imagePayload == nil && f.cblc != nil && f.cbdt != nil {
-			payload, err := GetCBLCImageAtPPEM(*f.cblc, *f.cbdt, glyphIndex, cblcRequestPPEM(f.yPPEM))
+			payload, err := GetCBLCImageAtPPEM(*f.cblc, *f.cbdt, glyphIndex, embeddedBitmapRequestPPEM(f.yPPEM))
 			if err == nil && payload != nil {
 				imagePayload = payload
 			}
@@ -1373,7 +1373,7 @@ func (f *Face) glyphMetricsForLoadFlags(glyphIndex int, loadFlags int) (glyphMet
 	return glyphMetrics26Dot6{advance: f.scaleFUnitsX(advance), lsb: f.scaleFUnitsX(lsb)}, true
 }
 
-func cblcRequestPPEM(ppem int) uint16 {
+func embeddedBitmapRequestPPEM(ppem int) uint16 {
 	if ppem <= 0 {
 		return 0
 	}
