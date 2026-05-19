@@ -1598,6 +1598,9 @@ func reconstructWOFF2CompositeGlyph(compositeStream, glyphStream, instructionStr
 		if err != nil {
 			return nil, err
 		}
+		if int(instructionLength) > instructionStream.remaining() {
+			return nil, errors.New("invalid WOFF2 composite glyph instructions")
+		}
 		appendUint16(glyph, instructionLength)
 		instructions, err := instructionStream.readBytes(int(instructionLength))
 		if err != nil {
@@ -2260,12 +2263,12 @@ func validateWOFF2CompositeGlyphReferences(glyph []byte, numGlyphs int) error {
 
 	if haveInstructions {
 		if offset+2 > len(glyph) {
-			return errors.New("invalid WOFF2 composite glyph")
+			return errors.New("invalid WOFF2 composite glyph instructions")
 		}
 		instructionLength := int(binary.BigEndian.Uint16(glyph[offset : offset+2]))
 		offset += 2
 		if offset+instructionLength > len(glyph) {
-			return errors.New("invalid WOFF2 composite glyph")
+			return errors.New("invalid WOFF2 composite glyph instructions")
 		}
 		offset += instructionLength
 	}

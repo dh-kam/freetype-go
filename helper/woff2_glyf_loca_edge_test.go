@@ -116,6 +116,38 @@ func TestWOFF2GlyfLocaEdgeAllowsCompositeZeroPadding(t *testing.T) {
 	}
 }
 
+func TestWOFF2GlyfLocaEdgeRejectsRawCompositeInstructionBounds(t *testing.T) {
+	var glyph bytes.Buffer
+	appendUint16(&glyph, 0xffff) // numberOfContours = composite
+	appendUint16(&glyph, 0)      // xMin
+	appendUint16(&glyph, 0)      // yMin
+	appendUint16(&glyph, 0)      // xMax
+	appendUint16(&glyph, 0)      // yMax
+	appendUint16(&glyph, 0x0102) // byte args, xy, instructions
+	appendUint16(&glyph, 0)      // glyphIndex
+	glyph.Write([]byte{0, 0})    // args
+	appendUint16(&glyph, 2)      // instructionLength, but no instruction bytes
+
+	loca := make([]byte, 4)
+	binary.BigEndian.PutUint16(loca[2:4], uint16(glyph.Len()/2))
+
+	woff2Data := testWOFF2WithRawOutlineTables(
+		t,
+		testHeadTable(0),
+		testMaxpTable(1),
+		glyph.Bytes(),
+		loca,
+	)
+
+	_, err := DecodeWOFF2(core.NewMemoryStream(woff2Data))
+	if err == nil {
+		t.Fatal("expected raw composite instruction bounds error")
+	}
+	if !strings.Contains(err.Error(), "invalid WOFF2 composite glyph instructions") {
+		t.Fatalf("error = %q, want composite instruction bounds error", err)
+	}
+}
+
 func woff2EdgeCompositeGlyph(t *testing.T, componentGlyphIndex uint16, instructions, padding []byte) []byte {
 	t.Helper()
 

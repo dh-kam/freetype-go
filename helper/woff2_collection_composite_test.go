@@ -98,7 +98,7 @@ func TestWOFF2CollectionCompositeRejectsMalformedSharedTransformedGlyf(t *testin
 				woff2CollectionCompositeBBoxStream(),
 				[]byte{0xde},
 			),
-			want: "unexpected EOF",
+			want: "invalid WOFF2 composite glyph instructions",
 		},
 		{
 			name: "extra composite stream bytes",

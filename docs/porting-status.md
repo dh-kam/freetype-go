@@ -82,9 +82,10 @@ comparison:
   long `loca`, per-glyph overlap bitmaps, instruction bytes, explicit bounding
   boxes, malformed substreams, zero-length transformed `loca`,
   collection/shared-outline table reconstruction, collection long-multiglyph
-  sharing, shared transformed composite glyphs in WOFF2 collections, malformed
-  shared-composite rejection, and transformed `hmtx`
-  reconstruction/dependency validation for collection faces, including
+  sharing, shared transformed composite glyphs in WOFF2 collections, composite
+  instruction stream bounds, malformed shared-composite rejection, and
+  transformed `hmtx` reconstruction/dependency validation for collection faces,
+  including
   multiglyph side bearings derived from short and long outline tables,
   malformed shared-`hmtx` outline metadata, malformed long-`loca` and raw-glyph
   shared-`hmtx` dependencies, and mixed raw/transformed outline dependencies.

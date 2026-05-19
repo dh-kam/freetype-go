@@ -1331,6 +1331,26 @@ func TestWOFF2RejectsMalformedCompositeTransformBounds(t *testing.T) {
 	}
 }
 
+func TestWOFF2RejectsMalformedCompositeInstructions(t *testing.T) {
+	var compositeStream bytes.Buffer
+	appendUint16(&compositeStream, 0x0102) // byte args, xy, instructions
+	appendUint16(&compositeStream, 0)
+	compositeStream.Write([]byte{0, 0})
+
+	_, err := reconstructWOFF2CompositeGlyph(
+		newWOFF2ByteReader(compositeStream.Bytes()),
+		newWOFF2ByteReader([]byte{2}),
+		newWOFF2ByteReader([]byte{0xde}),
+		1,
+	)
+	if err == nil {
+		t.Fatal("expected truncated composite instructions to fail")
+	}
+	if !strings.Contains(err.Error(), "invalid WOFF2 composite glyph instructions") {
+		t.Fatalf("error = %q, want composite instruction error", err)
+	}
+}
+
 func TestWOFF2TripletDecodeCoversFlagClasses(t *testing.T) {
 	flags := []byte{0x80 | 9, 19, 83, 119, 123, 127}
 	glyphStream := []byte{
