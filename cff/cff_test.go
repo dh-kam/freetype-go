@@ -1354,6 +1354,14 @@ func TestDecodeCharStringRejectsTopLevelReturn(t *testing.T) {
 	}
 }
 
+func TestDecodeCharStringRejectsCFF1EOFWithoutEndchar(t *testing.T) {
+	n := csNumber
+	_, err := DecodeCharString([]byte{n(0), n(0), 21}, nil, nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "missing endchar") {
+		t.Fatalf("DecodeCharString error = %v, want missing endchar", err)
+	}
+}
+
 func TestCharStringWidthHintsAndMasks(t *testing.T) {
 	n := csNumber
 	data := []byte{

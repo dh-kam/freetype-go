@@ -237,6 +237,9 @@ func decodeCharString(data []byte, opts charStringDecodeOptions) (*charStringRes
 	if ctx.lastStop == charStringStopReturn {
 		return nil, errors.New("return in top-level charstring")
 	}
+	if ctx.lastStop == charStringStopEOF && opts.maxStack != maxCFF2ArgumentStack {
+		return nil, errors.New("CFF charstring missing endchar")
+	}
 	return &charStringResult{outline: ctx.outline, segments: ctx.segments}, nil
 }
 
