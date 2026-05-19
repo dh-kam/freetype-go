@@ -1691,6 +1691,10 @@ func (e *ExecutionEnv) Step(opcode byte) error {
 		if err != nil {
 			return err
 		}
+		zone := &e.Zones[e.ZP0]
+		if pIdx < 0 || int(pIdx) >= len(zone.Points) {
+			return fmt.Errorf("point index out of bounds in UTP: %d", pIdx)
+		}
 		e.untouchCurrent(int(pIdx), e.ZP0)
 		e.IP++
 

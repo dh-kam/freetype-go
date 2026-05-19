@@ -623,6 +623,58 @@ func TestSHPIXPreflightsLoopPointIndexes(t *testing.T) {
 	}
 }
 
+func TestUTPRejectsInvalidPointIndex(t *testing.T) {
+	sys := core.NewSystem()
+	ctx := NewContext(sys)
+
+	ctx.Zones[1].Points = []api.Vector{{X: 20, Y: 0}}
+	ctx.Zones[1].OriginalPoints = []api.Vector{{X: 20, Y: 0}}
+	ctx.Zones[1].TouchedX = []bool{true}
+	ctx.Zones[1].TouchedY = []bool{false}
+	ctx.Zones[1].Tags = []byte{outlineTagTouchX}
+	ctx.ZP0 = 1
+
+	ctx.Code = []byte{
+		0xB0, 0x02, // invalid point 2
+		0x29, // UTP
+	}
+
+	if err := ctx.Run(); err == nil {
+		t.Fatal("UTP with an invalid point should fail")
+	}
+	if !ctx.Zones[1].TouchedX[0] || ctx.Zones[1].Tags[0]&outlineTagTouchX == 0 {
+		t.Fatalf("UTP invalid point mutated touch state: touched=%v tags=%#x", ctx.Zones[1].TouchedX, ctx.Zones[1].Tags)
+	}
+}
+
+func TestUTPClearsCurrentFreedomAxisTouch(t *testing.T) {
+	sys := core.NewSystem()
+	ctx := NewContext(sys)
+
+	ctx.GS.FreeVector = api.Vector{X: 0x4000, Y: 0}
+	ctx.Zones[1].Points = []api.Vector{{X: 20, Y: 0}}
+	ctx.Zones[1].OriginalPoints = []api.Vector{{X: 20, Y: 0}}
+	ctx.Zones[1].TouchedX = []bool{true}
+	ctx.Zones[1].TouchedY = []bool{true}
+	ctx.Zones[1].Tags = []byte{outlineTagTouchX | outlineTagTouchY}
+	ctx.ZP0 = 1
+
+	ctx.Code = []byte{
+		0xB0, 0x00, // point 0
+		0x29, // UTP
+	}
+
+	if err := ctx.Run(); err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+	if ctx.Zones[1].TouchedX[0] || ctx.Zones[1].Tags[0]&outlineTagTouchX != 0 {
+		t.Fatalf("UTP kept X touch state: touched=%v tags=%#x", ctx.Zones[1].TouchedX, ctx.Zones[1].Tags)
+	}
+	if !ctx.Zones[1].TouchedY[0] || ctx.Zones[1].Tags[0]&outlineTagTouchY == 0 {
+		t.Fatalf("UTP cleared unrelated Y touch state: touched=%v tags=%#x", ctx.Zones[1].TouchedY, ctx.Zones[1].Tags)
+	}
+}
+
 func TestStackDepthDebugAndStateOpcodes(t *testing.T) {
 	sys := core.NewSystem()
 
