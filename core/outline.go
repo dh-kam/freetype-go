@@ -1,6 +1,9 @@
 package core
 
-import "github.com/dh-kam/freetype-go/api"
+import (
+	"github.com/dh-kam/freetype-go/api"
+	ftmath "github.com/dh-kam/freetype-go/math"
+)
 
 // Outline implements api.Outline.
 type Outline struct {
@@ -23,8 +26,8 @@ func (o *Outline) GetContours() []int {
 
 func (o *Outline) Scale(xScale, yScale int32) {
 	for i := range o.Points {
-		o.Points[i].X = int32((int64(o.Points[i].X) * int64(xScale)) >> 16)
-		o.Points[i].Y = int32((int64(o.Points[i].Y) * int64(yScale)) >> 16)
+		o.Points[i].X = ftmath.MulFix(o.Points[i].X, xScale)
+		o.Points[i].Y = ftmath.MulFix(o.Points[i].Y, yScale)
 	}
 }
 

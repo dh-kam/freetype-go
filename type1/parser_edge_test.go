@@ -96,6 +96,23 @@ func TestParserEdgeParseFontRDSkipsExactlyOneWhitespaceByte(t *testing.T) {
 	}
 }
 
+func TestParserEdgeParseFontFindsCharStringsAfterBinarySubrs(t *testing.T) {
+	private := []byte("/Private 8 dict dup begin\n/lenIV -1 def\n/Subrs 1 array\n")
+	private = append(private, []byte("dup 0 6 RD ")...)
+	private = append(private, []byte("%abcde")...)
+	private = append(private, []byte(" NP /CharStrings 1 dict dup begin\n/A 1 RD ")...)
+	private = append(private, 14)
+	private = append(private, []byte(" ND\nend\nend\n")...)
+
+	font, err := ParseFont(parserEdgePFBForPrivate(private))
+	if err != nil {
+		t.Fatalf("ParseFont failed after binary Subrs payload: %v", err)
+	}
+	if !bytes.Equal(font.CharStrings["A"], []byte{14}) {
+		t.Fatalf("A charstring = %v, want endchar", font.CharStrings["A"])
+	}
+}
+
 func TestParserEdgeParseFontGlyphNamesPreserveCharStringOrder(t *testing.T) {
 	private := parserEdgePrivateDict([]parserEdgeGlyph{
 		{name: "B", data: []byte{14}},

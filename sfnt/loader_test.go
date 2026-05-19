@@ -261,6 +261,27 @@ func TestSetPixelSizes(t *testing.T) {
 	}
 }
 
+func TestScaleCFFOutlineUsesFreeTypeDesignUnitRounding(t *testing.T) {
+	f := &Face{head: HeadTable{UnitsPerEm: 1000}}
+	if err := f.SetPixelSizes(25, 25); err != nil {
+		t.Fatalf("SetPixelSizes failed: %v", err)
+	}
+	outline := &core.Outline{
+		Points: []api.Vector{
+			{X: 261 << 6, Y: 647 << 6},
+		},
+	}
+
+	f.scaleCFFOutline(outline)
+
+	if got, want := outline.Points[0].X, int32(418); got != want {
+		t.Fatalf("scaled CFF X = %d, want %d", got, want)
+	}
+	if got, want := outline.Points[0].Y, int32(1035); got != want {
+		t.Fatalf("scaled CFF Y = %d, want %d", got, want)
+	}
+}
+
 func TestSetPixelSizesScalesCVTAndRunsPrep(t *testing.T) {
 	f := &Face{
 		head:   HeadTable{UnitsPerEm: 1000},
@@ -582,8 +603,8 @@ func TestLoadedFaceSetPixelSizesRerunsPrepBeforeHinting(t *testing.T) {
 		wantX int32
 		wantY int32
 	}{
-		{width: 20, wantX: 64, wantY: 128},
-		{width: 10, wantX: 32, wantY: 64},
+		{width: 20, wantX: 26, wantY: 128},
+		{width: 10, wantX: 13, wantY: 64},
 	} {
 		if err := face.SetPixelSizes(tc.width, tc.width); err != nil {
 			t.Fatalf("SetPixelSizes %d failed: %v", tc.width, err)
@@ -1474,7 +1495,7 @@ func TestLoadGlyphAppliesGvarDeltas(t *testing.T) {
 	if len(points) != 1 {
 		t.Fatalf("point count = %d, want 1", len(points))
 	}
-	if got, want := points[0].X, int32(60<<6); got != want {
+	if got, want := points[0].X, int32(30<<6); got != want {
 		t.Fatalf("gvar-adjusted point X = %d, want %d", got, want)
 	}
 
@@ -1660,10 +1681,10 @@ func TestCompositeGlyphAppliesGvarPseudoPointDeltas(t *testing.T) {
 	if len(points) != 2 {
 		t.Fatalf("composite point count = %d, want 2", len(points))
 	}
-	if got, want := points[0].X, int32(40<<6); got != want {
+	if got, want := points[0].X, int32(45<<6); got != want {
 		t.Fatalf("component 0 X = %d, want %d", got, want)
 	}
-	if got, want := points[1].X, int32(80<<6); got != want {
+	if got, want := points[1].X, int32(85<<6); got != want {
 		t.Fatalf("component 1 X = %d, want %d", got, want)
 	}
 
@@ -1697,6 +1718,9 @@ func TestLoadGlyphUnhintedMetricsUseBBoxLSBPhantoms(t *testing.T) {
 	points := slot.GetOutline().GetPoints()
 	if len(points) != 1 {
 		t.Fatalf("external outline point count = %d, want 1", len(points))
+	}
+	if got, want := points[0].X, int32(20<<6); got != want {
+		t.Fatalf("origin-translated point X = %d, want %d", got, want)
 	}
 
 	advance, lsb, err = face.GetGlyphMetrics(0)
@@ -1910,7 +1934,7 @@ func TestCFFSlotMetricsUseVORGVerticalOrigin(t *testing.T) {
 	}
 }
 
-func TestLoadGlyphNoScaleLeavesOutlineAndSlotMetricsUnscaled(t *testing.T) {
+func TestLoadGlyphNoScaleLeavesMetricsUnscaledAndAppliesOriginTranslation(t *testing.T) {
 	glyph := simpleRectGlyphData(50, 0, 90, 40)
 	face := loadGlyphMetricsTestFace(t, []uint32{0, uint32(len(glyph))}, glyph, []metricsGlyph{
 		{advance: 300, lsb: 20},
@@ -1924,7 +1948,7 @@ func TestLoadGlyphNoScaleLeavesOutlineAndSlotMetricsUnscaled(t *testing.T) {
 		t.Fatalf("LoadGlyph failed: %v", err)
 	}
 	points := slot.GetOutline().GetPoints()
-	if got, want := points[0].X, int32(50<<6); got != want {
+	if got, want := points[0].X, int32(20<<6); got != want {
 		t.Fatalf("NoScale point X = %d, want %d", got, want)
 	}
 
@@ -2111,7 +2135,7 @@ func TestLoadGlyphUsesPrepGraphicsState(t *testing.T) {
 	if len(points) != 1 {
 		t.Fatalf("outline point count = %d, want 1", len(points))
 	}
-	if got, want := points[0].X, int32(50<<6); got != want {
+	if got, want := points[0].X, int32(20<<6); got != want {
 		t.Fatalf("prep-inherited X = %d, want %d", got, want)
 	}
 	if got, want := points[0].Y, int32(100<<6); got != want {

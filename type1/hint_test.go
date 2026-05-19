@@ -46,7 +46,7 @@ func TestBuildHintContextScalesStemsAndPrivateHints(t *testing.T) {
 		},
 	}
 
-	context := BuildHintContext(font, result, 32768, 65536)
+	context := BuildHintContext(font, result, 32<<16, 64<<16)
 	if got, want := len(context.Stems), 2; got != want {
 		t.Fatalf("stem count = %d, want %d", got, want)
 	}

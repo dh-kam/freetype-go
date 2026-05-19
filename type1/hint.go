@@ -4,6 +4,7 @@ import (
 	"math"
 
 	"github.com/dh-kam/freetype-go/core"
+	ftmath "github.com/dh-kam/freetype-go/math"
 )
 
 // HintContext contains decoded Type 1 hint data scaled for the current face
@@ -376,7 +377,7 @@ func type1HintDesignTo26Dot6(value float64) (int32, bool) {
 }
 
 func type1HintScale26Dot6(value, scale int32) int32 {
-	return int32((int64(value) * int64(scale)) >> 16)
+	return ftmath.MulFix(type1Design26Dot6ToUnits(value), scale)
 }
 
 func type1HintRoundToPixel(value int32) int32 {

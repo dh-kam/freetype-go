@@ -682,11 +682,11 @@ func (f *Face) runPrep() error {
 }
 
 func (f *Face) scaleFUnitsX(v int32) int32 {
-	return f.scale26Dot6X(v << 6)
+	return scaleTTFUnits(v, f.xPPEM, f.GetUnitsPerEm())
 }
 
 func (f *Face) scaleFUnitsY(v int32) int32 {
-	return f.scale26Dot6Y(v << 6)
+	return scaleTTFUnits(v, f.yPPEM, f.GetUnitsPerEm())
 }
 
 func (f *Face) scaleFUnitsXForLoadFlags(v int32, loadFlags int) int32 {
@@ -743,9 +743,69 @@ func (f *Face) scaleOutline(outline *core.Outline) {
 		return
 	}
 	for i := range outline.Points {
-		outline.Points[i].X = f.scale26Dot6X(outline.Points[i].X)
-		outline.Points[i].Y = f.scale26Dot6Y(outline.Points[i].Y)
+		outline.Points[i].X = f.scaleTTOutlineCoordX(outline.Points[i].X)
+		outline.Points[i].Y = f.scaleTTOutlineCoordY(outline.Points[i].Y)
 	}
+}
+
+func (f *Face) scaleTTOutlineCoordX(v int32) int32 {
+	return scaleTTOutlineCoord(v, f.xPPEM, f.GetUnitsPerEm())
+}
+
+func (f *Face) scaleTTOutlineCoordY(v int32) int32 {
+	return scaleTTOutlineCoord(v, f.yPPEM, f.GetUnitsPerEm())
+}
+
+func scaleTTOutlineCoord(v int32, ppem int, unitsPerEm uint16) int32 {
+	if unitsPerEm == 0 || ppem <= 0 {
+		return v
+	}
+	// FreeType's TrueType loader scales integer design-unit outline points with
+	// size->metrics.[xy]_scale, i.e. a 16.16 scale for 26.6 pixel output.
+	if v%64 == 0 {
+		return scaleTTFUnits(v>>6, ppem, unitsPerEm)
+	}
+	return scaleFractionalTTOutlineCoord(v, ppem, unitsPerEm)
+}
+
+func scaleTTFUnits(v int32, ppem int, unitsPerEm uint16) int32 {
+	if unitsPerEm == 0 || ppem <= 0 {
+		return v << 6
+	}
+	return ftmath.MulFix(v, ftmath.DivFix(int32(ppem<<6), int32(unitsPerEm)))
+}
+
+func scaleFractionalTTOutlineCoord(v int32, ppem int, unitsPerEm uint16) int32 {
+	num := int64(v) * int64(ppem)
+	den := int64(unitsPerEm)
+	if num >= 0 {
+		return int32((num + den/2) / den)
+	}
+	return -int32((-num + den/2) / den)
+}
+
+func (f *Face) scaleCFFOutline(outline *core.Outline) {
+	if outline == nil {
+		return
+	}
+	xScale := f.computeCFFSizeScale(f.xPPEM)
+	yScale := f.computeCFFSizeScale(f.yPPEM)
+	for i := range outline.Points {
+		outline.Points[i].X = ftmath.MulFix(cffDesignUnit(outline.Points[i].X), xScale)
+		outline.Points[i].Y = ftmath.MulFix(cffDesignUnit(outline.Points[i].Y), yScale)
+	}
+}
+
+func (f *Face) computeCFFSizeScale(ppem int) int32 {
+	unitsPerEm := f.GetUnitsPerEm()
+	if unitsPerEm == 0 || ppem <= 0 {
+		return 1 << 16
+	}
+	return ftmath.DivFix(int32(ppem)<<6, int32(unitsPerEm))
+}
+
+func cffDesignUnit(v int32) int32 {
+	return v / 64
 }
 
 func copyTTOrusPoints(outline *core.Outline) []api.Vector {
@@ -1295,7 +1355,7 @@ func (f *Face) LoadGlyph(glyphIndex int, loadFlags int) (api.GlyphSlot, error) {
 			return nil, err
 		}
 		if loadFlags&api.LoadNoScale == 0 {
-			f.scaleOutline(outline)
+			f.scaleCFFOutline(outline)
 		}
 		bitmap, err := f.renderGlyphBitmap(outline, loadFlags)
 		if err != nil {
@@ -1341,7 +1401,7 @@ func (f *Face) LoadGlyph(glyphIndex int, loadFlags int) (api.GlyphSlot, error) {
 			slotMetrics.HoriAdvance = result.metrics.advance
 		}
 	}
-	outline := stripGlyphPhantoms(result.outline, result.realPointCount)
+	outline := stripGlyphPhantomsAndApplyOrigin(result.outline, result.realPointCount)
 	bitmap, err := f.renderGlyphBitmap(outline, loadFlags)
 	if err != nil {
 		return nil, err
@@ -1561,7 +1621,12 @@ func (f *Face) applySyntheticVerticalSlotMetrics(loadFlags int, slotMetrics *api
 	}
 	height := ceil26Dot6(slotMetrics.Height)
 	if loadFlags&api.LoadNoScale == 0 {
-		height = ceil26Dot6(ftmath.DivFix(slotMetrics.Height, f.yScale))
+		// FreeType's TrueType loader reverses scaled 26.6 bbox height with
+		// size->metrics.y_scale, which is 64 times the f.yScale used for
+		// fUnit-to-26.6 scaling here.
+		if yScale := f.yScale << 6; yScale != 0 {
+			height = ftmath.DivFix(slotMetrics.Height, yScale)
+		}
 	}
 	topSideBearing := (advance - height) / 2
 	slotMetrics.VertBearingX = slotMetrics.HoriBearingX - slotMetrics.HoriAdvance/2
@@ -2309,6 +2374,29 @@ func stripGlyphPhantoms(outline *core.Outline, realPointCount int) *core.Outline
 	outline.Points = outline.Points[:realPointCount]
 	outline.Tags = outline.Tags[:realPointCount]
 	return outline
+}
+
+func stripGlyphPhantomsAndApplyOrigin(outline *core.Outline, realPointCount int) *core.Outline {
+	if outline == nil {
+		return nil
+	}
+	phantoms, ok := copyGlyphPhantoms(outline, realPointCount)
+	outline = stripGlyphPhantoms(outline, realPointCount)
+	if !ok {
+		return outline
+	}
+	translateOutline(outline, -phantoms[0].X, 0)
+	return outline
+}
+
+func translateOutline(outline *core.Outline, dx, dy int32) {
+	if outline == nil || (dx == 0 && dy == 0) {
+		return
+	}
+	for i := range outline.Points {
+		outline.Points[i].X += dx
+		outline.Points[i].Y += dy
+	}
 }
 
 func realPointCount(outline *core.Outline) int {

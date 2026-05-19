@@ -33,6 +33,7 @@ type Bitmap struct {
 	Top       int
 
 	packedMono bool
+	placed     bool
 }
 
 func (b *Bitmap) GetRows() int {
@@ -61,6 +62,10 @@ func (b *Bitmap) GetLeft() int {
 
 func (b *Bitmap) GetTop() int {
 	return b.Top
+}
+
+func (b *Bitmap) HasPlacement() bool {
+	return b != nil && b.placed
 }
 
 func (b *Bitmap) SetPixelMode(mode uint8) {
@@ -319,6 +324,7 @@ func PrepareBitmapForOutline(outline api.Outline, pointCount int, mode api.Rende
 	bitmap := NewBitmapWithPixelMode(metrics.SurfaceWidth, metrics.SurfaceRows, metrics.PixelMode)
 	bitmap.Left = metrics.Left
 	bitmap.Top = metrics.Top
+	bitmap.placed = true
 	if metrics.Width == 0 || metrics.Rows == 0 {
 		return nil, bitmap, metrics, true
 	}

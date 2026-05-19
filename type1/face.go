@@ -9,6 +9,7 @@ import (
 
 	"github.com/dh-kam/freetype-go/api"
 	"github.com/dh-kam/freetype-go/core"
+	ftmath "github.com/dh-kam/freetype-go/math"
 	"github.com/dh-kam/freetype-go/raster"
 )
 
@@ -191,7 +192,7 @@ func (f *Face) LoadGlyph(glyphIndex int, loadFlags int) (api.GlyphSlot, error) {
 		if loadFlags&api.LoadNoHinting == 0 {
 			hintSnaps = type1HintPointSnaps(outline, BuildHintContext(f.font, result, f.xScale, f.yScale))
 		}
-		outline.Scale(f.xScale, f.yScale)
+		scaleType1DesignOutline(outline, f.xScale, f.yScale)
 		applyType1HintPointSnaps(outline, hintSnaps)
 	}
 
@@ -240,6 +241,15 @@ func (f *Face) GetGlyphIndex(char rune) (int, error) {
 		return 0, nil
 	}
 	return idx, nil
+}
+
+// GetGlyphIndexByName returns the Type 1 glyph index for a glyph name.
+func (f *Face) GetGlyphIndexByName(name string) (int, bool) {
+	if f == nil || name == "" {
+		return 0, false
+	}
+	idx, ok := f.glyphIndex[name]
+	return idx, ok
 }
 
 func (f *Face) GetGlyphMetrics(glyphIndex int) (advance int32, lsb int32, err error) {
@@ -441,16 +451,30 @@ func (f *Face) updateScales() {
 	if upem <= 0 {
 		upem = 1000
 	}
-	f.xScale = int32((int64(f.xPPEM) << 16) / int64(upem))
-	f.yScale = int32((int64(f.yPPEM) << 16) / int64(upem))
+	f.xScale = ftmath.DivFix(int32(f.xPPEM)<<6, upem)
+	f.yScale = ftmath.DivFix(int32(f.yPPEM)<<6, upem)
 }
 
 func (f *Face) scale26Dot6X(v int32) int32 {
-	return int32((int64(v) * int64(f.xScale)) >> 16)
+	return ftmath.MulFix(type1Design26Dot6ToUnits(v), f.xScale)
 }
 
 func (f *Face) scale26Dot6Y(v int32) int32 {
-	return int32((int64(v) * int64(f.yScale)) >> 16)
+	return ftmath.MulFix(type1Design26Dot6ToUnits(v), f.yScale)
+}
+
+func type1Design26Dot6ToUnits(v int32) int32 {
+	return v / 64
+}
+
+func scaleType1DesignOutline(outline *core.Outline, xScale, yScale int32) {
+	if outline == nil {
+		return
+	}
+	for i, p := range outline.Points {
+		outline.Points[i].X = ftmath.MulFix(type1Design26Dot6ToUnits(p.X), xScale)
+		outline.Points[i].Y = ftmath.MulFix(type1Design26Dot6ToUnits(p.Y), yScale)
+	}
 }
 
 func (f *Face) slotMetrics(name string, outline *core.Outline, result *CharStringResult, loadFlags int) api.GlyphMetrics {

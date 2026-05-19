@@ -41,6 +41,16 @@ func TestType1LoaderAndFace(t *testing.T) {
 	if gid != 1 {
 		t.Fatalf("glyph index for A = %d, want 1", gid)
 	}
+	nameGID, ok := face.GetGlyphIndexByName("A")
+	if !ok {
+		t.Fatal("GetGlyphIndexByName did not find A")
+	}
+	if nameGID != gid {
+		t.Fatalf("glyph index by name = %d, want %d", nameGID, gid)
+	}
+	if _, ok := face.GetGlyphIndexByName("MissingGlyph"); ok {
+		t.Fatal("GetGlyphIndexByName unexpectedly found MissingGlyph")
+	}
 
 	slot, err := face.LoadGlyph(gid, api.LoadNoScale)
 	if err != nil {

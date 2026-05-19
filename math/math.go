@@ -8,22 +8,9 @@ import (
 
 // MulFix computes (a * b) / 0x10000 with rounding.
 func MulFix(a, b int32) int32 {
-	s := int32(1)
-	aa := int64(a)
-	bb := int64(b)
-	if aa < 0 {
-		aa = -aa
-		s = -s
-	}
-	if bb < 0 {
-		bb = -bb
-		s = -s
-	}
-	res := (uint64(aa)*uint64(bb) + 0x8000) >> 16
-	if s < 0 {
-		return -int32(res)
-	}
-	return int32(res)
+	ret := int64(a) * int64(b)
+	ret += 0x8000 + (ret >> 63)
+	return int32(ret >> 16)
 }
 
 // DivFix computes (a * 0x10000) / b with rounding.

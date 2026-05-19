@@ -53,6 +53,9 @@ func TestBitmapPlacementGettersAndLegacyMono(t *testing.T) {
 	if bitmap.GetLeft() != -2 || bitmap.GetTop() != 7 {
 		t.Fatalf("placement = %d,%d, want -2,7", bitmap.GetLeft(), bitmap.GetTop())
 	}
+	if _, _, ok := api.GetBitmapPlacement(bitmap); ok {
+		t.Fatal("manual bitmap exposed unset FreeType placement")
+	}
 
 	bitmap.SetPixelMode(api.MODE_MONO)
 	if bitmap.IsPackedMono() {
@@ -171,11 +174,30 @@ func TestPrepareBitmapForOutlinePlacementAndTranslation(t *testing.T) {
 	if bitmap.Left != -5 || bitmap.Top != 8 {
 		t.Fatalf("bitmap placement = left %d top %d, want -5 8", bitmap.Left, bitmap.Top)
 	}
+	if left, top, ok := api.GetBitmapPlacement(bitmap); !ok || left != -5 || top != 8 {
+		t.Fatalf("placement provider = left %d top %d ok %v, want -5 8 true", left, top, ok)
+	}
 	if renderOutline == nil || len(renderOutline.Points) != len(outline.Points) {
 		t.Fatalf("translated outline length = %d, want %d", len(renderOutline.Points), len(outline.Points))
 	}
 	if got := renderOutline.Points[0]; got.X != 96 || got.Y != 8*64-(-2*64-1) {
 		t.Fatalf("translated first point = (%d,%d), want (96,%d)", got.X, got.Y, 8*64-(-2*64-1))
+	}
+
+	topZeroOutline := &Outline{
+		Points: []api.Vector{
+			{X: 0, Y: -10 << 6},
+			{X: 10 << 6, Y: 0},
+		},
+		Tags:     []byte{1, 1},
+		Contours: []int{1},
+	}
+	_, topZeroBitmap, _, ok := PrepareBitmapForOutline(topZeroOutline, -1, api.RenderModeNormal)
+	if !ok {
+		t.Fatal("PrepareBitmapForOutline returned !ok for top-zero outline")
+	}
+	if left, top, ok := api.GetBitmapPlacement(topZeroBitmap); !ok || left != 0 || top != 0 {
+		t.Fatalf("top-zero placement provider = left %d top %d ok %v, want 0 0 true", left, top, ok)
 	}
 }
 

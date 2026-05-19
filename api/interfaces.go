@@ -126,6 +126,13 @@ type BitmapPlacementProvider interface {
 	GetTop() int
 }
 
+// BitmapPlacementStateProvider optionally marks whether placement values are
+// meaningful. Implementations that only expose zero-value placement fields can
+// return false until a renderer assigns FreeType bitmap placement.
+type BitmapPlacementStateProvider interface {
+	HasPlacement() bool
+}
+
 // GetBitmapPlacement returns FreeType-style bitmap placement when a bitmap
 // implementation exposes it through BitmapPlacementProvider.
 func GetBitmapPlacement(bitmap Bitmap) (left, top int, ok bool) {
@@ -134,6 +141,9 @@ func GetBitmapPlacement(bitmap Bitmap) (left, top int, ok bool) {
 	}
 	provider, ok := bitmap.(BitmapPlacementProvider)
 	if !ok {
+		return 0, 0, false
+	}
+	if state, ok := bitmap.(BitmapPlacementStateProvider); ok && !state.HasPlacement() {
 		return 0, 0, false
 	}
 	return provider.GetLeft(), provider.GetTop(), true

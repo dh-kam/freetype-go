@@ -107,7 +107,7 @@ func (r *SmoothRasterizer) Render(outline api.Outline, bitmap api.Bitmap) error 
 	r.worker.YScale = 1
 	r.worker.FlipY = false
 	r.worker.FreeTypeFillRule = r.freeTypeFillRule
-	if _, top, ok := api.GetBitmapPlacement(bitmap); ok && top != 0 && pixelMode != api.MODE_LCD_V {
+	if _, _, ok := api.GetBitmapPlacement(bitmap); ok && pixelMode != api.MODE_LCD_V {
 		r.worker.FlipY = true
 	}
 	switch pixelMode {
@@ -172,8 +172,8 @@ func (r *SmoothRasterizer) decompose(outline api.Outline) error {
 			continue
 		}
 
-		vStart := r.worker.scaledOutlinePoint(points[first], xScale, yScale)
-		vLast := r.worker.scaledOutlinePoint(points[last], xScale, yScale)
+		vStart := r.worker.outlinePoint26Dot6(points[first], xScale, yScale)
+		vLast := r.worker.outlinePoint26Dot6(points[last], xScale, yScale)
 		point := first
 		limit := last
 		tag := curveTag(tags[first])
@@ -193,8 +193,9 @@ func (r *SmoothRasterizer) decompose(outline api.Outline) error {
 			point--
 		}
 
-		r.worker.x = vStart.X
-		r.worker.y = vStart.Y
+		start := upscalePoint(vStart)
+		r.worker.x = start.X
+		r.worker.y = start.Y
 		r.worker.X = int(r.worker.x >> pixelBits)
 		r.worker.Y = int(r.worker.y >> pixelBits)
 		r.worker.Area = 0
@@ -205,48 +206,48 @@ func (r *SmoothRasterizer) decompose(outline api.Outline) error {
 			tag = curveTag(tags[point])
 			switch tag {
 			case curveTagOn:
-				vec := r.worker.scaledOutlinePoint(points[point], xScale, yScale)
-				r.worker.renderLine(vec.X, vec.Y)
+				vec := r.worker.outlinePoint26Dot6(points[point], xScale, yScale)
+				r.worker.renderLinePoint(vec)
 			case curveTagConic:
-				control := r.worker.scaledOutlinePoint(points[point], xScale, yScale)
+				control := r.worker.outlinePoint26Dot6(points[point], xScale, yScale)
 				for {
 					if point >= limit {
-						r.worker.renderQuadratic(control.X, control.Y, vStart.X, vStart.Y)
+						r.worker.renderQuadraticPoint(control, vStart)
 						goto closeContour
 					}
 					point++
-					vec := r.worker.scaledOutlinePoint(points[point], xScale, yScale)
+					vec := r.worker.outlinePoint26Dot6(points[point], xScale, yScale)
 					tag = curveTag(tags[point])
 					if tag == curveTagOn {
-						r.worker.renderQuadratic(control.X, control.Y, vec.X, vec.Y)
+						r.worker.renderQuadraticPoint(control, vec)
 						break
 					}
 					if tag != curveTagConic {
 						goto closeContour
 					}
 					mid := midpoint(control, vec)
-					r.worker.renderQuadratic(control.X, control.Y, mid.X, mid.Y)
+					r.worker.renderQuadraticPoint(control, mid)
 					control = vec
 				}
 			case curveTagCubic:
 				if point+1 > limit || curveTag(tags[point+1]) != curveTagCubic {
 					goto closeContour
 				}
-				control1 := r.worker.scaledOutlinePoint(points[point], xScale, yScale)
+				control1 := r.worker.outlinePoint26Dot6(points[point], xScale, yScale)
 				point++
-				control2 := r.worker.scaledOutlinePoint(points[point], xScale, yScale)
+				control2 := r.worker.outlinePoint26Dot6(points[point], xScale, yScale)
 				point++
 				if point <= limit {
-					vec := r.worker.scaledOutlinePoint(points[point], xScale, yScale)
-					r.worker.renderCubic(control1.X, control1.Y, control2.X, control2.Y, vec.X, vec.Y)
+					vec := r.worker.outlinePoint26Dot6(points[point], xScale, yScale)
+					r.worker.renderCubicPoint(control1, control2, vec)
 				} else {
-					r.worker.renderCubic(control1.X, control1.Y, control2.X, control2.Y, vStart.X, vStart.Y)
+					r.worker.renderCubicPoint(control1, control2, vStart)
 					goto closeContour
 				}
 			}
 		}
 
-		r.worker.renderLine(vStart.X, vStart.Y)
+		r.worker.renderLinePoint(vStart)
 
 	closeContour:
 		if r.worker.Area != 0 || r.worker.Cover != 0 {
@@ -258,15 +259,40 @@ func (r *SmoothRasterizer) decompose(outline api.Outline) error {
 	return nil
 }
 
-func (w *TWorker) scaledOutlinePoint(point api.Vector, xScale, yScale int32) api.Vector {
+func (w *TWorker) outlinePoint26Dot6(point api.Vector, xScale, yScale int32) api.Vector {
 	y := point.Y
 	if w.FlipY {
 		y = int32((w.MaxEy/w.YScale)<<6) - y
 	}
 	return api.Vector{
-		X: point.X * xScale * upscale,
-		Y: y * yScale * upscale,
+		X: point.X * xScale,
+		Y: y * yScale,
 	}
+}
+
+func upscalePoint(point api.Vector) api.Vector {
+	return api.Vector{
+		X: point.X * upscale,
+		Y: point.Y * upscale,
+	}
+}
+
+func (w *TWorker) renderLinePoint(to api.Vector) {
+	vec := upscalePoint(to)
+	w.renderLine(vec.X, vec.Y)
+}
+
+func (w *TWorker) renderQuadraticPoint(control, to api.Vector) {
+	ctrl := upscalePoint(control)
+	vec := upscalePoint(to)
+	w.renderQuadratic(ctrl.X, ctrl.Y, vec.X, vec.Y)
+}
+
+func (w *TWorker) renderCubicPoint(control1, control2, to api.Vector) {
+	ctrl1 := upscalePoint(control1)
+	ctrl2 := upscalePoint(control2)
+	vec := upscalePoint(to)
+	w.renderCubic(ctrl1.X, ctrl1.Y, ctrl2.X, ctrl2.Y, vec.X, vec.Y)
 }
 
 func curveTag(tag byte) byte {

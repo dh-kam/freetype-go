@@ -383,8 +383,16 @@ func isType1DataOperator(tok string) bool {
 }
 
 func readType1BinaryData(data []byte, pos, length int) ([]byte, int, error) {
+	start, end, err := skipType1BinaryData(data, pos, length)
+	if err != nil {
+		return nil, 0, err
+	}
+	return data[start:end], end, nil
+}
+
+func skipType1BinaryData(data []byte, pos, length int) (int, int, error) {
 	if length < 0 {
-		return nil, 0, errors.New("negative Type 1 binary length")
+		return 0, 0, errors.New("negative Type 1 binary length")
 	}
 	start := pos
 	if start < len(data) && isPSSpace(data[start]) {
@@ -392,9 +400,9 @@ func readType1BinaryData(data []byte, pos, length int) ([]byte, int, error) {
 	}
 	end := start + length
 	if end < start || end > len(data) {
-		return nil, 0, errors.New("Type 1 binary data exceeds input")
+		return 0, 0, errors.New("Type 1 binary data exceeds input")
 	}
-	return data[start:end], end, nil
+	return start, end, nil
 }
 
 func findType1Eexec(data []byte) (int, int) {
@@ -412,6 +420,7 @@ func findType1Eexec(data []byte) (int, int) {
 }
 
 func findPSToken(data []byte, target string, pos int) int {
+	var prevToken string
 	for pos < len(data) {
 		tok, start, end, ok := readPSToken(data, pos)
 		if !ok {
@@ -421,6 +430,14 @@ func findPSToken(data []byte, target string, pos int) int {
 			return start
 		}
 		pos = end
+		if isType1DataOperator(tok) {
+			if length, err := strconv.Atoi(prevToken); err == nil {
+				if payloadStart, _, err := skipType1BinaryData(data, pos, length); err == nil {
+					pos = payloadStart + length
+				}
+			}
+		}
+		prevToken = tok
 	}
 	return -1
 }
