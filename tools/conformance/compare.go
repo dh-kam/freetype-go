@@ -944,6 +944,9 @@ func compareGlyphs(path string, reference, candidate []GlyphRecord, opts compare
 		if refGlyph.RenderError != candGlyph.RenderError {
 			add(glyphPath+".render_error", quoted(refGlyph.RenderError), quoted(candGlyph.RenderError))
 		}
+		if refGlyph.GlyphName != "" && refGlyph.GlyphName != candGlyph.GlyphName {
+			add(glyphPath+".glyph_name", quoted(refGlyph.GlyphName), quoted(candGlyph.GlyphName))
+		}
 		if refGlyph.Format != "" && refGlyph.Format != candGlyph.Format {
 			add(glyphPath+".format", quoted(refGlyph.Format), quoted(candGlyph.Format))
 		}

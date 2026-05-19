@@ -124,6 +124,7 @@ type SizeDump struct {
 
 type GlyphRecord struct {
 	GlyphIndex     int                   `json:"glyph_index"`
+	GlyphName      string                `json:"glyph_name,omitempty"`
 	Chars          []string              `json:"chars,omitempty"`
 	Format         string                `json:"format,omitempty"`
 	RenderedFormat string                `json:"rendered_format,omitempty"`
@@ -430,6 +431,9 @@ func dumpGoGlyph(face api.Face, sel glyphSelection, loadFlags loadFlagSpec, rend
 		Metrics:    MetricsRecord{Available: false, Error: "glyph not loaded"},
 		Outline:    OutlineRecord{Available: false},
 		Bitmap:     BitmapRecord{Available: false},
+	}
+	if name, ok := api.GetGlyphName(face, sel.GlyphIndex); ok {
+		record.GlyphName = name
 	}
 
 	effectiveLoadFlags := loadFlagsForRenderMode(loadFlags.Value, renderMode.Value)

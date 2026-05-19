@@ -809,6 +809,24 @@ func TestCompareDumpsSlotMetricsAndBBox(t *testing.T) {
 	}
 }
 
+func TestCompareDumpsGlyphName(t *testing.T) {
+	reference := minimalDumpWithPoint(Point{X: 100, Y: 200})
+	reference.Sizes[0].Glyphs[0].GlyphName = "A.alt"
+	candidate := minimalDumpWithPoint(Point{X: 100, Y: 200})
+	candidate.Sizes[0].Glyphs[0].GlyphName = "A"
+
+	diffs := compareDumps(reference, candidate, compareOptions{})
+	if len(diffs) != 1 {
+		t.Fatalf("diff count = %d, want 1: %+v", len(diffs), diffs)
+	}
+	if got, want := diffs[0].Path, "sizes[12x12/no-hinting].glyphs[0].glyph_name"; got != want {
+		t.Fatalf("path = %q, want %q", got, want)
+	}
+	if diffs[0].Want != `"A.alt"` || diffs[0].Got != `"A"` {
+		t.Fatalf("diff = %+v, want glyph names", diffs[0])
+	}
+}
+
 func TestCompareDumpsType1SegmentsEqual(t *testing.T) {
 	reference := minimalDumpWithPoint(Point{X: 100, Y: 200})
 	reference.Sizes[0].Glyphs[0].Type1Segments = conformanceType1SegmentRecords()
@@ -1108,8 +1126,9 @@ func TestDumpGoGlyphRecordsMetricsOutlineBitmapAndImage(t *testing.T) {
 			metrics: api.GlyphMetrics{Width: 30, Height: 20, HoriBearingX: -2, HoriBearingY: 18, HoriAdvance: 64},
 			has:     true,
 		},
-		advance: 70,
-		lsb:     -3,
+		advance:    70,
+		lsb:        -3,
+		glyphNames: map[int]string{4: "A.alt"},
 	}
 	record := dumpGoGlyph(face, glyphSelection{GlyphIndex: 4, Chars: []string{"U+0041"}}, loadFlagSpec{Name: "no-hinting", Value: api.LoadNoHinting}, renderModeSpec{Name: "lcd-v", Value: api.RenderModeLCDV}, true)
 
@@ -1119,6 +1138,9 @@ func TestDumpGoGlyphRecordsMetricsOutlineBitmapAndImage(t *testing.T) {
 	}
 	if !record.Metrics.Available || record.Metrics.Advance != 70 || record.Metrics.LSB != -3 {
 		t.Fatalf("metrics = %+v", record.Metrics)
+	}
+	if record.GlyphName != "A.alt" {
+		t.Fatalf("glyph name = %q, want A.alt", record.GlyphName)
 	}
 	if record.SlotMetrics == nil || !record.SlotMetrics.Available || record.SlotMetrics.HoriAdvance != 64 {
 		t.Fatalf("slot metrics = %+v", record.SlotMetrics)
@@ -1141,9 +1163,12 @@ func TestDumpGoGlyphRecordsMetricsOutlineBitmapAndImage(t *testing.T) {
 
 func TestDumpGoGlyphReportsLoadAndRenderFailures(t *testing.T) {
 	loadErr := errors.New("fixture load failed")
-	record := dumpGoGlyph(&conformanceFakeFace{loadErr: loadErr}, glyphSelection{GlyphIndex: 9}, loadFlagSpec{Name: "default"}, renderModeSpec{Name: "none", Value: api.RenderModeNone}, false)
+	record := dumpGoGlyph(&conformanceFakeFace{loadErr: loadErr, glyphNames: map[int]string{9: "broken"}}, glyphSelection{GlyphIndex: 9}, loadFlagSpec{Name: "default"}, renderModeSpec{Name: "none", Value: api.RenderModeNone}, false)
 	if record.LoadError != loadErr.Error() || record.Metrics.Error != loadErr.Error() || record.Outline.Error != loadErr.Error() || record.Bitmap.Error != loadErr.Error() {
 		t.Fatalf("load failure record = %+v", record)
+	}
+	if record.GlyphName != "broken" {
+		t.Fatalf("load failure glyph name = %q, want broken", record.GlyphName)
 	}
 
 	record = dumpGoGlyph(&conformanceFakeFace{slot: &conformanceFakeSlot{}}, glyphSelection{GlyphIndex: 1}, loadFlagSpec{Name: "default"}, renderModeSpec{Name: "normal", Value: api.RenderModeNormal}, false)
@@ -1360,6 +1385,7 @@ type conformanceFakeFace struct {
 	advance     int32
 	lsb         int32
 	metricErr   error
+	glyphNames  map[int]string
 	loadedGlyph int
 	loadedFlags int
 }
@@ -1382,6 +1408,11 @@ func (f *conformanceFakeFace) GetGlyphSlot() api.GlyphSlot { return f.slot }
 func (f *conformanceFakeFace) GetUnitsPerEm() uint16 { return 1000 }
 
 func (f *conformanceFakeFace) GetGlyphIndex(char rune) (int, error) { return 0, nil }
+
+func (f *conformanceFakeFace) GetGlyphName(glyphIndex int) (string, bool) {
+	name, ok := f.glyphNames[glyphIndex]
+	return name, ok
+}
 
 func (f *conformanceFakeFace) GetGlyphMetrics(glyphIndex int) (int32, int32, error) {
 	if f.metricErr != nil {

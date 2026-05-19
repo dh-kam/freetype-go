@@ -82,6 +82,10 @@ static int ftgo_render_glyph(FT_Face face, FT_Render_Mode mode) {
 	return FT_Render_Glyph(face->glyph, mode);
 }
 
+static int ftgo_get_glyph_name(FT_Face face, FT_UInt glyph_index, char* buffer, FT_UInt buffer_max) {
+	return FT_Get_Glyph_Name(face, glyph_index, buffer, buffer_max);
+}
+
 static short ftgo_outline_n_points(FT_Face face) {
 	return face->glyph->outline.n_points;
 }
@@ -244,6 +248,7 @@ func resolveFreeTypeSelections(face C.FT_Face, opts dumpOptions) ([]glyphSelecti
 func dumpFreeTypeGlyph(face C.FT_Face, sel glyphSelection, loadFlags loadFlagSpec, renderMode renderModeSpec, includeBitmapBuffer bool) GlyphRecord {
 	record := GlyphRecord{
 		GlyphIndex: sel.GlyphIndex,
+		GlyphName:  dumpFreeTypeGlyphName(face, sel.GlyphIndex),
 		Chars:      sel.Chars,
 		Outline:    OutlineRecord{Available: false},
 		Bitmap:     BitmapRecord{Available: false},
@@ -277,6 +282,14 @@ func dumpFreeTypeGlyph(face C.FT_Face, sel glyphSelection, loadFlags loadFlagSpe
 		record.Bitmap.Error = record.RenderError
 	}
 	return record
+}
+
+func dumpFreeTypeGlyphName(face C.FT_Face, glyphIndex int) string {
+	var buf [128]C.char
+	if code := C.ftgo_get_glyph_name(face, C.FT_UInt(glyphIndex), &buf[0], C.FT_UInt(len(buf))); code != 0 {
+		return ""
+	}
+	return C.GoString(&buf[0])
 }
 
 func dumpFreeTypeSlotMetrics(face C.FT_Face) *SlotMetricsRecord {
