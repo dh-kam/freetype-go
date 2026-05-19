@@ -1353,7 +1353,7 @@ func pixelModeName(mode uint8) string {
 		return "gray"
 	case api.MODE_LCD, 5:
 		return "lcd"
-	case core.PixelModeLCDV, 6:
+	case api.MODE_LCD_V, 6:
 		return "lcd-v"
 	default:
 		return fmt.Sprintf("unknown-%d", mode)

@@ -154,10 +154,11 @@ type Bitmap interface {
 }
 
 const (
-	MODE_NONE uint8 = iota
-	MODE_MONO       // 1-bit per pixel
-	MODE_GRAY       // 8-bit per pixel (standard smooth)
-	MODE_LCD        // 3x horizontal resolution for LCD
+	MODE_NONE  uint8 = iota
+	MODE_MONO        // 1-bit per pixel
+	MODE_GRAY        // 8-bit per pixel (standard smooth)
+	MODE_LCD         // 3x horizontal resolution for LCD
+	MODE_LCD_V       // 3x vertical resolution for LCD
 )
 
 const (

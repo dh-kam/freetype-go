@@ -2,10 +2,9 @@ package core
 
 import "github.com/dh-kam/freetype-go/api"
 
-// PixelModeLCDV represents FreeType's vertical LCD subpixel bitmap mode.
-// The public api package does not yet expose this pixel mode, so core keeps
-// the value next to the bitmap allocation helpers that need it.
-const PixelModeLCDV uint8 = api.MODE_LCD + 1
+// PixelModeLCDV is kept for existing callers. New code should use
+// api.MODE_LCD_V.
+const PixelModeLCDV uint8 = api.MODE_LCD_V
 
 const lcdFilterPadding26Dot6 int32 = 43
 
@@ -141,7 +140,7 @@ func PixelModeForRenderMode(mode api.RenderMode) uint8 {
 	case api.RenderModeLCD:
 		return api.MODE_LCD
 	case api.RenderModeLCDV:
-		return PixelModeLCDV
+		return api.MODE_LCD_V
 	default:
 		return api.MODE_GRAY
 	}

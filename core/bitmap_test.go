@@ -88,7 +88,7 @@ func TestNewBitmapForRenderModeSurfaceDimensions(t *testing.T) {
 		{name: "light", mode: api.RenderModeLight, width: 7, rows: 5, pitch: 7, pixelMode: api.MODE_GRAY},
 		{name: "mono", mode: api.RenderModeMono, width: 7, rows: 5, pitch: 2, pixelMode: api.MODE_MONO, packedMono: true},
 		{name: "lcd", mode: api.RenderModeLCD, width: 21, rows: 5, pitch: 24, pixelMode: api.MODE_LCD},
-		{name: "lcdv", mode: api.RenderModeLCDV, width: 7, rows: 15, pitch: 7, pixelMode: PixelModeLCDV},
+		{name: "lcdv", mode: api.RenderModeLCDV, width: 7, rows: 15, pitch: 7, pixelMode: api.MODE_LCD_V},
 	}
 
 	for _, tc := range tests {

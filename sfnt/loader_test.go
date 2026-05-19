@@ -1951,7 +1951,7 @@ func TestLoadGlyphRenderModesUseFreeTypeBitmapSurfaces(t *testing.T) {
 	}{
 		{name: "normal", flags: api.LoadRender | api.LoadNoHinting, width: 10, rows: 10, pitch: 10, pixelMode: api.MODE_GRAY, left: -4, top: 8},
 		{name: "lcd", flags: api.LoadRender | api.LoadNoHinting | api.LoadTargetLCD, width: 36, rows: 10, pitch: 36, pixelMode: api.MODE_LCD, left: -5, top: 8},
-		{name: "lcd-v", flags: api.LoadRender | api.LoadNoHinting | api.LoadTargetLCDV, width: 10, rows: 36, pitch: 10, pixelMode: core.PixelModeLCDV, left: -4, top: 9},
+		{name: "lcd-v", flags: api.LoadRender | api.LoadNoHinting | api.LoadTargetLCDV, width: 10, rows: 36, pitch: 10, pixelMode: api.MODE_LCD_V, left: -4, top: 9},
 	}
 
 	for _, tc := range tests {

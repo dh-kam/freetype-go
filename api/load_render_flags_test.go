@@ -65,6 +65,25 @@ func TestRenderModeValuesAreStable(t *testing.T) {
 	}
 }
 
+func TestPixelModeValuesAreStable(t *testing.T) {
+	tests := []struct {
+		name string
+		got  uint8
+		want uint8
+	}{
+		{"none", MODE_NONE, 0},
+		{"mono", MODE_MONO, 1},
+		{"gray", MODE_GRAY, 2},
+		{"lcd", MODE_LCD, 3},
+		{"lcd-v", MODE_LCD_V, 4},
+	}
+	for _, tt := range tests {
+		if tt.got != tt.want {
+			t.Fatalf("%s pixel mode = %d, want %d", tt.name, tt.got, tt.want)
+		}
+	}
+}
+
 type placementBitmap struct{}
 
 func (placementBitmap) GetRows() int            { return 0 }

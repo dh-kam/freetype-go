@@ -107,13 +107,13 @@ func (r *SmoothRasterizer) Render(outline api.Outline, bitmap api.Bitmap) error 
 	r.worker.YScale = 1
 	r.worker.FlipY = false
 	r.worker.FreeTypeFillRule = r.freeTypeFillRule
-	if _, top, ok := api.GetBitmapPlacement(bitmap); ok && top != 0 && pixelMode != core.PixelModeLCDV {
+	if _, top, ok := api.GetBitmapPlacement(bitmap); ok && top != 0 && pixelMode != api.MODE_LCD_V {
 		r.worker.FlipY = true
 	}
 	switch pixelMode {
 	case api.MODE_LCD:
 		r.worker.XScale = 3
-	case core.PixelModeLCDV:
+	case api.MODE_LCD_V:
 		r.worker.YScale = 3
 	}
 
@@ -656,7 +656,7 @@ func (w *TWorker) sweep(bitmap api.Bitmap) {
 	case api.MODE_LCD:
 		w.sweepLCD(bitmap)
 		return
-	case core.PixelModeLCDV:
+	case api.MODE_LCD_V:
 		w.sweepLCDV(bitmap)
 		return
 	}

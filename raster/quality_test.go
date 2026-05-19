@@ -313,9 +313,9 @@ func TestLCDVRenderingUsesVerticalSubpixelSurface(t *testing.T) {
 	}
 	bitmap := core.NewBitmapForRenderMode(20, 20, api.RenderModeLCDV)
 
-	if bitmap.GetWidth() != 20 || bitmap.GetRows() != 60 || bitmap.GetPitch() != 20 || bitmap.GetPixelMode() != core.PixelModeLCDV {
+	if bitmap.GetWidth() != 20 || bitmap.GetRows() != 60 || bitmap.GetPitch() != 20 || bitmap.GetPixelMode() != api.MODE_LCD_V {
 		t.Fatalf("LCDV geometry got width=%d rows=%d pitch=%d mode=%d, want 20 60 20 %d",
-			bitmap.GetWidth(), bitmap.GetRows(), bitmap.GetPitch(), bitmap.GetPixelMode(), core.PixelModeLCDV)
+			bitmap.GetWidth(), bitmap.GetRows(), bitmap.GetPitch(), bitmap.GetPixelMode(), api.MODE_LCD_V)
 	}
 	if err := rasterizer.Render(outline, bitmap); err != nil {
 		t.Fatalf("Render failed: %v", err)
