@@ -20,6 +20,15 @@ func (m *MockImageDecoder) Decode(data []byte) (*api.Image, error) {
 	return nil, errors.New("invalid data")
 }
 
+type recordingImageDecoder struct {
+	last []byte
+}
+
+func (d *recordingImageDecoder) Decode(data []byte) (*api.Image, error) {
+	d.last = append(d.last[:0], data...)
+	return &api.Image{Width: len(data), Height: 1, Pixels: append([]byte(nil), data...)}, nil
+}
+
 type MockStream struct {
 	data []byte
 }
@@ -55,6 +64,55 @@ func cblcWithIndexSubtable(firstGlyph, lastGlyph uint16, subtable []byte) []byte
 	binary.Write(cblcBuf, binary.BigEndian, uint32(8))               // additionalOffset
 	cblcBuf.Write(subtable)
 
+	return cblcBuf.Bytes()
+}
+
+type cblcStrikeFixture struct {
+	firstGlyph      uint16
+	lastGlyph       uint16
+	ppem            byte
+	imageDataOffset uint32
+	imageDataLength uint32
+}
+
+func cblcWithStrikes(strikes []cblcStrikeFixture) []byte {
+	cblcBuf := new(bytes.Buffer)
+	binary.Write(cblcBuf, binary.BigEndian, uint16(2))            // major
+	binary.Write(cblcBuf, binary.BigEndian, uint16(0))            // minor
+	binary.Write(cblcBuf, binary.BigEndian, uint32(len(strikes))) // numSizes
+
+	sizeRecords := make([][]byte, len(strikes))
+	indexData := new(bytes.Buffer)
+	indexDataBase := 8 + len(strikes)*48
+	for i, strike := range strikes {
+		subtable := new(bytes.Buffer)
+		binary.Write(subtable, binary.BigEndian, uint16(1)) // indexFormat
+		binary.Write(subtable, binary.BigEndian, uint16(5)) // imageFormat
+		binary.Write(subtable, binary.BigEndian, strike.imageDataOffset)
+		binary.Write(subtable, binary.BigEndian, uint32(0))
+		binary.Write(subtable, binary.BigEndian, strike.imageDataLength)
+
+		arrayOffset := uint32(indexDataBase + indexData.Len())
+		record := new(bytes.Buffer)
+		binary.Write(record, binary.BigEndian, arrayOffset)
+		binary.Write(record, binary.BigEndian, uint32(8+subtable.Len())) // indexTablesSize
+		binary.Write(record, binary.BigEndian, uint32(1))                // numberOfIndexSubTables
+		binary.Write(record, binary.BigEndian, uint32(0))                // colorRef
+		record.Write(make([]byte, 24))                                   // metrics
+		binary.Write(record, binary.BigEndian, strike.firstGlyph)
+		binary.Write(record, binary.BigEndian, strike.lastGlyph)
+		record.Write([]byte{strike.ppem, strike.ppem, 8, 1})
+		sizeRecords[i] = record.Bytes()
+
+		binary.Write(indexData, binary.BigEndian, strike.firstGlyph)
+		binary.Write(indexData, binary.BigEndian, strike.lastGlyph)
+		binary.Write(indexData, binary.BigEndian, uint32(8)) // additionalOffset
+		indexData.Write(subtable.Bytes())
+	}
+	for _, record := range sizeRecords {
+		cblcBuf.Write(record)
+	}
+	cblcBuf.Write(indexData.Bytes())
 	return cblcBuf.Bytes()
 }
 
@@ -357,6 +415,73 @@ func TestCBLCCBDTIndexFormat5SparseConstantMetrics(t *testing.T) {
 	}
 	if string(got) != "VWXYZ" {
 		t.Fatalf("unexpected image data: %q", got)
+	}
+}
+
+func TestCBLCCBDTSelectsStrikeForPPEM(t *testing.T) {
+	cblc, err := parseCBLC(&MockStream{data: cblcWithStrikes([]cblcStrikeFixture{
+		{firstGlyph: 0, lastGlyph: 0, ppem: 12, imageDataOffset: 0, imageDataLength: 5},
+		{firstGlyph: 0, lastGlyph: 0, ppem: 24, imageDataOffset: 5, imageDataLength: 5},
+		{firstGlyph: 0, lastGlyph: 0, ppem: 48, imageDataOffset: 10, imageDataLength: 4},
+	})})
+	if err != nil {
+		t.Fatalf("parseCBLC failed: %v", err)
+	}
+	cbdt, err := parseCBDT(&MockStream{data: []byte("smalllargehuge")})
+	if err != nil {
+		t.Fatalf("parseCBDT failed: %v", err)
+	}
+
+	tests := []struct {
+		ppem uint16
+		want string
+	}{
+		{ppem: 0, want: "small"},
+		{ppem: 10, want: "small"},
+		{ppem: 24, want: "large"},
+		{ppem: 40, want: "large"},
+		{ppem: 50, want: "huge"},
+	}
+	for _, tt := range tests {
+		got, err := GetCBLCImageAtPPEM(cblc, cbdt, 0, tt.ppem)
+		if err != nil {
+			t.Fatalf("GetCBLCImageAtPPEM(%d) failed: %v", tt.ppem, err)
+		}
+		if string(got) != tt.want {
+			t.Fatalf("GetCBLCImageAtPPEM(%d) = %q, want %q", tt.ppem, got, tt.want)
+		}
+	}
+}
+
+func TestLoadGlyphCBLCUsesCurrentPPEM(t *testing.T) {
+	cblc, err := parseCBLC(&MockStream{data: cblcWithStrikes([]cblcStrikeFixture{
+		{firstGlyph: 0, lastGlyph: 0, ppem: 12, imageDataOffset: 0, imageDataLength: 5},
+		{firstGlyph: 0, lastGlyph: 0, ppem: 24, imageDataOffset: 5, imageDataLength: 5},
+	})})
+	if err != nil {
+		t.Fatalf("parseCBLC failed: %v", err)
+	}
+	cbdt, err := parseCBDT(&MockStream{data: []byte("smalllarge")})
+	if err != nil {
+		t.Fatalf("parseCBDT failed: %v", err)
+	}
+	decoder := &recordingImageDecoder{}
+	sys := core.NewSystem()
+	sys.SetImageDecoder(decoder)
+	face := &Face{sys: sys, cblc: &cblc, cbdt: &cbdt}
+	if err := face.SetPixelSizes(24, 24); err != nil {
+		t.Fatalf("SetPixelSizes failed: %v", err)
+	}
+
+	slot, err := face.LoadGlyph(0, 0)
+	if err != nil {
+		t.Fatalf("LoadGlyph failed: %v", err)
+	}
+	if string(decoder.last) != "large" {
+		t.Fatalf("decoded payload = %q, want large", decoder.last)
+	}
+	if slot.GetImage() == nil || slot.GetImage().Width != len("large") {
+		t.Fatalf("image = %+v, want decoded large payload", slot.GetImage())
 	}
 }
 

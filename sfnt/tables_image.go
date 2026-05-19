@@ -169,6 +169,10 @@ func parseCBDT(s api.Stream) (CBDTTable, error) {
 }
 
 func GetCBLCImage(cblc CBLCTable, cbdt CBDTTable, glyphIndex int) ([]byte, error) {
+	return GetCBLCImageAtPPEM(cblc, cbdt, glyphIndex, 0)
+}
+
+func GetCBLCImageAtPPEM(cblc CBLCTable, cbdt CBDTTable, glyphIndex int, ppem uint16) ([]byte, error) {
 	if cblc.Stream == nil || cbdt.Stream == nil {
 		return nil, errors.New("missing CBLC or CBDT")
 	}
@@ -177,6 +181,7 @@ func GetCBLCImage(cblc CBLCTable, cbdt CBDTTable, glyphIndex int) ([]byte, error
 	}
 
 	var foundSizeOffset int64 = 0
+	var foundPPEM uint16
 	for i := uint32(0); i < cblc.NumSizes; i++ {
 		offset := int64(8 + i*48)
 		startGlyph, err := readUint16(cblc.Stream, offset+40)
@@ -189,8 +194,17 @@ func GetCBLCImage(cblc CBLCTable, cbdt CBDTTable, glyphIndex int) ([]byte, error
 		}
 
 		if glyphIndex >= int(startGlyph) && glyphIndex <= int(endGlyph) {
-			foundSizeOffset = offset
-			break
+			sizePPEM, err := cblcSizeRecordPPEM(cblc.Stream, offset)
+			if err != nil {
+				return nil, err
+			}
+			if foundSizeOffset == 0 || betterCBLCStrike(ppem, sizePPEM, foundPPEM) {
+				foundSizeOffset = offset
+				foundPPEM = sizePPEM
+				if ppem != 0 && sizePPEM == ppem {
+					break
+				}
+			}
 		}
 	}
 
@@ -393,6 +407,54 @@ func GetCBLCImage(cblc CBLCTable, cbdt CBDTTable, glyphIndex int) ([]byte, error
 	}
 
 	return extractEmbeddedBitmapPayload(imageFormat, rawData)
+}
+
+func cblcSizeRecordPPEM(s api.Stream, offset int64) (uint16, error) {
+	ppemY, err := readByteAt(s, offset+45)
+	if err != nil {
+		return 0, err
+	}
+	if ppemY != 0 {
+		return uint16(ppemY), nil
+	}
+	ppemX, err := readByteAt(s, offset+44)
+	if err != nil {
+		return 0, err
+	}
+	return uint16(ppemX), nil
+}
+
+func readByteAt(s api.Stream, offset int64) (byte, error) {
+	var buf [1]byte
+	if err := readExactAt(s, buf[:], offset); err != nil {
+		return 0, err
+	}
+	return buf[0], nil
+}
+
+func betterCBLCStrike(requested, candidate, current uint16) bool {
+	if requested == 0 {
+		return false
+	}
+	if current == 0 {
+		return true
+	}
+	if candidate == requested {
+		return true
+	}
+	if current == requested {
+		return false
+	}
+	if candidate <= requested && current > requested {
+		return true
+	}
+	if candidate <= requested && current <= requested {
+		return candidate > current
+	}
+	if candidate > requested && current > requested {
+		return candidate < current
+	}
+	return false
 }
 
 func extractEmbeddedBitmapPayload(imageFormat uint16, rawData []byte) ([]byte, error) {

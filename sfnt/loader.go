@@ -1265,7 +1265,7 @@ func (f *Face) LoadGlyph(glyphIndex int, loadFlags int) (api.GlyphSlot, error) {
 			}
 		}
 		if imagePayload == nil && f.cblc != nil && f.cbdt != nil {
-			payload, err := GetCBLCImage(*f.cblc, *f.cbdt, glyphIndex)
+			payload, err := GetCBLCImageAtPPEM(*f.cblc, *f.cbdt, glyphIndex, cblcRequestPPEM(f.yPPEM))
 			if err == nil && payload != nil {
 				imagePayload = payload
 			}
@@ -1371,6 +1371,16 @@ func (f *Face) glyphMetricsForLoadFlags(glyphIndex int, loadFlags int) (glyphMet
 		return glyphMetrics26Dot6{advance: advance << 6, lsb: lsb << 6}, true
 	}
 	return glyphMetrics26Dot6{advance: f.scaleFUnitsX(advance), lsb: f.scaleFUnitsX(lsb)}, true
+}
+
+func cblcRequestPPEM(ppem int) uint16 {
+	if ppem <= 0 {
+		return 0
+	}
+	if ppem > 0xffff {
+		return 0xffff
+	}
+	return uint16(ppem)
 }
 
 func (f *Face) renderGlyphBitmap(outline *core.Outline, loadFlags int) (api.Bitmap, error) {
