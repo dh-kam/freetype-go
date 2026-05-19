@@ -52,6 +52,15 @@ type CFF struct {
 	FontDicts []FontDict
 	FDSelect  *FDSelect
 
+	UnitsPerEm       uint16
+	FontBBox         [4]float64
+	HasFontBBox      bool
+	Charset          []string
+	Encoding         [256]string
+	GlyphIndexByCode map[int]int
+	GlyphNameByCode  map[int]string
+	GlyphIndexByName map[string]int
+
 	VariationStore *VariationStore
 	Stream         api.Stream
 
@@ -171,10 +180,14 @@ func (s *FDSelect) FDIndex(glyphIndex int) (int, error) {
 }
 
 const (
+	opFontBBox       = 5
+	opCharset        = 15
+	opEncoding       = 16
 	opCharStrings    = 17
 	opPrivate        = 18
 	opLocalSubrs     = 19
 	opVariationStore = 24
+	opROS            = 12<<8 | 30
 	opFDArray        = 12<<8 | 36
 	opFDSelect       = 12<<8 | 37
 	opPrivateVSIndex = 22
@@ -285,6 +298,10 @@ func ParseCFF(stream api.Stream, offset int64) (*CFF, error) {
 			}
 			cff.LocalSubrIndex = privateDict.LocalSubrIndex
 			cff.FontDicts = []FontDict{{PrivateDict: privateDict}}
+		}
+
+		if err := cff.parseCFF1Metadata(stream, offset, topDict); err != nil {
+			return nil, err
 		}
 	}
 

@@ -281,6 +281,50 @@ func testCFF1CIDFixture() []byte {
 	return blob
 }
 
+func testCFF1MetadataFixture(charset, encoding []byte, charStringCount int) []byte {
+	header := []byte{1, 0, 4, 4}
+	nameIndex := testIndex16Bytes([]byte("RawCFF"))
+	stringIndex := testIndex16Bytes()
+	globalSubrs := testIndex16Bytes()
+	charStringsData := make([][]byte, charStringCount)
+	for i := range charStringsData {
+		charStringsData[i] = []byte{14}
+	}
+	charStrings := testIndex16Bytes(charStringsData...)
+
+	const topDictSize = 39
+	topDictIndexLen := len(testIndex16Bytes(make([]byte, topDictSize)))
+	charsetOffset := len(header) + len(nameIndex) + topDictIndexLen + len(stringIndex) + len(globalSubrs)
+	encodingOffset := charsetOffset + len(charset)
+	charStringsOffset := encodingOffset + len(encoding)
+
+	topDict := make([]byte, 0, topDictSize)
+	topDict = append(topDict, dictEntry(opFontBBox, -10, -20, 700, 800)...)
+	topDict = append(topDict, dictEntry(opCharset, charsetOffset)...)
+	topDict = append(topDict, dictEntry(opEncoding, encodingOffset)...)
+	topDict = append(topDict, dictEntry(opCharStrings, charStringsOffset)...)
+	if len(topDict) != topDictSize {
+		panic("test CFF1 metadata Top DICT size changed")
+	}
+
+	blob := append(header, nameIndex...)
+	blob = append(blob, testIndex16Bytes(topDict)...)
+	blob = append(blob, stringIndex...)
+	blob = append(blob, globalSubrs...)
+	blob = append(blob, charset...)
+	blob = append(blob, encoding...)
+	blob = append(blob, charStrings...)
+	return blob
+}
+
+func testCFFCharsetFormat0(sids ...uint16) []byte {
+	data := []byte{0}
+	for _, sid := range sids {
+		data = appendUint16(data, sid)
+	}
+	return data
+}
+
 func assertPoint(t *testing.T, outline *core.Outline, idx int, x, y int32) {
 	t.Helper()
 	if idx >= len(outline.Points) {
@@ -495,6 +539,100 @@ func TestParseCFF(t *testing.T) {
 	name, _ := cff.NameIndex.Get(0)
 	if string(name) != "TestFont" {
 		t.Errorf("expected TestFont, got %s", name)
+	}
+}
+
+func TestParseCFFRawMetadataEncodingAndFontBBox(t *testing.T) {
+	sids := make([]uint16, 20)
+	for i := 0; i < 19; i++ {
+		sids[i] = uint16(34 + i) // A through S.
+	}
+	sids[19] = 13 // comma.
+	charset := testCFFCharsetFormat0(sids...)
+	encoding := append([]byte{0, 20},
+		1, 2, 3, 4, 5,
+		6, 7, 8, 9, 10,
+		11, 12, 13, 14, 15,
+		16, 17, 18, 19, 59,
+	)
+	face, err := ParseCFF(core.NewMemoryStream(testCFF1MetadataFixture(charset, encoding, 21)), 0)
+	if err != nil {
+		t.Fatalf("ParseCFF failed: %v", err)
+	}
+
+	if got := face.GetUnitsPerEm(); got != 1000 {
+		t.Fatalf("GetUnitsPerEm = %d, want 1000", got)
+	}
+	if bbox, ok := face.GetFontBBox(); !ok || bbox != ([4]float64{-10, -20, 700, 800}) {
+		t.Fatalf("GetFontBBox = %v, %v; want [-10 -20 700 800], true", bbox, ok)
+	}
+	if gid, err := face.GetGlyphIndex(rune(59)); err != nil || gid != 20 {
+		t.Fatalf("GetGlyphIndex(59) = %d, %v; want 20, nil", gid, err)
+	}
+	if name, ok := face.GetGlyphNameByCharCode(59); !ok || name != "comma" {
+		t.Fatalf("GetGlyphNameByCharCode(59) = %q, %v; want comma, true", name, ok)
+	}
+	if gid, ok := face.LookupGlyphIndexByName("comma"); !ok || gid != 20 {
+		t.Fatalf("LookupGlyphIndexByName(comma) = %d, %v; want 20, true", gid, ok)
+	}
+	if name, ok := face.GlyphName(20); !ok || name != "comma" {
+		t.Fatalf("GlyphName(20) = %q, %v; want comma, true", name, ok)
+	}
+}
+
+func TestParseCFFRawEncodingSupplementUsesGlyphName(t *testing.T) {
+	charset := testCFFCharsetFormat0(34, 13) // A, comma.
+	encoding := []byte{
+		0x80, 1, 65, // format 0 with one base code: code 65 -> GID 1/A.
+		1, 59, 0, 13, // supplement: code 59 -> SID 13/comma -> GID 2.
+	}
+	face, err := ParseCFF(core.NewMemoryStream(testCFF1MetadataFixture(charset, encoding, 3)), 0)
+	if err != nil {
+		t.Fatalf("ParseCFF failed: %v", err)
+	}
+
+	if gid, err := face.GetGlyphIndex(rune(59)); err != nil || gid != 2 {
+		t.Fatalf("GetGlyphIndex(59) = %d, %v; want 2, nil", gid, err)
+	}
+	if name, ok := face.GetGlyphNameByCharCode(59); !ok || name != "comma" {
+		t.Fatalf("GetGlyphNameByCharCode(59) = %q, %v; want comma, true", name, ok)
+	}
+	if gid, err := face.GetGlyphIndex('A'); err != nil || gid != 1 {
+		t.Fatalf("GetGlyphIndex(A) = %d, %v; want 1, nil", gid, err)
+	}
+}
+
+func TestParseCFFRawDefaultPredefinedEncoding(t *testing.T) {
+	header := []byte{1, 0, 4, 4}
+	nameIndex := testIndex16Bytes([]byte("StdCFF"))
+	stringIndex := testIndex16Bytes()
+	globalSubrs := testIndex16Bytes()
+	charStringsData := make([][]byte, 14)
+	for i := range charStringsData {
+		charStringsData[i] = []byte{14}
+	}
+	charStrings := testIndex16Bytes(charStringsData...)
+
+	const topDictSize = 6
+	topDictIndexLen := len(testIndex16Bytes(make([]byte, topDictSize)))
+	charStringsOffset := len(header) + len(nameIndex) + topDictIndexLen + len(stringIndex) + len(globalSubrs)
+	topDict := dictEntry(opCharStrings, charStringsOffset)
+
+	blob := append(header, nameIndex...)
+	blob = append(blob, testIndex16Bytes(topDict)...)
+	blob = append(blob, stringIndex...)
+	blob = append(blob, globalSubrs...)
+	blob = append(blob, charStrings...)
+
+	face, err := ParseCFF(core.NewMemoryStream(blob), 0)
+	if err != nil {
+		t.Fatalf("ParseCFF failed: %v", err)
+	}
+	if gid, err := face.GetGlyphIndex(','); err != nil || gid != 13 {
+		t.Fatalf("GetGlyphIndex(comma) = %d, %v; want 13, nil", gid, err)
+	}
+	if name, ok := face.GetGlyphNameByCharCode(44); !ok || name != "comma" {
+		t.Fatalf("GetGlyphNameByCharCode(44) = %q, %v; want comma, true", name, ok)
 	}
 }
 
