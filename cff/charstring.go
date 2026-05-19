@@ -11,7 +11,6 @@ import (
 
 const (
 	maxCFF1ArgumentStack = 48
-	defaultCFF2MaxStack  = 193
 	maxCFF2ArgumentStack = 513
 )
 
