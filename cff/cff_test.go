@@ -176,8 +176,8 @@ func testCFF2Fixture() ([]byte, testCFF2Offsets) {
 	n := csNumber
 	globalSubrs := testIndex32Bytes()
 	charStrings := testIndex32Bytes(
-		[]byte{n(0), n(0), 21, 14},
-		[]byte{n(10), n(20), n(5), n(7), n(-3), n(11), n(2), 16, 21, 14},
+		[]byte{n(0), n(0), 21},
+		[]byte{n(10), n(20), n(5), n(7), n(-3), n(11), n(2), 16, 21},
 	)
 	fdSelect := []byte{0, 0, 1}
 	private1 := append(dictInt32(1), byte(opPrivateVSIndex))
@@ -729,6 +729,9 @@ func TestParseCFF2FDArrayPrivateVariationStore(t *testing.T) {
 	if len(outline.Points) != 1 {
 		t.Fatalf("expected one point, got %d", len(outline.Points))
 	}
+	if len(outline.Contours) != 1 || outline.Contours[0] != 0 {
+		t.Fatalf("CFF2 contours = %v, want [0]", outline.Contours)
+	}
 	assertPoint(t, outline, 0, 10, 20)
 
 	outline, err = face.LoadGlyphOutlineAt(1, []float64{1})
@@ -893,8 +896,8 @@ func TestLoadGlyphOutlineUsesFDSelectLocalSubrs(t *testing.T) {
 	face := &CFF{
 		Major: 2,
 		CharStringsIndex: *testIndex(
-			[]byte{n(0), n(0), 21, n(-107), 10, 14},
-			[]byte{n(0), n(0), 21, n(-107), 10, 14},
+			[]byte{n(0), n(0), 21, n(-107), 10},
+			[]byte{n(0), n(0), 21, n(-107), 10},
 		),
 		FDSelect: &FDSelect{Format: 3, GlyphFD: []uint16{0, 1}},
 		FontDicts: []FontDict{
@@ -1699,6 +1702,15 @@ func TestDecodeCharStringCFF2OperandStackLimit(t *testing.T) {
 		maxStack: maxCFF2ArgumentStack,
 	}); err == nil {
 		t.Fatal("decodeCharString accepted CFF2 operand stack overflow")
+	}
+}
+
+func TestDecodeCharStringRejectsCFF2Endchar(t *testing.T) {
+	_, err := decodeCharString([]byte{14}, charStringDecodeOptions{
+		maxStack: maxCFF2ArgumentStack,
+	})
+	if err == nil || !strings.Contains(err.Error(), "CFF2") {
+		t.Fatalf("decodeCharString error = %v, want CFF2 endchar rejection", err)
 	}
 }
 

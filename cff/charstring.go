@@ -26,6 +26,7 @@ type charStringContext struct {
 	blendVectors map[int][]float64
 	varStore     *VariationStore
 	varCoords    []float64
+	cff2         bool
 	nesting      int
 	widthParsed  bool
 	hintCount    int
@@ -73,6 +74,10 @@ type charStringDecodeOptions struct {
 	variationCoords []float64
 	defaultVSIndex  int
 	maxStack        int
+}
+
+func (opts charStringDecodeOptions) isCFF2() bool {
+	return opts.maxStack == maxCFF2ArgumentStack
 }
 
 func (c *charStringContext) stackLimit() int {
@@ -229,6 +234,7 @@ func decodeCharString(data []byte, opts charStringDecodeOptions) (*charStringRes
 		varCoords:   opts.variationCoords,
 		vsIndex:     opts.defaultVSIndex,
 		maxStack:    opts.maxStack,
+		cff2:        opts.isCFF2(),
 	}
 	err := ctx.interpret(data)
 	if err != nil {
@@ -237,7 +243,7 @@ func decodeCharString(data []byte, opts charStringDecodeOptions) (*charStringRes
 	if ctx.lastStop == charStringStopReturn {
 		return nil, errors.New("return in top-level charstring")
 	}
-	if ctx.lastStop == charStringStopEOF && opts.maxStack != maxCFF2ArgumentStack {
+	if ctx.lastStop == charStringStopEOF && !ctx.cff2 {
 		return nil, errors.New("CFF charstring missing endchar")
 	}
 	return &charStringResult{outline: ctx.outline, segments: ctx.segments}, nil
@@ -435,12 +441,13 @@ func (c *charStringContext) interpret(data []byte) error {
 				c.lastStop = charStringStopReturn
 				return nil
 			case 14: // endchar
+				if c.cff2 {
+					return errors.New("endchar operator is not valid in CFF2 charstring")
+				}
 				if err := c.consumeEndcharArgs(); err != nil {
 					return err
 				}
-				if len(c.outline.Points) > 0 {
-					c.outline.Contours = append(c.outline.Contours, len(c.outline.Points)-1)
-				}
+				c.closeCurrentContour()
 				c.lastStop = charStringStopEndChar
 				return nil
 			case 15: // vsindex (CFF2)
@@ -653,8 +660,22 @@ func (c *charStringContext) interpret(data []byte) error {
 			}
 		}
 	}
+	if c.cff2 {
+		c.closeCurrentContour()
+	}
 	c.lastStop = charStringStopEOF
 	return nil
+}
+
+func (c *charStringContext) closeCurrentContour() {
+	if len(c.outline.Points) == 0 {
+		return
+	}
+	lastPoint := len(c.outline.Points) - 1
+	if len(c.outline.Contours) > 0 && c.outline.Contours[len(c.outline.Contours)-1] == lastPoint {
+		return
+	}
+	c.outline.Contours = append(c.outline.Contours, lastPoint)
 }
 
 func (c *charStringContext) vsindex() error {

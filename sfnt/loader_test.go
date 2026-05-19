@@ -1100,8 +1100,8 @@ func buildCFF2VariationTestTable() []byte {
 	n := testCFF2CharStringNumber
 	globalSubrs := testCFF2Index32Bytes()
 	charStrings := testCFF2Index32Bytes(
-		[]byte{n(0), n(0), 21, 14},
-		[]byte{n(10), n(20), n(5), n(7), n(-3), n(11), n(2), 16, 21, 14},
+		[]byte{n(0), n(0), 21},
+		[]byte{n(10), n(20), n(5), n(7), n(-3), n(11), n(2), 16, 21},
 	)
 	fdSelect := []byte{0, 0, 1}
 	private1 := append(testCFF2DictInt32(1), byte(testCFFOpPrivateVSIndex))
