@@ -33,6 +33,7 @@ type charStringContext struct {
 	maxStack     int
 	transient    [32]float64
 	randomSeed   uint32
+	lastStop     charStringStop
 }
 
 type charStringSegmentKind uint8
@@ -41,6 +42,14 @@ const (
 	charStringMoveSegment charStringSegmentKind = iota
 	charStringLineSegment
 	charStringCubicSegment
+)
+
+type charStringStop uint8
+
+const (
+	charStringStopEOF charStringStop = iota
+	charStringStopReturn
+	charStringStopEndChar
 )
 
 type charStringSegment struct {
@@ -225,6 +234,9 @@ func decodeCharString(data []byte, opts charStringDecodeOptions) (*charStringRes
 	if err != nil {
 		return nil, err
 	}
+	if ctx.lastStop == charStringStopReturn {
+		return nil, errors.New("return in top-level charstring")
+	}
 	return &charStringResult{outline: ctx.outline, segments: ctx.segments}, nil
 }
 
@@ -382,6 +394,13 @@ func (c *charStringContext) interpret(data []byte) error {
 				if err := c.interpret(subrData); err != nil {
 					return err
 				}
+				switch c.lastStop {
+				case charStringStopReturn:
+				case charStringStopEndChar:
+					return nil
+				default:
+					return fmt.Errorf("CFF local subr %d missing return", idx)
+				}
 			case 29: // callgsubr
 				operand, err := c.pop()
 				if err != nil {
@@ -402,7 +421,15 @@ func (c *charStringContext) interpret(data []byte) error {
 				if err := c.interpret(subrData); err != nil {
 					return err
 				}
+				switch c.lastStop {
+				case charStringStopReturn:
+				case charStringStopEndChar:
+					return nil
+				default:
+					return fmt.Errorf("CFF global subr %d missing return", idx)
+				}
 			case 11: // return
+				c.lastStop = charStringStopReturn
 				return nil
 			case 14: // endchar
 				if err := c.consumeEndcharArgs(); err != nil {
@@ -411,6 +438,7 @@ func (c *charStringContext) interpret(data []byte) error {
 				if len(c.outline.Points) > 0 {
 					c.outline.Contours = append(c.outline.Contours, len(c.outline.Points)-1)
 				}
+				c.lastStop = charStringStopEndChar
 				return nil
 			case 15: // vsindex (CFF2)
 				if err := c.vsindex(); err != nil {
@@ -622,6 +650,7 @@ func (c *charStringContext) interpret(data []byte) error {
 			}
 		}
 	}
+	c.lastStop = charStringStopEOF
 	return nil
 }
 

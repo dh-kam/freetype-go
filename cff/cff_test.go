@@ -1315,6 +1315,45 @@ func TestDecodeCharStringSubrBias(t *testing.T) {
 	assertPoint(t, outline, 2, 10, 20)
 }
 
+func TestDecodeCharStringRejectsSubrEOFWithoutReturn(t *testing.T) {
+	n := csNumber
+
+	t.Run("local", func(t *testing.T) {
+		localSubrs := testIndex([]byte{n(10), n(0), 5})
+		data := []byte{
+			n(0), n(0), 21,
+			n(-107), 10,
+			14,
+		}
+
+		_, err := DecodeCharString(data, nil, localSubrs, nil)
+		if err == nil || !strings.Contains(err.Error(), "CFF local subr") {
+			t.Fatalf("DecodeCharString error = %v, want local subr missing return", err)
+		}
+	})
+
+	t.Run("global", func(t *testing.T) {
+		globalSubrs := testIndex([]byte{n(0), n(10), 5})
+		data := []byte{
+			n(0), n(0), 21,
+			n(-107), 29,
+			14,
+		}
+
+		_, err := DecodeCharString(data, globalSubrs, nil, nil)
+		if err == nil || !strings.Contains(err.Error(), "CFF global subr") {
+			t.Fatalf("DecodeCharString error = %v, want global subr missing return", err)
+		}
+	})
+}
+
+func TestDecodeCharStringRejectsTopLevelReturn(t *testing.T) {
+	_, err := DecodeCharString([]byte{11}, nil, nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "return in top-level charstring") {
+		t.Fatalf("DecodeCharString error = %v, want top-level return rejection", err)
+	}
+}
+
 func TestCharStringWidthHintsAndMasks(t *testing.T) {
 	n := csNumber
 	data := []byte{
