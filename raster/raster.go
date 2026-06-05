@@ -1,6 +1,7 @@
 package raster
 
 import (
+	"os"
 	"slices"
 	"sync"
 
@@ -15,9 +16,10 @@ var tcellPool = sync.Pool{
 }
 
 const (
-	pixelBits = 8
-	onePixel  = 1 << pixelBits
-	upscale   = onePixel >> 6
+	pixelBits    = 8
+	onePixel     = 1 << pixelBits
+	upscale      = onePixel >> 6
+	overlapScale = 4
 
 	curveTagOn    = 1
 	curveTagConic = 0
@@ -102,6 +104,13 @@ func (r *SmoothRasterizer) Render(outline api.Outline, bitmap api.Bitmap) error 
 		return nil
 	}
 
+	if os.Getenv("FTGO_DEBUG_DISABLE_OVERLAP_RENDER") == "" &&
+		pixelMode == api.MODE_GRAY && r.GraySpans == nil &&
+		core.OutlineFlags(outline)&core.OutlineOverlap != 0 &&
+		width*overlapScale <= 0x7fff {
+		return r.renderOverlap(outline, bitmap)
+	}
+
 	r.worker.PixelMode = pixelMode
 	r.worker.XScale = 1
 	r.worker.YScale = 1
@@ -156,6 +165,74 @@ func (r *SmoothRasterizer) Render(outline api.Outline, bitmap api.Bitmap) error 
 	// Sweep the cells to produce the final bitmap
 	r.worker.sweep(bitmap)
 
+	return nil
+}
+
+func (r *SmoothRasterizer) renderOverlap(outline api.Outline, bitmap api.Bitmap) error {
+	rows := bitmap.GetRows()
+	width := bitmap.GetWidth()
+	buffer := bitmap.GetBuffer()
+	pitch := bitmap.GetPitch()
+	if rows == 0 || width == 0 || len(buffer) == 0 || pitch <= 0 || pitch < width || len(buffer) < (rows-1)*pitch+width {
+		return nil
+	}
+
+	r.worker.PixelMode = api.MODE_GRAY
+	r.worker.XScale = overlapScale
+	r.worker.YScale = overlapScale
+	r.worker.FlipY = false
+	r.worker.FreeTypeFillRule = r.freeTypeFillRule
+	if _, _, ok := api.GetBitmapPlacement(bitmap); ok {
+		r.worker.FlipY = true
+	}
+	r.worker.GraySpans = func(y int, spans []Span) {
+		dstY := y / overlapScale
+		if dstY < 0 || dstY >= rows {
+			return
+		}
+		line := buffer[dstY*pitch : dstY*pitch+width]
+		for _, span := range spans {
+			cover := int(span.Coverage) + overlapScale*overlapScale/2
+			cover /= overlapScale * overlapScale
+			if cover == 0 {
+				continue
+			}
+			for i := 0; i < int(span.Len); i++ {
+				dstX := (int(span.X) + i) / overlapScale
+				if dstX < 0 || dstX >= width {
+					continue
+				}
+				sum := int(line[dstX]) + cover
+				line[dstX] = byte(sum - (sum >> 8))
+			}
+		}
+	}
+
+	r.worker.MinEx = 0
+	r.worker.MinEy = 0
+	r.worker.MaxEx = width * overlapScale
+	r.worker.MaxEy = rows * overlapScale
+	r.worker.NumCells = 0
+
+	r.worker.Cells = tcellPool.Get().([]TCell)
+	defer func() {
+		tcellPool.Put(r.worker.Cells)
+		r.worker.Cells = nil
+		r.worker.GraySpans = nil
+	}()
+
+	if err := r.decompose(outline); err != nil {
+		return err
+	}
+
+	slices.SortFunc(r.worker.Cells[:r.worker.NumCells], func(a, b TCell) int {
+		if a.Y != b.Y {
+			return a.Y - b.Y
+		}
+		return a.X - b.X
+	})
+	highBitmap := core.NewBitmapWithPixelMode(width*overlapScale, rows*overlapScale, api.MODE_GRAY)
+	r.worker.sweep(highBitmap)
 	return nil
 }
 

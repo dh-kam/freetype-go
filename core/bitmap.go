@@ -338,6 +338,7 @@ func translatedBitmapOutline(outline api.Outline, minX26Dot6, maxY26Dot6 int32) 
 		Points:   make([]api.Vector, len(points)),
 		Tags:     append([]byte{}, outline.GetTags()...),
 		Contours: append([]int{}, outline.GetContours()...),
+		Flags:    OutlineFlags(outline),
 	}
 	for i, p := range points {
 		renderOutline.Points[i] = api.Vector{

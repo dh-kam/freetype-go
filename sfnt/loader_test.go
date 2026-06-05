@@ -584,6 +584,41 @@ func TestLoadGlyphSlotMetricsUseNonSquarePixelScales(t *testing.T) {
 	}
 }
 
+func TestLoadGlyphPreservesSimpleOverlapFlag(t *testing.T) {
+	glyph := simpleRectGlyphData(0, 0, 100, 100)
+	glyph[14] |= OVERLAP_SIMPLE
+	face := loadGlyphMetricsTestFace(t, []uint32{0, uint32(len(glyph))}, glyph, []metricsGlyph{
+		{advance: 100, lsb: 0},
+	})
+
+	slot, err := face.LoadGlyph(0, api.LoadNoHinting)
+	if err != nil {
+		t.Fatalf("LoadGlyph failed: %v", err)
+	}
+	if flags := core.OutlineFlags(slot.GetOutline()); flags&core.OutlineOverlap == 0 {
+		t.Fatalf("outline flags = 0x%x, want OutlineOverlap set", flags)
+	}
+}
+
+func TestLoadGlyphPreservesCompositeOverlapFlag(t *testing.T) {
+	composite := compositeGlyphData(1)
+	binary.BigEndian.PutUint16(composite[10:12], ARGS_ARE_XY_VALUES|OVERLAP_COMPOUND)
+	simple := simpleRectGlyphData(0, 0, 100, 100)
+	glyf := append(append([]byte{}, composite...), simple...)
+	face := loadGlyphMetricsTestFace(t, []uint32{0, uint32(len(composite)), uint32(len(glyf))}, glyf, []metricsGlyph{
+		{advance: 100, lsb: 0},
+		{advance: 100, lsb: 0},
+	})
+
+	slot, err := face.LoadGlyph(0, api.LoadNoHinting)
+	if err != nil {
+		t.Fatalf("LoadGlyph failed: %v", err)
+	}
+	if flags := core.OutlineFlags(slot.GetOutline()); flags&core.OutlineOverlap == 0 {
+		t.Fatalf("outline flags = 0x%x, want OutlineOverlap set", flags)
+	}
+}
+
 func TestLoadedFaceSetPixelSizesRerunsPrepBeforeHinting(t *testing.T) {
 	glyph := simpleOnePointGlyphData(50, 20, []byte{
 		0xB0, 0, // PUSHB point 0

@@ -10,7 +10,13 @@ type Outline struct {
 	Points   []api.Vector
 	Tags     []byte
 	Contours []int
+	Flags    int
 }
+
+const (
+	// OutlineOverlap matches FreeType's FT_OUTLINE_OVERLAP flag.
+	OutlineOverlap = 0x40
+)
 
 func (o *Outline) GetPoints() []api.Vector {
 	return o.Points
@@ -22,6 +28,25 @@ func (o *Outline) GetTags() []byte {
 
 func (o *Outline) GetContours() []int {
 	return o.Contours
+}
+
+func (o *Outline) GetFlags() int {
+	return o.Flags
+}
+
+type outlineFlagsProvider interface {
+	GetFlags() int
+}
+
+// OutlineFlags returns optional FreeType-compatible outline flags.
+func OutlineFlags(outline api.Outline) int {
+	if outline == nil {
+		return 0
+	}
+	if provider, ok := outline.(outlineFlagsProvider); ok {
+		return provider.GetFlags()
+	}
+	return 0
 }
 
 func (o *Outline) Scale(xScale, yScale int32) {

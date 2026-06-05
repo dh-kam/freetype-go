@@ -788,6 +788,9 @@ func (f *Face) scaleCFFOutline(outline *core.Outline) {
 	if outline == nil {
 		return
 	}
+	// OpenType CFF glyph coordinates are already in the SFNT design space.
+	// FreeType scales them with head.unitsPerEm; applying the CFF FontMatrix
+	// here double-scales fonts whose Top DICT matrix is 1/unitsPerEm.
 	xScale := f.computeCFFSizeScale(f.xPPEM)
 	yScale := f.computeCFFSizeScale(f.yPPEM)
 	for i := range outline.Points {
@@ -1279,6 +1282,8 @@ const (
 	WE_HAVE_INSTRUCTIONS     = 0x0100
 	USE_MY_METRICS           = 0x0200
 	OVERLAP_COMPOUND         = 0x0400
+
+	OVERLAP_SIMPLE = 0x40
 )
 
 const (
@@ -2020,6 +2025,9 @@ func (f *Face) parseSimpleGlyph(s api.Stream, offset int64, numberOfContours int
 		Tags:     make([]byte, numPoints),
 		Contours: make([]int, numberOfContours),
 	}
+	if numPoints > 0 && flags[0]&OVERLAP_SIMPLE != 0 {
+		outline.Flags |= core.OutlineOverlap
+	}
 
 	for i := 0; i < numPoints; i++ {
 		// TrueType units are converted to 26.6 fixed point (shifted by 6)
@@ -2268,6 +2276,10 @@ func (f *Face) parseCompositeGlyph(s api.Stream, offset int64, glyphIndex int, l
 			for _, c := range subOutline.Contours {
 				finalOutline.Contours = append(finalOutline.Contours, c+numPoints)
 			}
+			finalOutline.Flags |= subOutline.Flags
+		}
+		if componentIndex == 0 && flags&OVERLAP_COMPOUND != 0 {
+			finalOutline.Flags |= core.OutlineOverlap
 		}
 
 		if flags&MORE_COMPONENTS == 0 {

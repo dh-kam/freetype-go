@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
+	"strings"
 
 	"github.com/dh-kam/freetype-go/api"
 	"github.com/dh-kam/freetype-go/core"
@@ -245,6 +247,9 @@ func decodeCharString(data []byte, opts charStringDecodeOptions) (*charStringRes
 	}
 	if ctx.lastStop == charStringStopEOF && !ctx.cff2 {
 		return nil, errors.New("CFF charstring missing endchar")
+	}
+	if enableClosedContourNormalization() {
+		normalizeClosedContours(ctx.outline)
 	}
 	return &charStringResult{outline: ctx.outline, segments: ctx.segments}, nil
 }
@@ -678,6 +683,55 @@ func (c *charStringContext) closeCurrentContour() {
 		return
 	}
 	c.outline.Contours = append(c.outline.Contours, lastPoint)
+}
+
+func normalizeClosedContours(outline *core.Outline) {
+	if outline == nil || len(outline.Points) == 0 || len(outline.Contours) == 0 {
+		return
+	}
+	for ci := len(outline.Contours) - 1; ci >= 0; ci-- {
+		end := outline.Contours[ci]
+		start := 0
+		if ci > 0 {
+			start = outline.Contours[ci-1] + 1
+		}
+		if start < 0 || end < start || end >= len(outline.Points) {
+			continue
+		}
+		if outline.Points[start] == outline.Points[end] && isOnCurvePoint(outline, end) {
+			deleteOutlinePoint(outline, end)
+			end--
+			outline.Contours[ci] = end
+		}
+		if end == start {
+			deleteOutlinePoint(outline, end)
+			outline.Contours = append(outline.Contours[:ci], outline.Contours[ci+1:]...)
+		}
+	}
+}
+
+func enableClosedContourNormalization() bool {
+	v := strings.TrimSpace(os.Getenv("FTGO_DEBUG_ENABLE_CFF_CONTOUR_NORMALIZATION"))
+	return v != "" && v != "0" && !strings.EqualFold(v, "false")
+}
+
+func isOnCurvePoint(outline *core.Outline, index int) bool {
+	return index >= 0 && index < len(outline.Tags) && outline.Tags[index] == 1
+}
+
+func deleteOutlinePoint(outline *core.Outline, index int) {
+	if outline == nil || index < 0 || index >= len(outline.Points) {
+		return
+	}
+	outline.Points = append(outline.Points[:index], outline.Points[index+1:]...)
+	if index < len(outline.Tags) {
+		outline.Tags = append(outline.Tags[:index], outline.Tags[index+1:]...)
+	}
+	for j := range outline.Contours {
+		if outline.Contours[j] >= index {
+			outline.Contours[j]--
+		}
+	}
 }
 
 func (c *charStringContext) vsindex() error {

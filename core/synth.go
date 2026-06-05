@@ -55,6 +55,7 @@ func Embolden(slot api.GlyphSlot) error {
 		Points:   newOutline.GetPoints(),
 		Tags:     newOutline.GetTags(),
 		Contours: newOutline.GetContours(),
+		Flags:    OutlineFlags(newOutline),
 	}
 
 	slot.SetOutline(coreOutline)
