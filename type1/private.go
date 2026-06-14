@@ -91,10 +91,53 @@ func type1PrivateToken(raw string) Token {
 	if strings.HasPrefix(raw, "(") {
 		return Token{Type: "String", Value: raw}
 	}
-	if _, err := strconv.ParseFloat(raw, 64); err == nil {
+	if isType1PrivateNumberToken(raw) {
 		return Token{Type: "Number", Value: raw}
 	}
 	return Token{Type: "Operator", Value: raw}
+}
+
+func isType1PrivateNumberToken(raw string) bool {
+	if raw == "" {
+		return false
+	}
+	i := 0
+	if raw[i] == '+' || raw[i] == '-' {
+		i++
+		if i == len(raw) {
+			return false
+		}
+	}
+	digits := 0
+	for i < len(raw) && raw[i] >= '0' && raw[i] <= '9' {
+		i++
+		digits++
+	}
+	if i < len(raw) && raw[i] == '.' {
+		i++
+		for i < len(raw) && raw[i] >= '0' && raw[i] <= '9' {
+			i++
+			digits++
+		}
+	}
+	if digits == 0 {
+		return false
+	}
+	if i < len(raw) && (raw[i] == 'e' || raw[i] == 'E') {
+		i++
+		if i < len(raw) && (raw[i] == '+' || raw[i] == '-') {
+			i++
+		}
+		expDigits := 0
+		for i < len(raw) && raw[i] >= '0' && raw[i] <= '9' {
+			i++
+			expDigits++
+		}
+		if expDigits == 0 {
+			return false
+		}
+	}
+	return i == len(raw)
 }
 
 func type1PrivateFloatArray(tokens []Token, name string) ([]float64, bool) {

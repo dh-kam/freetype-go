@@ -102,6 +102,31 @@ func TestParseFontPrivateHintsSkipCharStringBinaryData(t *testing.T) {
 	}
 }
 
+func TestType1PrivateTokenClassifiesNumbersWithoutOperatorParse(t *testing.T) {
+	cases := []struct {
+		raw      string
+		wantType string
+	}{
+		{raw: "0", wantType: "Number"},
+		{raw: "-1", wantType: "Number"},
+		{raw: "+1.25", wantType: "Number"},
+		{raw: ".5", wantType: "Number"},
+		{raw: "1e-3", wantType: "Number"},
+		{raw: "dup", wantType: "Operator"},
+		{raw: "readonly", wantType: "Operator"},
+		{raw: "1e", wantType: "Operator"},
+		{raw: "-", wantType: "Operator"},
+	}
+
+	for _, tc := range cases {
+		got := type1PrivateToken(tc.raw)
+		if got.Type != tc.wantType || got.Value != tc.raw {
+			t.Fatalf("type1PrivateToken(%q) = (%s, %q), want (%s, %q)",
+				tc.raw, got.Type, got.Value, tc.wantType, tc.raw)
+		}
+	}
+}
+
 func privateHintTestPrivate(metadata string, charString []byte) []byte {
 	private := []byte("/Private 32 dict dup begin\n/lenIV -1 def\n")
 	private = append(private, metadata...)
